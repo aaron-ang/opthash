@@ -1,0 +1,7 @@
+/target
+
+# Paper directory - ignore all except .pdf, .tex, and .bbl files
+/paper/*
+!/paper/*.pdf
+!/paper/*.tex
+!/paper/*.bbl

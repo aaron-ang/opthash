@@ -1,0 +1,111 @@
+\begin{thebibliography}{10}
+
+\bibitem{ajtai1978there}
+Mikl{\'o}s Ajtai, J{\'a}nos Koml{\'o}s, and Endre Szemer{\'e}di.
+\newblock There is no fast single hashing algorithm.
+\newblock {\em Information Processing Letters}, 7(6):270--273, 1978.
+
+\bibitem{bender2023iceberg}
+Michael~A Bender, Alex Conway, Mart{\'\i}n Farach-Colton, William Kuszmaul, and Guido Tagliavini.
+\newblock Iceberg hashing: Optimizing many hash-table criteria at once.
+\newblock {\em Journal of the ACM}, 70(6):1--51, 2023.
+
+\bibitem{bender2023tinypointers}
+Michael~A. Bender, Alex Conway, Martín Farach-Colton, William Kuszmaul, and Guido Tagliavini.
+\newblock {\em Tiny Pointers}, pages 477--508.
+\newblock 2023.
+\newblock \href {https://doi.org/10.1137/1.9781611977554.ch21} {\path{doi:10.1137/1.9781611977554.ch21}}.
+
+\bibitem{contention}
+Michael~A. Bender, Martin Farach{-}Colton, Simai He, Bradley~C. Kuszmaul, and Charles~E. Leiserson.
+\newblock Adversarial contention resolution for simple channels.
+\newblock In {\em {SPAA}}, pages 325--332. {ACM}, 2005.
+
+\bibitem{berenbrink2000tchashing}
+Petra Berenbrink, Artur Czumaj, Angelika Steger, and Berthold V\"{o}cking.
+\newblock Balanced allocations: the heavily loaded case.
+\newblock In {\em Proceedings of the Thirty-Second Annual ACM Symposium on Theory of Computing}, STOC '00, page 745–754. Association for Computing Machinery, 2000.
+\newblock \href {https://doi.org/10.1145/335305.335411} {\path{doi:10.1145/335305.335411}}.
+
+\bibitem{brent1973reducing}
+Richard~P Brent.
+\newblock Reducing the retrieval time of scatter storage techniques.
+\newblock {\em Communications of the ACM}, 16(2):105--109, 1973.
+
+\bibitem{broder1990multilevel}
+Andrei~Z Broder and Anna~R Karlin.
+\newblock Multilevel adaptive hashing.
+\newblock In {\em Proceedings of the first annual ACM-SIAM symposium on Discrete algorithms}, pages 43--53, 1990.
+
+\bibitem{burkhard2005external}
+Walter~A Burkhard.
+\newblock External double hashing with choice.
+\newblock In {\em 8th International Symposium on Parallel Architectures, Algorithms and Networks (ISPAN'05)}, pages 8--pp. IEEE, 2005.
+
+\bibitem{fotakis2005space}
+Dimitris Fotakis, Rasmus Pagh, Peter Sanders, and Paul Spirakis.
+\newblock Space efficient hash tables with worst case constant access time.
+\newblock {\em Theory of Computing Systems}, 38(2):229--248, 2005.
+
+\bibitem{gonnet1979efficient}
+Gaston~H Gonnet and J~Ian Munro.
+\newblock Efficient ordering of hash tables.
+\newblock {\em SIAM Journal on Computing}, 8(3):463--478, 1979.
+
+\bibitem{knuth1963notes}
+Donald~E Knuth.
+\newblock Notes on “open” addressing.
+\newblock {\em Unpublished memorandum}, pages 11--97, 1963.
+
+\bibitem{knuth1974computer}
+Donald~E Knuth.
+\newblock Computer science and its relation to mathematics.
+\newblock {\em The American Mathematical Monthly}, 81(4):323--343, 1974.
+
+\bibitem{Knuth98Vol3}
+Donald~Ervin Knuth.
+\newblock {\em The Art of Computer Programming, Volume III: Sorting and Searching}.
+\newblock Addison-Wesley, 2nd edition, 1998.
+\newblock URL: \url{https://www.worldcat.org/oclc/312994415}.
+
+\bibitem{lueker1988more}
+George Lueker and Mariko Molodowitch.
+\newblock More analysis of double hashing.
+\newblock In {\em Proceedings of the twentieth annual ACM symposium on Theory of computing}, pages 354--359, 1988.
+
+\bibitem{martini2003double}
+Paul~M Martini and Walter~A Burkhard.
+\newblock Double hashing with multiple passbits.
+\newblock {\em International Journal of Foundations of Computer Science}, 14(06):1165--1182, 2003.
+
+\bibitem{molodowitch1990analysis}
+Mariko Molodowitch.
+\newblock {\em Analysis and design of algorithms: double hashing and parallel graph searching}.
+\newblock University of California, Irvine, 1990.
+
+\bibitem{munro1986techniques}
+J~Ian Munro and Pedro Celis.
+\newblock Techniques for collision resolution in hash tables with open addressing.
+\newblock In {\em Proceedings of 1986 ACM Fall joint computer conference}, pages 601--610, 1986.
+
+\bibitem{sanders2018hashing}
+Peter Sanders.
+\newblock Hashing with linear probing and referential integrity.
+\newblock {\em arXiv preprint arXiv:1808.04602}, 2018.
+
+\bibitem{ullman1972note}
+Jeffrey~D Ullman.
+\newblock A note on the efficiency of hashing functions.
+\newblock {\em Journal of the ACM (JACM)}, 19(3):569--575, 1972.
+
+\bibitem{vocking2003asymmetry}
+Berthold V{\"o}cking.
+\newblock How asymmetry helps load balancing.
+\newblock {\em Journal of the ACM (JACM)}, 50(4):568--589, 2003.
+
+\bibitem{yao1985uniform}
+Andrew~C Yao.
+\newblock Uniform hashing is optimal.
+\newblock {\em Journal of the ACM (JACM)}, 32(3):687--693, 1985.
+
+\end{thebibliography}
