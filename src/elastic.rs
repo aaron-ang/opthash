@@ -3,10 +3,9 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
 use crate::common::{
-    CTRL_EMPTY, CTRL_TOMBSTONE, DEFAULT_RESERVE_FRACTION, Entry, RawSlots,
-    advance_wrapping_index, ceil_three_quarters, control_fingerprint, find_first_free_control,
-    floor_half_reserve_slots, greatest_common_divisor, is_free_control, is_occupied_control,
-    sanitize_reserve_fraction,
+    CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, Controls, DEFAULT_RESERVE_FRACTION, Entry, RawTable,
+    advance_wrapping_index, ceil_three_quarters, control_fingerprint, floor_half_reserve_slots,
+    greatest_common_divisor, sanitize_reserve_fraction,
 };
 
 const DEFAULT_PROBE_SCALE: f64 = 16.0;
@@ -14,23 +13,21 @@ const INITIAL_CAPACITY: usize = 16;
 
 #[derive(Debug)]
 struct Level<K, V> {
-    slots: RawSlots<Entry<K, V>>,
-    controls: Vec<u8>,
+    table: RawTable<Entry<K, V>>,
     len: usize,
 }
 
 impl<K, V> Level<K, V> {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            slots: RawSlots::new(capacity),
-            controls: vec![CTRL_EMPTY; capacity],
+            table: RawTable::new(capacity),
             len: 0,
         }
     }
 
     #[inline]
     fn capacity(&self) -> usize {
-        self.slots.len()
+        self.table.capacity()
     }
 
     #[inline]
@@ -45,10 +42,9 @@ impl<K, V> Level<K, V> {
 
 impl<K, V> Drop for Level<K, V> {
     fn drop(&mut self) {
-        for (idx, &control) in self.controls.iter().enumerate() {
-            if is_occupied_control(control) {
-                // SAFETY: occupied control means the slot was initialized via write.
-                unsafe { self.slots.drop_in_place(idx) };
+        for idx in 0..self.table.capacity() {
+            if self.table.control_at(idx).is_occupied() {
+                unsafe { self.table.drop_in_place(idx) };
             }
         }
     }
@@ -149,7 +145,7 @@ where
             self.find_slot_indices_with_hash(&key, key_hash, key_fingerprint)
         {
             // SAFETY: find_slot_indices_with_hash only returns occupied slots.
-            let entry = unsafe { self.levels[level_idx].slots.get_mut(slot_idx) };
+            let entry = unsafe { self.levels[level_idx].table.get_mut(slot_idx) };
             let old = std::mem::replace(&mut entry.value, value);
             return Some(old);
         }
@@ -174,9 +170,9 @@ where
             });
 
         self.levels[level_idx]
-            .slots
+            .table
             .write(slot_idx, Entry { key, value });
-        self.levels[level_idx].controls[slot_idx] = key_fingerprint;
+        *self.levels[level_idx].table.control_at_mut(slot_idx) = key_fingerprint;
         self.levels[level_idx].len += 1;
         self.len += 1;
         if level_idx > self.max_populated_level {
@@ -199,7 +195,7 @@ where
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
         // SAFETY: find_slot_indices_with_hash only returns occupied slots.
-        Some(unsafe { &self.levels[level_idx].slots.get_ref(slot_idx).value })
+        Some(unsafe { &self.levels[level_idx].table.get_ref(slot_idx).value })
     }
 
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
@@ -212,7 +208,7 @@ where
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
         // SAFETY: find_slot_indices_with_hash only returns occupied slots.
-        Some(unsafe { &mut self.levels[level_idx].slots.get_mut(slot_idx).value })
+        Some(unsafe { &mut self.levels[level_idx].table.get_mut(slot_idx).value })
     }
 
     pub fn contains_key<Q>(&self, key: &Q) -> bool
@@ -237,8 +233,8 @@ where
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
         let level = &mut self.levels[level_idx];
         // SAFETY: find_slot_indices_with_hash only returns occupied slots.
-        let removed_entry = unsafe { level.slots.take(slot_idx) };
-        level.controls[slot_idx] = CTRL_TOMBSTONE;
+        let removed_entry = unsafe { level.table.take(slot_idx) };
+        *level.table.control_at_mut(slot_idx) = CTRL_TOMBSTONE;
         level.len -= 1;
         self.len -= 1;
         Some(removed_entry.value)
@@ -246,12 +242,12 @@ where
 
     pub fn clear(&mut self) {
         for level in &mut self.levels {
-            for (idx, control) in level.controls.iter_mut().enumerate() {
-                if is_occupied_control(*control) {
+            for idx in 0..level.table.capacity() {
+                if level.table.control_at(idx).is_occupied() {
                     // SAFETY: occupied control means slot was initialized.
-                    unsafe { level.slots.drop_in_place(idx) };
+                    unsafe { level.table.drop_in_place(idx) };
                 }
-                *control = CTRL_EMPTY;
+                *level.table.control_at_mut(idx) = CTRL_EMPTY;
             }
             level.len = 0;
         }
@@ -265,11 +261,11 @@ where
         let mut entries = Vec::with_capacity(self.len);
 
         for level in &mut self.levels {
-            for (idx, control) in level.controls.iter_mut().enumerate() {
-                if is_occupied_control(*control) {
-                    let entry = unsafe { level.slots.take(idx) };
+            for idx in 0..level.table.capacity() {
+                if level.table.control_at(idx).is_occupied() {
+                    let entry = unsafe { level.table.take(idx) };
                     entries.push((entry.key, entry.value));
-                    *control = CTRL_EMPTY;
+                    *level.table.control_at_mut(idx) = CTRL_EMPTY;
                 }
             }
             level.len = 0;
@@ -277,8 +273,7 @@ where
         self.len = 0;
         self.max_populated_level = 0;
 
-        let hash_builder =
-            std::mem::replace(&mut self.hash_builder, RandomState::new());
+        let hash_builder = std::mem::take(&mut self.hash_builder);
         let mut new_map = Self::with_params_and_hasher(
             new_capacity,
             self.reserve_fraction,
@@ -416,13 +411,13 @@ where
             self.probe_sequence_start_step(key_hash, level_idx, level_cap);
         let mut slot_idx = probe_start;
         for _ in 0..level_cap {
-            let control = level.controls[slot_idx];
+            let control = level.table.control_at(slot_idx);
             if control == CTRL_EMPTY {
                 return None;
             }
             if control == key_fingerprint {
                 // SAFETY: fingerprint match means slot is occupied (fingerprints are 1..=0x7F).
-                let entry = unsafe { level.slots.get_ref(slot_idx) };
+                let entry = unsafe { level.table.get_ref(slot_idx) };
                 if entry.key.borrow() == key {
                     return Some(slot_idx);
                 }
@@ -476,14 +471,14 @@ where
         if probe_step == 1 {
             let first_run = max_probes.min(level_cap - probe_start);
             if let Some(offset) =
-                find_first_free_control(&level.controls[probe_start..probe_start + first_run])
+                level.table.controls(probe_start..probe_start + first_run).find_first_free()
             {
                 return Some(probe_start + offset);
             }
 
             let wrapped = max_probes - first_run;
             if wrapped > 0
-                && let Some(offset) = find_first_free_control(&level.controls[..wrapped])
+                && let Some(offset) = level.table.controls(..wrapped).find_first_free()
             {
                 return Some(offset);
             }
@@ -492,7 +487,7 @@ where
 
         let mut slot_idx = probe_start;
         for _ in 0..max_probes {
-            if is_free_control(level.controls[slot_idx]) {
+            if level.table.control_at(slot_idx).is_free() {
                 return Some(slot_idx);
             }
             slot_idx = advance_wrapping_index(slot_idx, probe_step, level_cap);
@@ -511,15 +506,15 @@ where
         let (probe_start, probe_step) =
             self.probe_sequence_start_step(key_hash, level_idx, level_cap);
         if probe_step == 1 {
-            if let Some(offset) = find_first_free_control(&level.controls[probe_start..]) {
+            if let Some(offset) = level.table.controls(probe_start..).find_first_free() {
                 return Some(probe_start + offset);
             }
-            return find_first_free_control(&level.controls[..probe_start]);
+            return level.table.controls(..probe_start).find_first_free();
         }
 
         let mut slot_idx = probe_start;
         for _ in 0..level_cap {
-            if is_free_control(level.controls[slot_idx]) {
+            if level.table.control_at(slot_idx).is_free() {
                 return Some(slot_idx);
             }
             slot_idx = advance_wrapping_index(slot_idx, probe_step, level_cap);

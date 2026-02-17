@@ -3,17 +3,16 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
 use crate::common::{
-    CTRL_EMPTY, CTRL_TOMBSTONE, DEFAULT_RESERVE_FRACTION, Entry, RawSlots, advance_wrapping_index,
-    control_fingerprint, find_first_control, find_first_free_control, find_next_control,
-    greatest_common_divisor, is_free_control, is_occupied_control, sanitize_reserve_fraction,
+    CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, Controls, DEFAULT_RESERVE_FRACTION, Entry, RawTable,
+    advance_wrapping_index, control_fingerprint, greatest_common_divisor,
+    sanitize_reserve_fraction,
 };
 
 const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
 
 #[derive(Debug)]
 struct BucketLevel<K, V> {
-    slots: RawSlots<Entry<K, V>>,
-    controls: Vec<u8>,
+    table: RawTable<Entry<K, V>>,
     len: usize,
     bucket_size: usize,
     has_holes: bool,
@@ -23,8 +22,7 @@ impl<K, V> BucketLevel<K, V> {
     fn with_bucket_count(bucket_count: usize, bucket_size: usize) -> Self {
         let total = bucket_count.saturating_mul(bucket_size);
         Self {
-            slots: RawSlots::new(total),
-            controls: vec![CTRL_EMPTY; total],
+            table: RawTable::new(total),
             len: 0,
             bucket_size,
             has_holes: false,
@@ -33,7 +31,7 @@ impl<K, V> BucketLevel<K, V> {
 
     #[inline]
     fn capacity(&self) -> usize {
-        self.slots.len()
+        self.table.capacity()
     }
 
     #[inline]
@@ -41,16 +39,16 @@ impl<K, V> BucketLevel<K, V> {
         if self.bucket_size == 0 {
             0
         } else {
-            self.slots.len() / self.bucket_size
+            self.table.capacity() / self.bucket_size
         }
     }
 }
 
 impl<K, V> Drop for BucketLevel<K, V> {
     fn drop(&mut self) {
-        for (idx, &control) in self.controls.iter().enumerate() {
-            if is_occupied_control(control) {
-                unsafe { self.slots.drop_in_place(idx) };
+        for idx in 0..self.table.capacity() {
+            if self.table.control_at(idx).is_occupied() {
+                unsafe { self.table.drop_in_place(idx) };
             }
         }
     }
@@ -58,12 +56,10 @@ impl<K, V> Drop for BucketLevel<K, V> {
 
 #[derive(Debug)]
 struct SpecialArray<K, V> {
-    primary_slots: RawSlots<Entry<K, V>>,
-    primary_controls: Vec<u8>,
+    primary: RawTable<Entry<K, V>>,
     primary_len: usize,
     primary_has_holes: bool,
-    fallback_slots: RawSlots<Entry<K, V>>,
-    fallback_controls: Vec<u8>,
+    fallback: RawTable<Entry<K, V>>,
     fallback_len: usize,
     fallback_has_holes: bool,
     fallback_bucket_size: usize,
@@ -78,12 +74,10 @@ impl<K, V> SpecialArray<K, V> {
         let primary_capacity = capacity.saturating_sub(fallback_capacity);
 
         Self {
-            primary_slots: RawSlots::new(primary_capacity),
-            primary_controls: vec![CTRL_EMPTY; primary_capacity],
+            primary: RawTable::new(primary_capacity),
             primary_len: 0,
             primary_has_holes: false,
-            fallback_slots: RawSlots::new(fallback_capacity),
-            fallback_controls: vec![CTRL_EMPTY; fallback_capacity],
+            fallback: RawTable::new(fallback_capacity),
             fallback_len: 0,
             fallback_has_holes: false,
             fallback_bucket_size,
@@ -95,21 +89,21 @@ impl<K, V> SpecialArray<K, V> {
         if self.fallback_bucket_size == 0 {
             0
         } else {
-            self.fallback_slots.len() / self.fallback_bucket_size
+            self.fallback.capacity() / self.fallback_bucket_size
         }
     }
 }
 
 impl<K, V> Drop for SpecialArray<K, V> {
     fn drop(&mut self) {
-        for (idx, &control) in self.primary_controls.iter().enumerate() {
-            if is_occupied_control(control) {
-                unsafe { self.primary_slots.drop_in_place(idx) };
+        for idx in 0..self.primary.capacity() {
+            if self.primary.control_at(idx).is_occupied() {
+                unsafe { self.primary.drop_in_place(idx) };
             }
         }
-        for (idx, &control) in self.fallback_controls.iter().enumerate() {
-            if is_occupied_control(control) {
-                unsafe { self.fallback_slots.drop_in_place(idx) };
+        for idx in 0..self.fallback.capacity() {
+            if self.fallback.control_at(idx).is_occupied() {
+                unsafe { self.fallback.drop_in_place(idx) };
             }
         }
     }
@@ -268,13 +262,13 @@ where
                 slot_idx,
             } => {
                 // SAFETY: find returns only occupied slots.
-                Some(unsafe { &self.levels[level_idx].slots.get_ref(slot_idx).value })
+                Some(unsafe { &self.levels[level_idx].table.get_ref(slot_idx).value })
             }
             SlotLocation::SpecialPrimary { slot_idx } => {
-                Some(unsafe { &self.special.primary_slots.get_ref(slot_idx).value })
+                Some(unsafe { &self.special.primary.get_ref(slot_idx).value })
             }
             SlotLocation::SpecialFallback { slot_idx } => {
-                Some(unsafe { &self.special.fallback_slots.get_ref(slot_idx).value })
+                Some(unsafe { &self.special.fallback.get_ref(slot_idx).value })
             }
         }
     }
@@ -290,12 +284,12 @@ where
             SlotLocation::Level {
                 level_idx,
                 slot_idx,
-            } => Some(unsafe { &mut self.levels[level_idx].slots.get_mut(slot_idx).value }),
+            } => Some(unsafe { &mut self.levels[level_idx].table.get_mut(slot_idx).value }),
             SlotLocation::SpecialPrimary { slot_idx } => {
-                Some(unsafe { &mut self.special.primary_slots.get_mut(slot_idx).value })
+                Some(unsafe { &mut self.special.primary.get_mut(slot_idx).value })
             }
             SlotLocation::SpecialFallback { slot_idx } => {
-                Some(unsafe { &mut self.special.fallback_slots.get_mut(slot_idx).value })
+                Some(unsafe { &mut self.special.fallback.get_mut(slot_idx).value })
             }
         }
     }
@@ -327,22 +321,22 @@ where
             } => {
                 let level = &mut self.levels[level_idx];
                 // SAFETY: find returns only occupied slots.
-                let removed = unsafe { level.slots.take(slot_idx) };
-                level.controls[slot_idx] = CTRL_TOMBSTONE;
+                let removed = unsafe { level.table.take(slot_idx) };
+                *level.table.control_at_mut(slot_idx) = CTRL_TOMBSTONE;
                 level.len -= 1;
                 level.has_holes = true;
                 removed
             }
             SlotLocation::SpecialPrimary { slot_idx } => {
-                let removed = unsafe { self.special.primary_slots.take(slot_idx) };
-                self.special.primary_controls[slot_idx] = CTRL_TOMBSTONE;
+                let removed = unsafe { self.special.primary.take(slot_idx) };
+                *self.special.primary.control_at_mut(slot_idx) = CTRL_TOMBSTONE;
                 self.special.primary_len -= 1;
                 self.special.primary_has_holes = true;
                 removed
             }
             SlotLocation::SpecialFallback { slot_idx } => {
-                let removed = unsafe { self.special.fallback_slots.take(slot_idx) };
-                self.special.fallback_controls[slot_idx] = CTRL_TOMBSTONE;
+                let removed = unsafe { self.special.fallback.take(slot_idx) };
+                *self.special.fallback.control_at_mut(slot_idx) = CTRL_TOMBSTONE;
                 self.special.fallback_len -= 1;
                 self.special.fallback_has_holes = true;
                 removed
@@ -355,27 +349,27 @@ where
 
     pub fn clear(&mut self) {
         for level in &mut self.levels {
-            for (idx, control) in level.controls.iter_mut().enumerate() {
-                if is_occupied_control(*control) {
-                    unsafe { level.slots.drop_in_place(idx) };
+            for idx in 0..level.table.capacity() {
+                if level.table.control_at(idx).is_occupied() {
+                    unsafe { level.table.drop_in_place(idx) };
                 }
-                *control = CTRL_EMPTY;
+                *level.table.control_at_mut(idx) = CTRL_EMPTY;
             }
             level.len = 0;
             level.has_holes = false;
         }
 
-        for (idx, control) in self.special.primary_controls.iter_mut().enumerate() {
-            if is_occupied_control(*control) {
-                unsafe { self.special.primary_slots.drop_in_place(idx) };
+        for idx in 0..self.special.primary.capacity() {
+            if self.special.primary.control_at(idx).is_occupied() {
+                unsafe { self.special.primary.drop_in_place(idx) };
             }
-            *control = CTRL_EMPTY;
+            *self.special.primary.control_at_mut(idx) = CTRL_EMPTY;
         }
-        for (idx, control) in self.special.fallback_controls.iter_mut().enumerate() {
-            if is_occupied_control(*control) {
-                unsafe { self.special.fallback_slots.drop_in_place(idx) };
+        for idx in 0..self.special.fallback.capacity() {
+            if self.special.fallback.control_at(idx).is_occupied() {
+                unsafe { self.special.fallback.drop_in_place(idx) };
             }
-            *control = CTRL_EMPTY;
+            *self.special.fallback.control_at_mut(idx) = CTRL_EMPTY;
         }
         self.special.primary_len = 0;
         self.special.fallback_len = 0;
@@ -389,32 +383,32 @@ where
         let mut entries = Vec::with_capacity(self.len);
 
         for level in &mut self.levels {
-            for (idx, control) in level.controls.iter_mut().enumerate() {
-                if is_occupied_control(*control) {
-                    let entry = unsafe { level.slots.take(idx) };
+            for idx in 0..level.table.capacity() {
+                if level.table.control_at(idx).is_occupied() {
+                    let entry = unsafe { level.table.take(idx) };
                     entries.push((entry.key, entry.value));
-                    *control = CTRL_EMPTY;
+                    *level.table.control_at_mut(idx) = CTRL_EMPTY;
                 }
             }
             level.len = 0;
             level.has_holes = false;
         }
 
-        for (idx, control) in self.special.primary_controls.iter_mut().enumerate() {
-            if is_occupied_control(*control) {
-                let entry = unsafe { self.special.primary_slots.take(idx) };
+        for idx in 0..self.special.primary.capacity() {
+            if self.special.primary.control_at(idx).is_occupied() {
+                let entry = unsafe { self.special.primary.take(idx) };
                 entries.push((entry.key, entry.value));
-                *control = CTRL_EMPTY;
+                *self.special.primary.control_at_mut(idx) = CTRL_EMPTY;
             }
         }
         self.special.primary_len = 0;
         self.special.primary_has_holes = false;
 
-        for (idx, control) in self.special.fallback_controls.iter_mut().enumerate() {
-            if is_occupied_control(*control) {
-                let entry = unsafe { self.special.fallback_slots.take(idx) };
+        for idx in 0..self.special.fallback.capacity() {
+            if self.special.fallback.control_at(idx).is_occupied() {
+                let entry = unsafe { self.special.fallback.take(idx) };
                 entries.push((entry.key, entry.value));
-                *control = CTRL_EMPTY;
+                *self.special.fallback.control_at_mut(idx) = CTRL_EMPTY;
             }
         }
         self.special.fallback_len = 0;
@@ -423,7 +417,7 @@ where
         self.len = 0;
         self.max_populated_level = 0;
 
-        let hash_builder = std::mem::replace(&mut self.hash_builder, RandomState::new());
+        let hash_builder = std::mem::take(&mut self.hash_builder);
         let mut new_map =
             Self::with_params_and_hasher(new_capacity, self.reserve_fraction, hash_builder);
 
@@ -442,15 +436,15 @@ where
                 slot_idx,
             } => {
                 // SAFETY: caller guarantees slot is occupied.
-                let entry = unsafe { self.levels[level_idx].slots.get_mut(slot_idx) };
+                let entry = unsafe { self.levels[level_idx].table.get_mut(slot_idx) };
                 std::mem::replace(&mut entry.value, value)
             }
             SlotLocation::SpecialPrimary { slot_idx } => {
-                let entry = unsafe { self.special.primary_slots.get_mut(slot_idx) };
+                let entry = unsafe { self.special.primary.get_mut(slot_idx) };
                 std::mem::replace(&mut entry.value, value)
             }
             SlotLocation::SpecialFallback { slot_idx } => {
-                let entry = unsafe { self.special.fallback_slots.get_mut(slot_idx) };
+                let entry = unsafe { self.special.fallback.get_mut(slot_idx) };
                 std::mem::replace(&mut entry.value, value)
             }
         }
@@ -464,26 +458,22 @@ where
                 slot_idx,
             } => {
                 self.levels[level_idx]
-                    .slots
+                    .table
                     .write(slot_idx, Entry { key, value });
-                self.levels[level_idx].controls[slot_idx] = key_fingerprint;
+                *self.levels[level_idx].table.control_at_mut(slot_idx) = key_fingerprint;
                 self.levels[level_idx].len += 1;
                 if level_idx > self.max_populated_level {
                     self.max_populated_level = level_idx;
                 }
             }
             SlotLocation::SpecialPrimary { slot_idx } => {
-                self.special
-                    .primary_slots
-                    .write(slot_idx, Entry { key, value });
-                self.special.primary_controls[slot_idx] = key_fingerprint;
+                self.special.primary.write(slot_idx, Entry { key, value });
+                *self.special.primary.control_at_mut(slot_idx) = key_fingerprint;
                 self.special.primary_len += 1;
             }
             SlotLocation::SpecialFallback { slot_idx } => {
-                self.special
-                    .fallback_slots
-                    .write(slot_idx, Entry { key, value });
-                self.special.fallback_controls[slot_idx] = key_fingerprint;
+                self.special.fallback.write(slot_idx, Entry { key, value });
+                *self.special.fallback.control_at_mut(slot_idx) = key_fingerprint;
                 self.special.fallback_len += 1;
             }
         }
@@ -567,23 +557,26 @@ where
         let bucket_idx = self.level_bucket_index(key_hash, level_idx, bucket_count);
         let bucket_start = bucket_idx * level.bucket_size;
         let bucket_end = bucket_start + level.bucket_size;
-        let free_offset = find_first_free_control(&level.controls[bucket_start..bucket_end])?;
+        let free_offset = level
+            .table
+            .controls(bucket_start..bucket_end)
+            .find_first_free()?;
         Some(bucket_start + free_offset)
     }
 
     #[inline]
     fn first_free_in_special_primary(&self, key_hash: u64) -> Option<usize> {
-        if self.special.primary_slots.len() == 0
-            || self.special.primary_len >= self.special.primary_slots.len()
+        if self.special.primary.capacity() == 0
+            || self.special.primary_len >= self.special.primary.capacity()
         {
             return None;
         }
 
-        let slot_count = self.special.primary_slots.len();
+        let slot_count = self.special.primary.capacity();
         let (start, step) = self.special_primary_probe_params(key_hash, slot_count);
         let mut slot_idx = start;
         for _ in 0..self.primary_probe_limit {
-            if is_free_control(self.special.primary_controls[slot_idx]) {
+            if self.special.primary.control_at(slot_idx).is_free() {
                 return Some(slot_idx);
             }
             slot_idx = advance_wrapping_index(slot_idx, step, slot_count);
@@ -593,8 +586,8 @@ where
 
     #[inline]
     fn first_free_in_special_fallback(&self, key_hash: u64) -> Option<usize> {
-        if self.special.fallback_slots.len() == 0
-            || self.special.fallback_len >= self.special.fallback_slots.len()
+        if self.special.fallback.capacity() == 0
+            || self.special.fallback_len >= self.special.fallback.capacity()
         {
             return None;
         }
@@ -612,12 +605,12 @@ where
 
         for offset in 0..bucket_size {
             let idx_a = base_a + offset;
-            if is_free_control(self.special.fallback_controls[idx_a]) {
+            if self.special.fallback.control_at(idx_a).is_free() {
                 return Some(idx_a);
             }
 
             let idx_b = base_b + offset;
-            if is_free_control(self.special.fallback_controls[idx_b]) {
+            if self.special.fallback.control_at(idx_b).is_free() {
                 return Some(idx_b);
             }
         }
@@ -650,21 +643,21 @@ where
         let bucket_idx = self.level_bucket_index(key_hash, level_idx, bucket_count);
         let bucket_start = bucket_idx * level.bucket_size;
         let bucket_end = bucket_start + level.bucket_size;
-        let controls = &level.controls[bucket_start..bucket_end];
+        let controls = level.table.controls(bucket_start..bucket_end);
 
         let searchable_len = if level.has_holes {
             controls.len()
         } else {
-            find_first_control(controls, CTRL_EMPTY).unwrap_or(controls.len())
+            controls.find_first(CTRL_EMPTY).unwrap_or(controls.len())
         };
 
         let mut match_offset = 0usize;
         while let Some(relative_idx) =
-            find_next_control(&controls[..searchable_len], key_fingerprint, match_offset)
+            controls[..searchable_len].find_next(key_fingerprint, match_offset)
         {
             let slot_idx = bucket_start + relative_idx;
             // SAFETY: fingerprint match means slot is occupied.
-            let entry = unsafe { level.slots.get_ref(slot_idx) };
+            let entry = unsafe { level.table.get_ref(slot_idx) };
             if entry.key.borrow() == key {
                 return LookupStep::Found(slot_idx);
             }
@@ -687,18 +680,18 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        if self.special.primary_slots.len() == 0 {
+        if self.special.primary.capacity() == 0 {
             return LookupStep::Continue;
         }
 
-        let slot_count = self.special.primary_slots.len();
+        let slot_count = self.special.primary.capacity();
         let (start, step) = self.special_primary_probe_params(key_hash, slot_count);
         let mut slot_idx = start;
         for _ in 0..self.primary_probe_limit.max(1) {
-            let control = self.special.primary_controls[slot_idx];
+            let control = self.special.primary.control_at(slot_idx);
             if control == key_fingerprint {
                 // SAFETY: fingerprint match means slot is occupied.
-                let entry = unsafe { self.special.primary_slots.get_ref(slot_idx) };
+                let entry = unsafe { self.special.primary.get_ref(slot_idx) };
                 if entry.key.borrow() == key {
                     return LookupStep::Found(slot_idx);
                 }
@@ -723,7 +716,7 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        if self.special.fallback_slots.len() == 0 {
+        if self.special.fallback.capacity() == 0 {
             return None;
         }
 
@@ -740,10 +733,10 @@ where
 
         for offset in 0..bucket_size {
             let idx_a = base_a + offset;
-            let control_a = self.special.fallback_controls[idx_a];
+            let control_a = self.special.fallback.control_at(idx_a);
             if control_a == key_fingerprint {
                 // SAFETY: fingerprint match means slot is occupied.
-                let entry = unsafe { self.special.fallback_slots.get_ref(idx_a) };
+                let entry = unsafe { self.special.fallback.get_ref(idx_a) };
                 if entry.key.borrow() == key {
                     return Some(idx_a);
                 }
@@ -753,9 +746,9 @@ where
             }
 
             let idx_b = base_b + offset;
-            let control_b = self.special.fallback_controls[idx_b];
+            let control_b = self.special.fallback.control_at(idx_b);
             if control_b == key_fingerprint {
-                let entry = unsafe { self.special.fallback_slots.get_ref(idx_b) };
+                let entry = unsafe { self.special.fallback.get_ref(idx_b) };
                 if entry.key.borrow() == key {
                     return Some(idx_b);
                 }
@@ -987,7 +980,7 @@ mod tests {
         let capacity = 257;
         let map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(capacity);
         let level_capacity = map.levels.iter().map(BucketLevel::capacity).sum::<usize>();
-        let special_capacity = map.special.primary_slots.len() + map.special.fallback_slots.len();
+        let special_capacity = map.special.primary.capacity() + map.special.fallback.capacity();
 
         assert_eq!(level_capacity + special_capacity, map.capacity());
         assert_eq!(map.capacity(), capacity);

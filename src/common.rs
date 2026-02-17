@@ -2,7 +2,10 @@
 use core::arch::aarch64::{
     vaddv_u8, vceqq_u8, vdupq_n_u8, vget_high_u8, vget_low_u8, vld1q_u8, vmulq_u8, vshrq_n_u8,
 };
-use std::mem::MaybeUninit;
+use std::alloc::{self, Layout};
+use std::marker::PhantomData;
+use std::ops::Index;
+use std::ptr::{self, NonNull};
 
 pub(crate) const DEFAULT_RESERVE_FRACTION: f64 = 0.10;
 pub(crate) const MIN_RESERVE_FRACTION: f64 = 1e-6;
@@ -16,75 +19,164 @@ pub(crate) struct Entry<K, V> {
     pub(crate) value: V,
 }
 
-/// A contiguous buffer of possibly-uninitialized entries.
+/// A single contiguous allocation holding both data slots and control bytes.
 ///
-/// Occupancy is tracked externally via control bytes; `RawSlots` never
-/// reads a slot unless the caller guarantees it has been initialized.
-pub(crate) struct RawSlots<T> {
-    slots: Vec<MaybeUninit<T>>,
+/// Layout: `[T0, T1, ..., T_{n-1}, C0, C1, ..., C_{n-1}]`
+///
+/// Control bytes are initialized to `CTRL_EMPTY` on creation. Slot occupancy
+/// is tracked via control bytes; `RawTable` never reads a slot unless the
+/// caller guarantees it has been initialized.
+pub(crate) struct RawTable<T> {
+    ptr: NonNull<u8>,
+    capacity: usize,
+    _marker: PhantomData<T>,
 }
 
-impl<T: std::fmt::Debug> std::fmt::Debug for RawSlots<T> {
+impl<T> std::fmt::Debug for RawTable<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RawSlots")
-            .field("len", &self.slots.len())
+        f.debug_struct("RawTable")
+            .field("capacity", &self.capacity)
             .finish()
     }
 }
 
-impl<T> RawSlots<T> {
+/// The `Drop` impl deallocates memory but does NOT drop contained `T` values.
+/// The owning struct must drop occupied entries before dropping the `RawTable`.
+impl<T> Drop for RawTable<T> {
+    fn drop(&mut self) {
+        if self.capacity > 0 {
+            let layout = Self::layout(self.capacity);
+            unsafe { alloc::dealloc(self.ptr.as_ptr(), layout) };
+        }
+    }
+}
+
+impl<T> RawTable<T> {
     pub fn new(capacity: usize) -> Self {
-        let mut slots = Vec::with_capacity(capacity);
-        // SAFETY: MaybeUninit<T> does not require initialization.
-        unsafe { slots.set_len(capacity) };
-        Self { slots }
+        if capacity == 0 {
+            return Self {
+                ptr: NonNull::dangling(),
+                capacity: 0,
+                _marker: PhantomData,
+            };
+        }
+
+        let layout = Self::layout(capacity);
+        // SAFETY: layout has non-zero size because capacity > 0.
+        let raw_ptr = unsafe { alloc::alloc(layout) };
+        let ptr = NonNull::new(raw_ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+
+        // Initialize control bytes to CTRL_EMPTY.
+        unsafe {
+            let ctrl_offset = capacity * std::mem::size_of::<T>();
+            let ctrl_ptr = ptr.as_ptr().add(ctrl_offset);
+            ptr::write_bytes(ctrl_ptr, CTRL_EMPTY, capacity);
+        }
+
+        Self {
+            ptr,
+            capacity,
+            _marker: PhantomData,
+        }
+    }
+
+    fn layout(capacity: usize) -> Layout {
+        let slots = Layout::array::<T>(capacity).expect("layout overflow");
+        let ctrls = Layout::array::<u8>(capacity).expect("layout overflow");
+        let (layout, _) = slots.extend(ctrls).expect("layout overflow");
+        layout.pad_to_align()
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
-        self.slots.len()
+    fn ctrl_offset(&self) -> usize {
+        self.capacity * std::mem::size_of::<T>()
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    #[inline]
+    pub fn controls<I>(&self, range: I) -> &I::Output
+    where
+        I: std::slice::SliceIndex<[u8]>,
+    {
+        if self.capacity == 0 {
+            return [].index(range);
+        }
+        unsafe {
+            let ctrl_ptr = self.ptr.as_ptr().add(self.ctrl_offset());
+            std::slice::from_raw_parts(ctrl_ptr, self.capacity).index(range)
+        }
+    }
+
+    #[inline]
+    pub fn control_at(&self, idx: usize) -> u8 {
+        unsafe { *self.ptr.as_ptr().add(self.ctrl_offset() + idx) }
+    }
+
+    #[inline]
+    pub fn control_at_mut(&mut self, idx: usize) -> &mut u8 {
+        unsafe { &mut *self.ptr.as_ptr().add(self.ctrl_offset() + idx) }
     }
 
     /// Write a value into the slot at `idx`, overwriting any previous content.
     #[inline]
     pub fn write(&mut self, idx: usize, value: T) {
-        self.slots[idx] = MaybeUninit::new(value);
+        unsafe {
+            self.ptr.as_ptr().cast::<T>().add(idx).write(value);
+        }
     }
 
     /// # Safety
     /// The slot at `idx` must have been previously initialized via `write`.
     #[inline]
     pub unsafe fn get_ref(&self, idx: usize) -> &T {
-        unsafe { self.slots[idx].assume_init_ref() }
+        unsafe { &*self.ptr.as_ptr().cast::<T>().add(idx) }
     }
 
     /// # Safety
     /// The slot at `idx` must have been previously initialized via `write`.
     #[inline]
     pub unsafe fn get_mut(&mut self, idx: usize) -> &mut T {
-        unsafe { self.slots[idx].assume_init_mut() }
+        unsafe { &mut *self.ptr.as_ptr().cast::<T>().add(idx) }
     }
 
+    /// Read the value out of the slot at `idx`, leaving it uninitialized.
+    ///
     /// # Safety
     /// The slot at `idx` must have been previously initialized via `write`.
     #[inline]
     pub unsafe fn take(&mut self, idx: usize) -> T {
-        unsafe { self.slots[idx].assume_init_read() }
+        unsafe { self.ptr.as_ptr().cast::<T>().add(idx).read() }
     }
 
+    /// Drop the value in the slot at `idx` in place.
+    ///
     /// # Safety
     /// The slot at `idx` must have been previously initialized via `write`.
     #[inline]
     pub unsafe fn drop_in_place(&mut self, idx: usize) {
-        unsafe { self.slots[idx].assume_init_drop() }
+        unsafe { ptr::drop_in_place(self.ptr.as_ptr().cast::<T>().add(idx)) }
     }
 }
 
-/// Returns true if the control byte represents an occupied slot
-/// (valid fingerprint in `1..=0x7F`).
-#[inline]
-pub(crate) fn is_occupied_control(control: u8) -> bool {
-    control != CTRL_EMPTY && control != CTRL_TOMBSTONE
+pub(crate) trait ControlByte {
+    fn is_occupied(self) -> bool;
+    fn is_free(self) -> bool;
+}
+
+impl ControlByte for u8 {
+    #[inline]
+    fn is_occupied(self) -> bool {
+        self != CTRL_EMPTY && self != CTRL_TOMBSTONE
+    }
+
+    #[inline]
+    fn is_free(self) -> bool {
+        self == CTRL_EMPTY || self == CTRL_TOMBSTONE
+    }
 }
 
 pub(crate) fn sanitize_reserve_fraction(reserve_fraction: f64) -> f64 {
@@ -110,11 +202,6 @@ pub(crate) fn control_fingerprint(hash: u64) -> u8 {
     low.max(1)
 }
 
-#[inline]
-pub(crate) fn is_free_control(control: u8) -> bool {
-    control == CTRL_EMPTY || control == CTRL_TOMBSTONE
-}
-
 pub(crate) fn greatest_common_divisor(mut a: usize, mut b: usize) -> usize {
     while b != 0 {
         let remainder = a % b;
@@ -130,122 +217,122 @@ pub(crate) fn advance_wrapping_index(current: usize, step: usize, len: usize) ->
     if next >= len { next - len } else { next }
 }
 
-#[inline]
-pub(crate) fn find_first_free_control(controls: &[u8]) -> Option<usize> {
-    if controls.len() < 16 {
-        return controls
-            .iter()
-            .position(|&control| is_free_control(control));
-    }
-
-    let mut index = 0usize;
-    while index + 16 <= controls.len() {
-        let mask = free_mask_16(&controls[index..index + 16]);
-        if mask != 0 {
-            return Some(index + mask.trailing_zeros() as usize);
-        }
-        index += 16;
-    }
-
-    for (offset, &control) in controls[index..].iter().enumerate() {
-        if is_free_control(control) {
-            return Some(index + offset);
-        }
-    }
-
-    None
+pub(crate) trait Controls {
+    fn find_first_free(&self) -> Option<usize>;
+    fn find_first(&self, target: u8) -> Option<usize>;
+    fn find_next(&self, target: u8, start: usize) -> Option<usize>;
+    fn free_mask(&self) -> u16;
+    fn eq_mask(&self, target: u8) -> u16;
 }
 
-#[inline]
-pub(crate) fn find_first_control(controls: &[u8], target: u8) -> Option<usize> {
-    find_next_control(controls, target, 0)
-}
+impl Controls for [u8] {
+    #[inline]
+    fn find_first_free(&self) -> Option<usize> {
+        if self.len() < 16 {
+            return self.iter().position(|&control| control.is_free());
+        }
 
-#[inline]
-pub(crate) fn find_next_control(controls: &[u8], target: u8, start: usize) -> Option<usize> {
-    if start >= controls.len() {
-        return None;
-    }
+        let mut index = 0usize;
+        while index + 16 <= self.len() {
+            let mask = self[index..index + 16].free_mask();
+            if mask != 0 {
+                return Some(index + mask.trailing_zeros() as usize);
+            }
+            index += 16;
+        }
 
-    if controls.len() - start < 16 {
-        for (offset, &control) in controls[start..].iter().enumerate() {
-            if control == target {
-                return Some(start + offset);
+        for (offset, &control) in self[index..].iter().enumerate() {
+            if control.is_free() {
+                return Some(index + offset);
             }
         }
-        return None;
+
+        None
     }
 
-    let mut index = start;
-    while index + 16 <= controls.len() {
-        let mask = eq_mask_16(&controls[index..index + 16], target);
-        if mask != 0 {
-            return Some(index + mask.trailing_zeros() as usize);
+    #[inline]
+    fn find_first(&self, target: u8) -> Option<usize> {
+        self.find_next(target, 0)
+    }
+
+    #[inline]
+    fn find_next(&self, target: u8, start: usize) -> Option<usize> {
+        if start >= self.len() {
+            return None;
         }
-        index += 16;
-    }
 
-    for (offset, &control) in controls[index..].iter().enumerate() {
-        if control == target {
-            return Some(index + offset);
+        if self.len() - start < 16 {
+            for (offset, &control) in self[start..].iter().enumerate() {
+                if control == target {
+                    return Some(start + offset);
+                }
+            }
+            return None;
         }
+
+        let mut index = start;
+        while index + 16 <= self.len() {
+            let mask = self[index..index + 16].eq_mask(target);
+            if mask != 0 {
+                return Some(index + mask.trailing_zeros() as usize);
+            }
+            index += 16;
+        }
+
+        for (offset, &control) in self[index..].iter().enumerate() {
+            if control == target {
+                return Some(index + offset);
+            }
+        }
+
+        None
     }
 
-    None
-}
+    #[inline]
+    fn free_mask(&self) -> u16 {
+        debug_assert!(self.len() == 16);
 
-#[inline]
-fn free_mask_16(chunk: &[u8]) -> u16 {
-    debug_assert!(chunk.len() == 16);
+        #[cfg(target_arch = "aarch64")]
+        {
+            unsafe { free_mask_16_neon(self.as_ptr()) }
+        }
 
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: `chunk` has exactly 16 bytes by construction.
-        unsafe { free_mask_16_neon(chunk.as_ptr()) }
-    }
+        #[cfg(target_arch = "x86_64")]
+        {
+            unsafe { free_mask_16_sse2(self.as_ptr()) }
+        }
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        unsafe { free_mask_16_sse2(chunk.as_ptr()) }
-    }
-
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        eq_mask_16_scalar(chunk, CTRL_EMPTY) | eq_mask_16_scalar(chunk, CTRL_TOMBSTONE)
-    }
-}
-
-#[inline]
-fn eq_mask_16(chunk: &[u8], target: u8) -> u16 {
-    debug_assert!(chunk.len() == 16);
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: `chunk` has exactly 16 bytes by construction.
-        unsafe { eq_mask_16_neon(chunk.as_ptr(), target) }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        unsafe { eq_mask_16_sse2(chunk.as_ptr(), target) }
-    }
-
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        eq_mask_16_scalar(chunk, target)
-    }
-}
-
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-#[inline]
-fn eq_mask_16_scalar(chunk: &[u8], target: u8) -> u16 {
-    let mut mask = 0u16;
-    for (idx, &value) in chunk.iter().enumerate() {
-        if value == target {
-            mask |= 1 << idx;
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            self.eq_mask(CTRL_EMPTY) | self.eq_mask(CTRL_TOMBSTONE)
         }
     }
-    mask
+
+    #[inline]
+    fn eq_mask(&self, target: u8) -> u16 {
+        debug_assert!(self.len() == 16);
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            unsafe { eq_mask_16_neon(self.as_ptr(), target) }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            unsafe { eq_mask_16_sse2(self.as_ptr(), target) }
+        }
+
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let mut mask = 0u16;
+            for (idx, &value) in self.iter().enumerate() {
+                if value == target {
+                    mask |= 1 << idx;
+                }
+            }
+            mask
+        }
+    }
 }
 
 // --- AArch64 NEON SIMD ---
