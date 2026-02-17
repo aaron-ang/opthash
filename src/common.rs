@@ -162,6 +162,7 @@ impl<T> RawTable<T> {
     }
 }
 
+#[allow(clippy::wrong_self_convention)]
 pub(crate) trait ControlByte {
     fn is_occupied(self) -> bool;
     fn is_free(self) -> bool;
