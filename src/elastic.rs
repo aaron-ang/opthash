@@ -162,12 +162,7 @@ where
         self.advance_batch_window();
         let (level_idx, slot_idx) = self
             .choose_slot_for_new_key(key_hash)
-            .unwrap_or_else(|| {
-                panic!(
-                    "ElasticHashMap: no free slot found; resize not yet implemented (capacity={}, len={})",
-                    self.capacity, self.len
-                )
-            });
+            .expect("no free slot found after resize");
 
         self.levels[level_idx]
             .table

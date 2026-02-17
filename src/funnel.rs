@@ -238,12 +238,7 @@ where
 
         let insertion_slot = self
             .choose_slot_for_new_key(key_hash)
-            .unwrap_or_else(|| {
-                panic!(
-                    "FunnelHashMap: no free slot found; resize not yet implemented (capacity={}, len={})",
-                    self.capacity, self.len
-                )
-            });
+            .expect("no free slot found after resize");
 
         self.place_new_entry(insertion_slot, key, value, key_fingerprint);
         None
