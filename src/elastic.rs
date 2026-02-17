@@ -3,37 +3,53 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
 use crate::common::{
-    DEFAULT_CAPACITY, DEFAULT_RESERVE_FRACTION, Entry, ceil_three_quarters, empty_slots,
-    floor_half_reserve_slots, sanitize_reserve_fraction,
+    CTRL_EMPTY, CTRL_TOMBSTONE, DEFAULT_RESERVE_FRACTION, Entry, RawSlots,
+    advance_wrapping_index, ceil_three_quarters, control_fingerprint, find_first_free_control,
+    floor_half_reserve_slots, greatest_common_divisor, is_free_control, is_occupied_control,
+    sanitize_reserve_fraction,
 };
 
 const DEFAULT_PROBE_SCALE: f64 = 16.0;
-const DOMAIN_PROBE_START: u8 = 1;
-const DOMAIN_PROBE_STEP: u8 = 2;
+const INITIAL_CAPACITY: usize = 16;
 
 #[derive(Debug)]
 struct Level<K, V> {
-    slots: Vec<Option<Entry<K, V>>>,
+    slots: RawSlots<Entry<K, V>>,
+    controls: Vec<u8>,
     len: usize,
 }
 
 impl<K, V> Level<K, V> {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            slots: empty_slots(capacity),
+            slots: RawSlots::new(capacity),
+            controls: vec![CTRL_EMPTY; capacity],
             len: 0,
         }
     }
 
+    #[inline]
     fn capacity(&self) -> usize {
         self.slots.len()
     }
 
+    #[inline]
     fn free_fraction(&self) -> f64 {
         if self.capacity() == 0 {
             0.0
         } else {
             1.0 - (self.len as f64 / self.capacity() as f64)
+        }
+    }
+}
+
+impl<K, V> Drop for Level<K, V> {
+    fn drop(&mut self) {
+        for (idx, &control) in self.controls.iter().enumerate() {
+            if is_occupied_control(control) {
+                // SAFETY: occupied control means the slot was initialized via write.
+                unsafe { self.slots.drop_in_place(idx) };
+            }
         }
     }
 }
@@ -49,6 +65,7 @@ pub struct ElasticHashMap<K, V> {
     batch_plan: Vec<usize>,
     current_batch_index: usize,
     batch_remaining: usize,
+    max_populated_level: usize,
     hash_builder: RandomState,
 }
 
@@ -66,11 +83,7 @@ where
     K: Eq + Hash,
 {
     pub fn new() -> Self {
-        Self::with_params(
-            DEFAULT_CAPACITY,
-            DEFAULT_RESERVE_FRACTION,
-            DEFAULT_PROBE_SCALE,
-        )
+        Self::with_capacity(0)
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
@@ -78,6 +91,15 @@ where
     }
 
     fn with_params(capacity: usize, reserve_fraction: f64, probe_scale: f64) -> Self {
+        Self::with_params_and_hasher(capacity, reserve_fraction, probe_scale, RandomState::new())
+    }
+
+    fn with_params_and_hasher(
+        capacity: usize,
+        reserve_fraction: f64,
+        probe_scale: f64,
+        hash_builder: RandomState,
+    ) -> Self {
         let reserve_fraction = sanitize_reserve_fraction(reserve_fraction);
         let probe_scale = sanitize_probe_scale(probe_scale);
 
@@ -102,7 +124,8 @@ where
             batch_plan,
             current_batch_index: 0,
             batch_remaining,
-            hash_builder: RandomState::new(),
+            max_populated_level: 0,
+            hash_builder,
         }
     }
 
@@ -119,26 +142,46 @@ where
     }
 
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        if let Some((level_idx, slot_idx)) = self.find_slot_indices(&key) {
-            let entry = self.levels[level_idx].slots[slot_idx]
-                .as_mut()
-                .expect("slot index returned by find_slot_indices must be occupied");
+        let key_hash = self.hash_key(&key);
+        let key_fingerprint = control_fingerprint(key_hash);
+
+        if let Some((level_idx, slot_idx)) =
+            self.find_slot_indices_with_hash(&key, key_hash, key_fingerprint)
+        {
+            // SAFETY: find_slot_indices_with_hash only returns occupied slots.
+            let entry = unsafe { self.levels[level_idx].slots.get_mut(slot_idx) };
             let old = std::mem::replace(&mut entry.value, value);
             return Some(old);
         }
 
         if self.len >= self.max_insertions {
-            todo!("resize on capacity reached");
+            let new_capacity = if self.capacity == 0 {
+                INITIAL_CAPACITY
+            } else {
+                self.capacity.saturating_mul(2)
+            };
+            self.resize(new_capacity);
         }
 
         self.advance_batch_window();
         let (level_idx, slot_idx) = self
-            .choose_slot_for_new_key(&key)
-            .unwrap_or_else(|| todo!("resize on capacity reached"));
+            .choose_slot_for_new_key(key_hash)
+            .unwrap_or_else(|| {
+                panic!(
+                    "ElasticHashMap: no free slot found; resize not yet implemented (capacity={}, len={})",
+                    self.capacity, self.len
+                )
+            });
 
-        self.levels[level_idx].slots[slot_idx] = Some(Entry { key, value });
+        self.levels[level_idx]
+            .slots
+            .write(slot_idx, Entry { key, value });
+        self.levels[level_idx].controls[slot_idx] = key_fingerprint;
         self.levels[level_idx].len += 1;
         self.len += 1;
+        if level_idx > self.max_populated_level {
+            self.max_populated_level = level_idx;
+        }
         if self.batch_remaining > 0 {
             self.batch_remaining -= 1;
         }
@@ -151,12 +194,12 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        if let Some((level_idx, slot_idx)) = self.find_slot_indices(key) {
-            return self.levels[level_idx].slots[slot_idx]
-                .as_ref()
-                .map(|entry| &entry.value);
-        }
-        None
+        let key_hash = self.hash_key(key);
+        let key_fingerprint = control_fingerprint(key_hash);
+        let (level_idx, slot_idx) =
+            self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
+        // SAFETY: find_slot_indices_with_hash only returns occupied slots.
+        Some(unsafe { &self.levels[level_idx].slots.get_ref(slot_idx).value })
     }
 
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
@@ -164,10 +207,12 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let (level_idx, slot_idx) = self.find_slot_indices(key)?;
-        self.levels[level_idx].slots[slot_idx]
-            .as_mut()
-            .map(|entry| &mut entry.value)
+        let key_hash = self.hash_key(key);
+        let key_fingerprint = control_fingerprint(key_hash);
+        let (level_idx, slot_idx) =
+            self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
+        // SAFETY: find_slot_indices_with_hash only returns occupied slots.
+        Some(unsafe { &mut self.levels[level_idx].slots.get_mut(slot_idx).value })
     }
 
     pub fn contains_key<Q>(&self, key: &Q) -> bool
@@ -175,7 +220,10 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.find_slot_indices(key).is_some()
+        let key_hash = self.hash_key(key);
+        let key_fingerprint = control_fingerprint(key_hash);
+        self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)
+            .is_some()
     }
 
     pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
@@ -183,9 +231,14 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let (level_idx, slot_idx) = self.find_slot_indices(key)?;
+        let key_hash = self.hash_key(key);
+        let key_fingerprint = control_fingerprint(key_hash);
+        let (level_idx, slot_idx) =
+            self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
         let level = &mut self.levels[level_idx];
-        let removed_entry = level.slots[slot_idx].take()?;
+        // SAFETY: find_slot_indices_with_hash only returns occupied slots.
+        let removed_entry = unsafe { level.slots.take(slot_idx) };
+        level.controls[slot_idx] = CTRL_TOMBSTONE;
         level.len -= 1;
         self.len -= 1;
         Some(removed_entry.value)
@@ -193,16 +246,54 @@ where
 
     pub fn clear(&mut self) {
         for level in &mut self.levels {
-            for slot in &mut level.slots {
-                *slot = None;
+            for (idx, control) in level.controls.iter_mut().enumerate() {
+                if is_occupied_control(*control) {
+                    // SAFETY: occupied control means slot was initialized.
+                    unsafe { level.slots.drop_in_place(idx) };
+                }
+                *control = CTRL_EMPTY;
             }
             level.len = 0;
         }
         self.len = 0;
         self.current_batch_index = 0;
         self.batch_remaining = self.batch_plan.first().copied().unwrap_or(0);
+        self.max_populated_level = 0;
     }
 
+    fn resize(&mut self, new_capacity: usize) {
+        let mut entries = Vec::with_capacity(self.len);
+
+        for level in &mut self.levels {
+            for (idx, control) in level.controls.iter_mut().enumerate() {
+                if is_occupied_control(*control) {
+                    let entry = unsafe { level.slots.take(idx) };
+                    entries.push((entry.key, entry.value));
+                    *control = CTRL_EMPTY;
+                }
+            }
+            level.len = 0;
+        }
+        self.len = 0;
+        self.max_populated_level = 0;
+
+        let hash_builder =
+            std::mem::replace(&mut self.hash_builder, RandomState::new());
+        let mut new_map = Self::with_params_and_hasher(
+            new_capacity,
+            self.reserve_fraction,
+            self.probe_scale,
+            hash_builder,
+        );
+
+        for (key, value) in entries {
+            new_map.insert(key, value);
+        }
+
+        *self = new_map;
+    }
+
+    #[inline]
     fn advance_batch_window(&mut self) {
         while self.batch_remaining == 0 && self.current_batch_index + 1 < self.batch_plan.len() {
             self.current_batch_index += 1;
@@ -210,12 +301,11 @@ where
         }
     }
 
-    fn choose_slot_for_new_key(&self, key: &K) -> Option<(usize, usize)> {
+    #[inline]
+    fn choose_slot_for_new_key(&self, key_hash: u64) -> Option<(usize, usize)> {
         if self.levels.is_empty() {
             return None;
         }
-
-        let key_hash = self.hash_key(key);
 
         if self.current_batch_index == 0 {
             return self
@@ -264,29 +354,39 @@ where
             .map(|slot_idx| (level_idx + 1, slot_idx))
     }
 
-    fn find_slot_indices<Q>(&self, key: &Q) -> Option<(usize, usize)>
+    #[inline]
+    fn find_slot_indices_with_hash<Q>(
+        &self,
+        key: &Q,
+        key_hash: u64,
+        key_fingerprint: u8,
+    ) -> Option<(usize, usize)>
     where
         K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Eq + ?Sized,
     {
-        let key_hash = self.hash_key(key);
-        for level_idx in 0..self.levels.len() {
-            if let Some(slot_idx) = self.find_in_level_by_probe(key_hash, key, level_idx) {
+        let search_limit = (self.max_populated_level + 1).min(self.levels.len());
+        for level_idx in 0..search_limit {
+            if let Some(slot_idx) =
+                self.find_in_level_by_probe(key_hash, key_fingerprint, key, level_idx)
+            {
                 return Some((level_idx, slot_idx));
             }
         }
         None
     }
 
+    #[inline]
     fn probe_limit_for_free_fraction(&self, free_fraction: f64) -> usize {
         let bounded_free_fraction = free_fraction.clamp(1e-12, 1.0);
-        let log_inverse_free_fraction = (1.0 / bounded_free_fraction).log2();
+        let log_sq_inverse_free_fraction = (1.0 / bounded_free_fraction).log2().powi(2);
         let log_inverse_reserve_fraction = (1.0 / self.reserve_fraction).log2();
         let probe_budget =
-            self.probe_scale * log_inverse_free_fraction.min(log_inverse_reserve_fraction);
+            self.probe_scale * log_sq_inverse_free_fraction.min(log_inverse_reserve_fraction);
         probe_budget.ceil().max(1.0) as usize
     }
 
+    #[inline]
     fn hash_key<Q>(&self, key: &Q) -> u64
     where
         Q: Hash + ?Sized,
@@ -294,7 +394,14 @@ where
         self.hash_builder.hash_one(key)
     }
 
-    fn find_in_level_by_probe<Q>(&self, key_hash: u64, key: &Q, level_idx: usize) -> Option<usize>
+    #[inline]
+    fn find_in_level_by_probe<Q>(
+        &self,
+        key_hash: u64,
+        key_fingerprint: u8,
+        key: &Q,
+        level_idx: usize,
+    ) -> Option<usize>
     where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
@@ -307,35 +414,35 @@ where
 
         let (probe_start, probe_step) =
             self.probe_sequence_start_step(key_hash, level_idx, level_cap);
-        for probe in 0..level_cap {
-            let slot_idx = probe_slot_index(probe_start, probe_step, probe, level_cap);
-            if level.slots[slot_idx]
-                .as_ref()
-                .is_some_and(|entry| entry.key.borrow() == key)
-            {
-                return Some(slot_idx);
+        let mut slot_idx = probe_start;
+        for _ in 0..level_cap {
+            let control = level.controls[slot_idx];
+            if control == CTRL_EMPTY {
+                return None;
             }
+            if control == key_fingerprint {
+                // SAFETY: fingerprint match means slot is occupied (fingerprints are 1..=0x7F).
+                let entry = unsafe { level.slots.get_ref(slot_idx) };
+                if entry.key.borrow() == key {
+                    return Some(slot_idx);
+                }
+            }
+            slot_idx = advance_wrapping_index(slot_idx, probe_step, level_cap);
         }
 
         None
     }
 
+    #[inline]
     fn probe_sequence_start_step(
         &self,
         key_hash: u64,
         level_idx: usize,
         level_cap: usize,
     ) -> (usize, usize) {
-        let probe_start = (self
-            .hash_builder
-            .hash_one((DOMAIN_PROBE_START, key_hash, level_idx))
-            as usize)
-            % level_cap;
-        let mut probe_step = (self
-            .hash_builder
-            .hash_one((DOMAIN_PROBE_STEP, key_hash, level_idx))
-            as usize)
-            % level_cap;
+        let rotated = key_hash.rotate_left((level_idx as u32 * 7) % 64);
+        let probe_start = (rotated as usize) % level_cap;
+        let mut probe_step = (rotated.rotate_left(32) as usize) % level_cap;
         if probe_step == 0 {
             probe_step = 1;
         }
@@ -350,6 +457,7 @@ where
         (probe_start, probe_step)
     }
 
+    #[inline]
     fn first_free_limited(
         &self,
         key_hash: u64,
@@ -364,15 +472,35 @@ where
 
         let (probe_start, probe_step) =
             self.probe_sequence_start_step(key_hash, level_idx, level_cap);
-        for probe in 0..probe_limit.min(level_cap) {
-            let slot_idx = probe_slot_index(probe_start, probe_step, probe, level_cap);
-            if level.slots[slot_idx].is_none() {
+        let max_probes = probe_limit.min(level_cap);
+        if probe_step == 1 {
+            let first_run = max_probes.min(level_cap - probe_start);
+            if let Some(offset) =
+                find_first_free_control(&level.controls[probe_start..probe_start + first_run])
+            {
+                return Some(probe_start + offset);
+            }
+
+            let wrapped = max_probes - first_run;
+            if wrapped > 0
+                && let Some(offset) = find_first_free_control(&level.controls[..wrapped])
+            {
+                return Some(offset);
+            }
+            return None;
+        }
+
+        let mut slot_idx = probe_start;
+        for _ in 0..max_probes {
+            if is_free_control(level.controls[slot_idx]) {
                 return Some(slot_idx);
             }
+            slot_idx = advance_wrapping_index(slot_idx, probe_step, level_cap);
         }
         None
     }
 
+    #[inline]
     fn first_free_uniform(&self, key_hash: u64, level_idx: usize) -> Option<usize> {
         let level = &self.levels[level_idx];
         let level_cap = level.capacity();
@@ -382,33 +510,23 @@ where
 
         let (probe_start, probe_step) =
             self.probe_sequence_start_step(key_hash, level_idx, level_cap);
-        for probe in 0..level_cap {
-            let slot_idx = probe_slot_index(probe_start, probe_step, probe, level_cap);
-            if level.slots[slot_idx].is_none() {
+        if probe_step == 1 {
+            if let Some(offset) = find_first_free_control(&level.controls[probe_start..]) {
+                return Some(probe_start + offset);
+            }
+            return find_first_free_control(&level.controls[..probe_start]);
+        }
+
+        let mut slot_idx = probe_start;
+        for _ in 0..level_cap {
+            if is_free_control(level.controls[slot_idx]) {
                 return Some(slot_idx);
             }
+            slot_idx = advance_wrapping_index(slot_idx, probe_step, level_cap);
         }
 
         None
     }
-}
-
-fn probe_slot_index(
-    probe_start: usize,
-    probe_step: usize,
-    probe: usize,
-    level_cap: usize,
-) -> usize {
-    (probe_start + probe.saturating_mul(probe_step)) % level_cap
-}
-
-fn greatest_common_divisor(mut a: usize, mut b: usize) -> usize {
-    while b != 0 {
-        let remainder = a % b;
-        a = b;
-        b = remainder;
-    }
-    a
 }
 
 fn sanitize_probe_scale(probe_scale: f64) -> f64 {
@@ -566,19 +684,37 @@ mod tests {
     }
 
     #[test]
-    fn insert_panics_with_resize_todo_when_threshold_is_reached() {
+    fn new_starts_with_zero_capacity() {
+        let map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        assert_eq!(map.capacity(), 0);
+        assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn insert_resizes_when_threshold_is_reached() {
         let capacity = 40;
         let mut map = ElasticHashMap::with_capacity(capacity);
         let max_insertions =
             capacity.saturating_sub((DEFAULT_RESERVE_FRACTION * capacity as f64).floor() as usize);
 
-        for key in 0..max_insertions {
+        // Insert beyond the original threshold
+        for key in 0..max_insertions + 10 {
             assert_eq!(map.insert(key, key), None);
         }
 
-        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = map.insert(max_insertions, max_insertions);
-        }));
-        assert!(panic_result.is_err());
+        // Verify all entries are still accessible
+        for key in 0..max_insertions + 10 {
+            assert_eq!(map.get(&key), Some(&key));
+        }
+
+        assert!(map.capacity() > capacity);
+    }
+
+    #[test]
+    fn insert_resizes_from_zero_capacity() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        map.insert(1, 10);
+        assert_eq!(map.get(&1), Some(&10));
+        assert!(map.capacity() > 0);
     }
 }
