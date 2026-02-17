@@ -52,7 +52,7 @@ fn bench_insert_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("insert_throughput");
     group.throughput(Throughput::Elements(INSERT_COUNT as u64));
 
-    group.bench_function("std_hash_map", |b| {
+    group.bench_function("std", |b| {
         b.iter_batched_ref(
             || StdHashMap::with_capacity(INSERT_COUNT * 2),
             |map| {
@@ -65,7 +65,7 @@ fn bench_insert_throughput(c: &mut Criterion) {
         );
     });
 
-    group.bench_function("elastic_hash_map", |b| {
+    group.bench_function("elastic", |b| {
         b.iter_batched_ref(
             || ElasticHashMap::with_capacity(INSERT_COUNT * 2),
             |map| {
@@ -78,7 +78,7 @@ fn bench_insert_throughput(c: &mut Criterion) {
         );
     });
 
-    group.bench_function("funnel_hash_map", |b| {
+    group.bench_function("funnel", |b| {
         b.iter_batched_ref(
             || FunnelHashMap::with_capacity(INSERT_COUNT * 2),
             |map| {
@@ -107,7 +107,7 @@ fn bench_get_hit_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("get_hit_throughput");
     group.throughput(Throughput::Elements(HIT_LOOKUP_COUNT as u64));
 
-    group.bench_function("std_hash_map", |b| {
+    group.bench_function("std", |b| {
         b.iter(|| {
             let mut sum = 0u64;
             for key in &query_keys {
@@ -117,7 +117,7 @@ fn bench_get_hit_throughput(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("elastic_hash_map", |b| {
+    group.bench_function("elastic", |b| {
         b.iter(|| {
             let mut sum = 0u64;
             for key in &query_keys {
@@ -128,7 +128,7 @@ fn bench_get_hit_throughput(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("funnel_hash_map", |b| {
+    group.bench_function("funnel", |b| {
         b.iter(|| {
             let mut sum = 0u64;
             for key in &query_keys {
@@ -154,7 +154,7 @@ fn bench_get_miss_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("get_miss_throughput");
     group.throughput(Throughput::Elements(MISS_LOOKUP_COUNT as u64));
 
-    group.bench_function("std_hash_map", |b| {
+    group.bench_function("std", |b| {
         b.iter(|| {
             let mut misses = 0usize;
             for key in &query_keys {
@@ -166,7 +166,7 @@ fn bench_get_miss_throughput(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("elastic_hash_map", |b| {
+    group.bench_function("elastic", |b| {
         b.iter(|| {
             let mut misses = 0usize;
             for key in &query_keys {
@@ -178,7 +178,7 @@ fn bench_get_miss_throughput(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("funnel_hash_map", |b| {
+    group.bench_function("funnel", |b| {
         b.iter(|| {
             let mut misses = 0usize;
             for key in &query_keys {
@@ -198,7 +198,7 @@ criterion_group!(
     config = Criterion::default()
         .sample_size(20)
         .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(3));
+        .measurement_time(Duration::from_secs(5));
     targets = bench_insert_throughput, bench_get_hit_throughput, bench_get_miss_throughput
 );
 criterion_main!(benches);
