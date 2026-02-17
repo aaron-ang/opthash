@@ -1,7 +1,14 @@
 [package]
 name = "opthash"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
+description = "Rust implementations of Elastic Hashing and Funnel Hashing"
+readme = "README.md"
+repository = "https://github.com/aaron-ang/opthash"
+license = "MIT OR Apache-2.0"
+keywords = ["hashmap", "open_addressing", "elastic_hashing", "funnel_hashing"]
+categories = ["algorithms", "data-structures"]
+exclude = ["benches/*", "paper/*"]
 
 [dependencies]
 
