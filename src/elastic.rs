@@ -3,13 +3,12 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
 use crate::common::{
-    CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, Controls, DEFAULT_RESERVE_FRACTION, Entry, RawTable,
-    advance_wrapping_index, ceil_three_quarters, control_fingerprint, floor_half_reserve_slots,
-    greatest_common_divisor, sanitize_reserve_fraction,
+    CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, Controls, DEFAULT_RESERVE_FRACTION, Entry,
+    INITIAL_CAPACITY, RawTable, advance_wrapping_index, ceil_three_quarters, control_fingerprint,
+    floor_half_reserve_slots, greatest_common_divisor, sanitize_reserve_fraction,
 };
 
 const DEFAULT_PROBE_SCALE: f64 = 16.0;
-const INITIAL_CAPACITY: usize = 16;
 
 #[derive(Debug)]
 struct Level<K, V> {
@@ -98,6 +97,8 @@ where
     ) -> Self {
         let reserve_fraction = sanitize_reserve_fraction(reserve_fraction);
         let probe_scale = sanitize_probe_scale(probe_scale);
+        let max_insertions =
+            capacity.saturating_sub((reserve_fraction * capacity as f64).floor() as usize);
 
         let level_capacities = partition_levels(capacity);
         let levels = level_capacities
@@ -105,8 +106,6 @@ where
             .map(|&cap| Level::with_capacity(cap))
             .collect::<Vec<_>>();
 
-        let max_insertions =
-            capacity.saturating_sub((reserve_fraction * capacity as f64).floor() as usize);
         let batch_plan = build_batch_plan(&level_capacities, reserve_fraction, max_insertions);
         let batch_remaining = batch_plan.first().copied().unwrap_or(0);
 
@@ -187,6 +186,7 @@ where
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control_fingerprint(key_hash);
+
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
         // SAFETY: find_slot_indices_with_hash only returns occupied slots.
@@ -200,6 +200,7 @@ where
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control_fingerprint(key_hash);
+
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
         // SAFETY: find_slot_indices_with_hash only returns occupied slots.
@@ -213,6 +214,7 @@ where
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control_fingerprint(key_hash);
+
         self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)
             .is_some()
     }
@@ -224,6 +226,7 @@ where
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control_fingerprint(key_hash);
+
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
         let level = &mut self.levels[level_idx];
@@ -465,8 +468,10 @@ where
         let max_probes = probe_limit.min(level_cap);
         if probe_step == 1 {
             let first_run = max_probes.min(level_cap - probe_start);
-            if let Some(offset) =
-                level.table.controls(probe_start..probe_start + first_run).find_first_free()
+            if let Some(offset) = level
+                .table
+                .controls(probe_start..probe_start + first_run)
+                .find_first_free()
             {
                 return Some(probe_start + offset);
             }

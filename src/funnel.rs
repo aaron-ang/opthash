@@ -3,9 +3,9 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
 use crate::common::{
-    CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, Controls, DEFAULT_RESERVE_FRACTION, Entry, RawTable,
-    advance_wrapping_index, control_fingerprint, greatest_common_divisor,
-    sanitize_reserve_fraction,
+    CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, Controls, DEFAULT_RESERVE_FRACTION, Entry,
+    INITIAL_CAPACITY, RawTable, advance_wrapping_index, control_fingerprint,
+    greatest_common_divisor, sanitize_reserve_fraction,
 };
 
 const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
@@ -123,8 +123,6 @@ enum LookupStep {
     StopSearch,
 }
 
-const INITIAL_CAPACITY: usize = 16;
-
 #[derive(Debug)]
 pub struct FunnelHashMap<K, V> {
     levels: Vec<BucketLevel<K, V>>,
@@ -170,6 +168,9 @@ where
     ) -> Self {
         let reserve_fraction =
             sanitize_reserve_fraction(reserve_fraction).min(MAX_FUNNEL_RESERVE_FRACTION);
+        let max_insertions =
+            capacity.saturating_sub((reserve_fraction * capacity as f64).floor() as usize);
+
         let level_count = compute_level_count(reserve_fraction);
         let bucket_width = compute_bucket_width(reserve_fraction);
 
@@ -191,8 +192,6 @@ where
 
         let primary_probe_limit = log_log_probe_limit(capacity);
         let special = SpecialArray::with_capacity(special_capacity, primary_probe_limit);
-        let max_insertions =
-            capacity.saturating_sub((reserve_fraction * capacity as f64).floor() as usize);
 
         Self {
             levels,
@@ -251,6 +250,7 @@ where
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control_fingerprint(key_hash);
+
         match self.find_slot_location_with_hash(key, key_hash, key_fingerprint)? {
             SlotLocation::Level {
                 level_idx,
@@ -275,6 +275,7 @@ where
     {
         let key_hash = self.hash_key(key);
         let key_fingerprint = control_fingerprint(key_hash);
+
         match self.find_slot_location_with_hash(key, key_hash, key_fingerprint)? {
             SlotLocation::Level {
                 level_idx,

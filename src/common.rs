@@ -7,6 +7,7 @@ use std::marker::PhantomData;
 use std::ops::Index;
 use std::ptr::{self, NonNull};
 
+pub(crate) const INITIAL_CAPACITY: usize = 16;
 pub(crate) const DEFAULT_RESERVE_FRACTION: f64 = 0.10;
 pub(crate) const MIN_RESERVE_FRACTION: f64 = 1e-6;
 pub(crate) const MAX_RESERVE_FRACTION: f64 = 0.999_999;
@@ -222,8 +223,8 @@ pub(crate) trait Controls {
     fn find_first_free(&self) -> Option<usize>;
     fn find_first(&self, target: u8) -> Option<usize>;
     fn find_next(&self, target: u8, start: usize) -> Option<usize>;
-    fn free_mask(&self) -> u16;
-    fn eq_mask(&self, target: u8) -> u16;
+    fn match_free_group(&self) -> u32;
+    fn match_fingerprint_group(&self, target: u8) -> u32;
 }
 
 impl Controls for [u8] {
@@ -234,8 +235,16 @@ impl Controls for [u8] {
         }
 
         let mut index = 0usize;
+        let wide = preferred_group_width();
+        while wide > 16 && index + wide <= self.len() {
+            let mask = self[index..index + wide].match_free_group();
+            if mask != 0 {
+                return Some(index + mask.trailing_zeros() as usize);
+            }
+            index += wide;
+        }
         while index + 16 <= self.len() {
-            let mask = self[index..index + 16].free_mask();
+            let mask = self[index..index + 16].match_free_group();
             if mask != 0 {
                 return Some(index + mask.trailing_zeros() as usize);
             }
@@ -272,8 +281,16 @@ impl Controls for [u8] {
         }
 
         let mut index = start;
+        let wide = preferred_group_width();
+        while wide > 16 && index + wide <= self.len() {
+            let mask = self[index..index + wide].match_fingerprint_group(target);
+            if mask != 0 {
+                return Some(index + mask.trailing_zeros() as usize);
+            }
+            index += wide;
+        }
         while index + 16 <= self.len() {
-            let mask = self[index..index + 16].eq_mask(target);
+            let mask = self[index..index + 16].match_fingerprint_group(target);
             if mask != 0 {
                 return Some(index + mask.trailing_zeros() as usize);
             }
@@ -290,50 +307,99 @@ impl Controls for [u8] {
     }
 
     #[inline]
-    fn free_mask(&self) -> u16 {
-        debug_assert!(self.len() == 16);
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            unsafe { free_mask_16_neon(self.as_ptr()) }
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            unsafe { free_mask_16_sse2(self.as_ptr()) }
-        }
-
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        {
-            self.eq_mask(CTRL_EMPTY) | self.eq_mask(CTRL_TOMBSTONE)
+    fn match_free_group(&self) -> u32 {
+        match self.len() {
+            16 => free_mask_16(self.as_ptr()) as u32,
+            32 => free_mask_32(self.as_ptr()),
+            _ => panic!("group matching requires 16 or 32 byte chunks"),
         }
     }
 
     #[inline]
-    fn eq_mask(&self, target: u8) -> u16 {
-        debug_assert!(self.len() == 16);
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            unsafe { eq_mask_16_neon(self.as_ptr(), target) }
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            unsafe { eq_mask_16_sse2(self.as_ptr(), target) }
-        }
-
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        {
-            let mut mask = 0u16;
-            for (idx, &value) in self.iter().enumerate() {
-                if value == target {
-                    mask |= 1 << idx;
-                }
-            }
-            mask
+    fn match_fingerprint_group(&self, target: u8) -> u32 {
+        match self.len() {
+            16 => eq_mask_16(self.as_ptr(), target) as u32,
+            32 => eq_mask_32(self.as_ptr(), target),
+            _ => panic!("group matching requires 16 or 32 byte chunks"),
         }
     }
+}
+
+fn preferred_group_width() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            return 32;
+        }
+    }
+    16
+}
+
+fn eq_mask_16(ptr: *const u8, target: u8) -> u16 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { eq_mask_16_neon(ptr, target) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { eq_mask_16_sse2(ptr, target) }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let slice = unsafe { std::slice::from_raw_parts(ptr, 16) };
+        let mut mask = 0u16;
+        for (idx, &value) in slice.iter().enumerate() {
+            if value == target {
+                mask |= 1 << idx;
+            }
+        }
+        mask
+    }
+}
+
+fn free_mask_16(ptr: *const u8) -> u16 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { free_mask_16_neon(ptr) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { free_mask_16_sse2(ptr) }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        eq_mask_16(ptr, CTRL_EMPTY) | eq_mask_16(ptr, CTRL_TOMBSTONE)
+    }
+}
+
+fn eq_mask_32(ptr: *const u8, target: u8) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe { return eq_mask_32_avx2(ptr, target) };
+        }
+    }
+
+    let lo = eq_mask_16(ptr, target) as u32;
+    let hi = eq_mask_16(unsafe { ptr.add(16) }, target) as u32;
+    lo | (hi << 16)
+}
+
+fn free_mask_32(ptr: *const u8) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe { return free_mask_32_avx2(ptr) };
+        }
+    }
+
+    let lo = free_mask_16(ptr) as u32;
+    let hi = free_mask_16(unsafe { ptr.add(16) }) as u32;
+    lo | (hi << 16)
 }
 
 // --- AArch64 NEON SIMD ---
@@ -406,5 +472,57 @@ unsafe fn free_mask_16_sse2(ptr: *const u8) -> u16 {
         let tombstone = _mm_cmpeq_epi8(data, _mm_set1_epi8(CTRL_TOMBSTONE as i8));
         let free = _mm_or_si128(empty, tombstone);
         _mm_movemask_epi8(free) as u16
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn eq_mask_32_avx2(ptr: *const u8, target: u8) -> u32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let data = _mm256_loadu_si256(ptr as *const __m256i);
+        let target_vec = _mm256_set1_epi8(target as i8);
+        let cmp = _mm256_cmpeq_epi8(data, target_vec);
+        _mm256_movemask_epi8(cmp) as u32
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn free_mask_32_avx2(ptr: *const u8) -> u32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let data = _mm256_loadu_si256(ptr as *const __m256i);
+        let empty = _mm256_cmpeq_epi8(data, _mm256_setzero_si256());
+        let tombstone = _mm256_cmpeq_epi8(data, _mm256_set1_epi8(CTRL_TOMBSTONE as i8));
+        let free = _mm256_or_si256(empty, tombstone);
+        _mm256_movemask_epi8(free) as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CTRL_EMPTY, CTRL_TOMBSTONE, Controls};
+
+    #[test]
+    fn control_group_matches_free_slots() {
+        let mut controls = [1u8; 32];
+        controls[3] = CTRL_EMPTY;
+        controls[22] = CTRL_TOMBSTONE;
+
+        let expected = (1u32 << 3) | (1u32 << 22);
+        assert_eq!(controls[..32].match_free_group(), expected);
+    }
+
+    #[test]
+    fn control_group_matches_fingerprints() {
+        let mut controls = [7u8; 32];
+        controls[0] = 9;
+        controls[9] = 9;
+        controls[18] = 9;
+        controls[31] = 9;
+
+        let expected = (1u32 << 0) | (1u32 << 9) | (1u32 << 18) | (1u32 << 31);
+        assert_eq!(controls[..32].match_fingerprint_group(9), expected);
     }
 }
