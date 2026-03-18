@@ -13,17 +13,20 @@ Both support `insert`, `get`, `get_mut`, `contains_key`, `remove`, and `clear`. 
 
 ## Benchmarks
 
-10,000 inserts and 20,000-entry maps for lookups, measured on Apple M1 (aarch64, NEON SIMD):
+Current Criterion throughput results on Apple M1 (aarch64, NEON SIMD), normalized so `std::HashMap` is the `1.0x` baseline:
 
-| Operation  | `std::HashMap` | `ElasticHashMap` | `FunnelHashMap` |
-| ---------- | -------------- | ---------------- | --------------- |
-| insert     | 50 Melem/s     | 5.4 Melem/s      | 19.8 Melem/s    |
-| get (hit)  | 98 Melem/s     | 8.9 Melem/s      | 23.8 Melem/s    |
-| get (miss) | 122 Melem/s    | 4.9 Melem/s      | 16.5 Melem/s    |
+![Benchmark speedup chart](assets/benchmark-speedup.svg)
 
-```
+Regenerate the benchmark chart:
+
+```bash
 cargo bench --bench throughput
+uv venv
+uv pip install -r requirements.txt
+uv run scripts/generate_speedup_chart.py
 ```
+
+Criterion also generates an interactive HTML report at `target/criterion/report/index.html`.
 
 ## Usage
 
