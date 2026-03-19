@@ -1,5 +1,7 @@
 /target
 /.venv
+__pycache__/
+*.pyc
 
 # Paper directory - ignore all except .pdf, .tex, and .bbl files
 /paper/*
