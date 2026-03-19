@@ -7,14 +7,14 @@ use crate::common::{
     control::{ControlByte, control_fingerprint},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
-        advance_wrapping_index, ceil_three_quarters, floor_half_reserve_slots,
-        greatest_common_divisor, sanitize_reserve_fraction,
+        advance_wrapping_index, ceil_three_quarters, ceil_to_usize, floor_half_reserve_slots,
+        greatest_common_divisor, max_insertions, sanitize_reserve_fraction, usize_to_f64,
     },
 };
 
 const DEFAULT_PROBE_SCALE: f64 = 16.0;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ElasticOptions {
     pub capacity: usize,
     pub reserve_fraction: f64,
@@ -32,6 +32,7 @@ impl Default for ElasticOptions {
 }
 
 impl ElasticOptions {
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             capacity,
@@ -139,14 +140,17 @@ impl<K, V> ElasticHashMap<K, V>
 where
     K: Eq + Hash,
 {
+    #[must_use]
     pub fn new() -> Self {
         Self::with_options(ElasticOptions::default())
     }
 
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self::with_options(ElasticOptions::with_capacity(capacity))
     }
 
+    #[must_use]
     pub fn with_options(options: ElasticOptions) -> Self {
         Self::with_options_and_hasher(options, RandomState::new())
     }
@@ -155,8 +159,7 @@ where
         let reserve_fraction = sanitize_reserve_fraction(options.reserve_fraction);
         let probe_scale = sanitize_probe_scale(options.probe_scale);
         let capacity = options.capacity;
-        let max_insertions =
-            capacity.saturating_sub((reserve_fraction * capacity as f64).floor() as usize);
+        let max_insertions = max_insertions(capacity, reserve_fraction);
 
         let level_capacities = partition_levels(capacity);
         let levels = level_capacities
@@ -185,18 +188,24 @@ where
         }
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
+    /// # Panics
+    ///
+    /// Panics if a resize succeeds but no free slot can be found for the new key.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let key_hash = self.hash_key(&key);
         let key_fingerprint = control_fingerprint(key_hash);
@@ -460,7 +469,7 @@ where
             return None;
         }
 
-        let (group_start, group_step) = self.group_probe_params(level, key_hash);
+        let (group_start, group_step) = Self::group_probe_params(level, key_hash);
         let group_count = level.table.group_count();
         let mut group_idx = group_start;
 
@@ -470,7 +479,7 @@ where
                 let mut match_mask = level.table.group_match_mask(group_idx, key_fingerprint);
                 while match_mask != 0 {
                     let relative_idx = match_mask.trailing_zeros() as usize;
-                    let slot_idx = level.table.group_start(group_idx) + relative_idx;
+                    let slot_idx = RawTable::<Entry<K, V>>::group_start(group_idx) + relative_idx;
                     let entry = unsafe { level.table.get_ref(slot_idx) };
                     if entry.key.borrow() == key {
                         return Some(slot_idx);
@@ -500,7 +509,7 @@ where
             return None;
         }
 
-        let (group_start, group_step) = self.group_probe_params(level, key_hash);
+        let (group_start, group_step) = Self::group_probe_params(level, key_hash);
         let group_count = level.table.group_count();
         let mut group_idx = group_start;
         let max_groups = max_groups.min(group_count.max(1));
@@ -523,7 +532,7 @@ where
             return None;
         }
 
-        let (group_start, group_step) = self.group_probe_params(level, key_hash);
+        let (group_start, group_step) = Self::group_probe_params(level, key_hash);
         let group_count = level.table.group_count();
         let mut group_idx = group_start;
 
@@ -540,15 +549,16 @@ where
     }
 
     #[inline]
-    fn group_probe_params(&self, level: &Level<K, V>, key_hash: u64) -> (usize, usize) {
+    fn group_probe_params(level: &Level<K, V>, key_hash: u64) -> (usize, usize) {
         let group_count = level.table.group_count();
         if group_count <= 1 {
             return (0, 1);
         }
 
         let mixed = key_hash ^ level.salt;
-        let group_start = (mixed as usize) % group_count;
-        let step = level.group_steps[(mixed.rotate_left(29) as usize) % level.group_steps.len()];
+        let group_start = hash_to_usize(mixed) % group_count;
+        let step =
+            level.group_steps[hash_to_usize(mixed.rotate_left(29)) % level.group_steps.len()];
         (group_start, step)
     }
 
@@ -603,7 +613,17 @@ fn sanitize_probe_scale(probe_scale: f64) -> f64 {
 }
 
 fn level_salt(level_idx: usize) -> u64 {
-    0x9E37_79B9_7F4A_7C15u64.wrapping_mul((level_idx as u64).wrapping_add(1))
+    0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(
+        u64::try_from(level_idx)
+            .expect("level index fits in u64")
+            .wrapping_add(1),
+    )
+}
+
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
+fn hash_to_usize(hash: u64) -> usize {
+    hash as usize
 }
 
 fn build_group_steps(group_count: usize) -> Box<[usize]> {
@@ -635,14 +655,13 @@ fn build_probe_budgets(
     }
 
     let log_inverse_reserve_fraction = (1.0 / reserve_fraction).log2();
-    for free_slots in 1..=capacity {
-        let free_fraction = free_slots as f64 / capacity as f64;
+    for (free_slots, budget) in budgets.iter_mut().enumerate().take(capacity + 1).skip(1) {
+        let free_fraction = usize_to_f64(free_slots) / usize_to_f64(capacity);
         let log_sq_inverse_free_fraction = (1.0 / free_fraction).log2().powi(2);
-        let slot_budget = (probe_scale
-            * log_sq_inverse_free_fraction.min(log_inverse_reserve_fraction))
-        .ceil()
-        .max(1.0) as usize;
-        budgets[free_slots] = slot_budget
+        let slot_budget = ceil_to_usize(
+            (probe_scale * log_sq_inverse_free_fraction.min(log_inverse_reserve_fraction)).max(1.0),
+        );
+        *budget = slot_budget
             .div_ceil(GROUP_SIZE)
             .clamp(1, group_count.max(1));
     }
@@ -731,8 +750,8 @@ mod tests {
         assert!(!sizes.is_empty());
 
         for window in sizes.windows(2) {
-            let current_level_size = window[0] as f64;
-            let next_level_size = window[1] as f64;
+            let current_level_size = usize_to_f64(window[0]);
+            let next_level_size = usize_to_f64(window[1]);
             assert!(next_level_size >= (current_level_size / 2.0 - 1.0));
             assert!(next_level_size <= (current_level_size / 2.0 + 1.0));
         }
@@ -806,8 +825,7 @@ mod tests {
     fn insert_resizes_when_threshold_is_reached() {
         let capacity = 40;
         let mut map = ElasticHashMap::with_capacity(capacity);
-        let max_insertions =
-            capacity.saturating_sub((DEFAULT_RESERVE_FRACTION * capacity as f64).floor() as usize);
+        let max_insertions = max_insertions(capacity, DEFAULT_RESERVE_FRACTION);
 
         for key in 0..max_insertions + 10 {
             assert_eq!(map.insert(key, key), None);

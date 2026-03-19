@@ -76,8 +76,8 @@ pub(super) fn eq_mask_32(ptr: *const u8, target: u8) -> u32 {
         }
     }
 
-    let lo = eq_mask_16(ptr, target) as u32;
-    let hi = eq_mask_16(unsafe { ptr.add(GROUP_SIZE) }, target) as u32;
+    let lo = u32::from(eq_mask_16(ptr, target));
+    let hi = u32::from(eq_mask_16(unsafe { ptr.add(GROUP_SIZE) }, target));
     lo | (hi << GROUP_SIZE)
 }
 
@@ -89,8 +89,8 @@ pub(super) fn free_mask_32(ptr: *const u8) -> u32 {
         }
     }
 
-    let lo = free_mask_16(ptr) as u32;
-    let hi = free_mask_16(unsafe { ptr.add(GROUP_SIZE) }) as u32;
+    let lo = u32::from(free_mask_16(ptr));
+    let hi = u32::from(free_mask_16(unsafe { ptr.add(GROUP_SIZE) }));
     lo | (hi << GROUP_SIZE)
 }
 
@@ -105,8 +105,8 @@ unsafe fn neon_movemask(cmp: core::arch::aarch64::uint8x16_t) -> u16 {
         let bits = vshrq_n_u8::<7>(cmp);
         let power_vec = vld1q_u8(NEON_BIT_POWERS.as_ptr());
         let weighted = vmulq_u8(bits, power_vec);
-        let lo = vaddv_u8(vget_low_u8(weighted)) as u16;
-        let hi = (vaddv_u8(vget_high_u8(weighted)) as u16) << 8;
+        let lo = u16::from(vaddv_u8(vget_low_u8(weighted)));
+        let hi = u16::from(vaddv_u8(vget_high_u8(weighted))) << 8;
         lo | hi
     }
 }

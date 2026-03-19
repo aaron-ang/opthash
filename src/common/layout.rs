@@ -38,7 +38,7 @@ impl<T> std::fmt::Debug for RawTable<T> {
             .field("capacity", &self.capacity)
             .field("padded_capacity", &self.padded_capacity)
             .field("group_count", &self.group_count)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -49,7 +49,7 @@ impl<T> Drop for RawTable<T> {
                 alloc::dealloc(
                     self.slots_ptr.as_ptr().cast::<u8>(),
                     Self::slots_layout(self.capacity),
-                )
+                );
             };
         }
         if self.padded_capacity > 0 {
@@ -57,7 +57,7 @@ impl<T> Drop for RawTable<T> {
                 alloc::dealloc(
                     self.controls_ptr.as_ptr(),
                     Self::controls_layout(self.padded_capacity),
-                )
+                );
             };
         }
     }
@@ -129,7 +129,7 @@ impl<T> RawTable<T> {
     }
 
     #[inline]
-    pub fn group_start(&self, group_idx: usize) -> usize {
+    pub fn group_start(group_idx: usize) -> usize {
         group_idx * GROUP_SIZE
     }
 
@@ -211,7 +211,7 @@ impl<T> RawTable<T> {
     pub fn clear_all_controls(&mut self) {
         if self.padded_capacity > 0 {
             unsafe {
-                ptr::write_bytes(self.controls_ptr.as_ptr(), CTRL_EMPTY, self.padded_capacity)
+                ptr::write_bytes(self.controls_ptr.as_ptr(), CTRL_EMPTY, self.padded_capacity);
             };
         }
         for group_idx in 0..self.group_count {
@@ -247,16 +247,20 @@ impl<T> RawTable<T> {
     #[inline]
     pub fn group_match_mask(&self, group_idx: usize, target: u8) -> u16 {
         let valid = valid_group_mask(self.group_len(group_idx));
-        (self
-            .group_controls(group_idx)
-            .match_fingerprint_group(target) as u16)
+        u16::try_from(
+            self.group_controls(group_idx)
+                .match_fingerprint_group(target),
+        )
+        .expect("group fingerprint mask fits in u16")
             & valid
     }
 
     #[inline]
     pub fn group_free_mask(&self, group_idx: usize) -> u16 {
         let valid = valid_group_mask(self.group_len(group_idx));
-        (self.group_controls(group_idx).match_free_group() as u16) & valid
+        u16::try_from(self.group_controls(group_idx).match_free_group())
+            .expect("group free mask fits in u16")
+            & valid
     }
 
     #[inline]
@@ -266,7 +270,7 @@ impl<T> RawTable<T> {
         if mask == 0 {
             None
         } else {
-            Some(self.group_start(group_idx) + mask.trailing_zeros() as usize)
+            Some(Self::group_start(group_idx) + mask.trailing_zeros() as usize)
         }
     }
 

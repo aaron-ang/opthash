@@ -23,13 +23,13 @@ impl ControlByte for u8 {
 
 #[inline]
 pub(crate) fn control_fingerprint(hash: u64) -> u8 {
-    let low = (hash as u8) & 0x7F;
+    let low = u8::try_from(hash & 0x7F).expect("7-bit fingerprint fits in u8");
     low.max(1)
 }
 
 #[inline]
 pub(crate) fn fingerprint_bit(fingerprint: u8) -> u128 {
-    1u128 << (fingerprint.saturating_sub(1) as u32)
+    1u128 << u32::from(fingerprint.saturating_sub(1))
 }
 
 #[inline]
@@ -55,7 +55,7 @@ impl Controls for [u8] {
     #[inline]
     fn find_first_free(&self) -> Option<usize> {
         if self.len() < GROUP_SIZE {
-            return self.iter().position(|control| control.is_free());
+            return self.iter().position(ControlByte::is_free);
         }
 
         let mut index = 0usize;
@@ -133,7 +133,7 @@ impl Controls for [u8] {
     #[inline]
     fn match_free_group(&self) -> u32 {
         match self.len() {
-            GROUP_SIZE => free_mask_16(self.as_ptr()) as u32,
+            GROUP_SIZE => u32::from(free_mask_16(self.as_ptr())),
             32 => free_mask_32(self.as_ptr()),
             _ => panic!("group matching requires 16 or 32 byte chunks"),
         }
@@ -142,7 +142,7 @@ impl Controls for [u8] {
     #[inline]
     fn match_fingerprint_group(&self, target: u8) -> u32 {
         match self.len() {
-            GROUP_SIZE => eq_mask_16(self.as_ptr(), target) as u32,
+            GROUP_SIZE => u32::from(eq_mask_16(self.as_ptr(), target)),
             32 => eq_mask_32(self.as_ptr(), target),
             _ => panic!("group matching requires 16 or 32 byte chunks"),
         }
