@@ -21,7 +21,7 @@ WORKLOADS = [
 IMPLEMENTATIONS = ("std", "elastic", "funnel")
 
 
-def load_estimate_time_ns(workload: str, implementation: str) -> float:
+def load_estimate_time_ns(workload: str, implementation: str):
     path = CRITERION_DIR / workload / implementation / "new" / "estimates.json"
     if not path.exists():
         raise FileNotFoundError(f"missing Criterion estimates: {path}")
@@ -38,13 +38,13 @@ def load_estimate_time_ns(workload: str, implementation: str) -> float:
     raise RuntimeError(f"no usable slope.mean point estimate in {path}")
 
 
-def throughput_from_time_ns(operation_count: int, time_ns: float) -> float:
+def throughput_from_time_ns(operation_count: int, time_ns: float):
     if time_ns <= 0:
         raise ValueError(f"non-positive benchmark time: {time_ns}")
     return operation_count / (time_ns / 1_000_000_000.0)
 
 
-def build_speedup_rows() -> list[dict[str, float | str]]:
+def build_speedup_rows():
     rows: list[dict[str, float | str]] = []
     for workload, label, operation_count in WORKLOADS:
         times = {
@@ -71,7 +71,7 @@ def build_speedup_rows() -> list[dict[str, float | str]]:
     return rows
 
 
-def plot_chart(rows: list[dict[str, float | str]]) -> None:
+def plot_chart(rows: list[dict[str, float | str]]):
     output_dir = OUTPUT_PATH.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -173,7 +173,7 @@ def plot_chart(rows: list[dict[str, float | str]]) -> None:
     plt.close(fig)
 
 
-def main() -> None:
+def main():
     rows = build_speedup_rows()
     plot_chart(rows)
     print(f"wrote {OUTPUT_PATH.relative_to(ROOT)}")
