@@ -76,7 +76,7 @@ mod tests {
 
     #[test]
     fn fingerprint_summary_bit_matches_fingerprint_domain() {
-        let fp = control_fingerprint(0xDEADBEEF);
+        let fp = control_fingerprint(0xDEAD_BEEF);
         let bit = fingerprint_bit(fp);
         assert_ne!(bit, 0);
     }

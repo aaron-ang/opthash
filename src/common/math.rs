@@ -1,6 +1,35 @@
 use super::config::{DEFAULT_RESERVE_FRACTION, MAX_RESERVE_FRACTION, MIN_RESERVE_FRACTION};
 use super::layout::GROUP_SIZE;
 
+#[allow(clippy::cast_precision_loss)]
+#[inline]
+pub(crate) fn usize_to_f64(value: usize) -> f64 {
+    value as f64
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[inline]
+pub(crate) fn floor_to_usize(value: f64) -> usize {
+    value.floor() as usize
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[inline]
+pub(crate) fn ceil_to_usize(value: f64) -> usize {
+    value.ceil() as usize
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[inline]
+pub(crate) fn round_to_usize(value: f64) -> usize {
+    value.round() as usize
+}
+
+#[inline]
+pub(crate) fn max_insertions(capacity: usize, reserve_fraction: f64) -> usize {
+    capacity.saturating_sub(floor_to_usize(reserve_fraction * usize_to_f64(capacity)))
+}
+
 pub(crate) fn sanitize_reserve_fraction(reserve_fraction: f64) -> f64 {
     if reserve_fraction.is_finite() {
         reserve_fraction.clamp(MIN_RESERVE_FRACTION, MAX_RESERVE_FRACTION)
@@ -14,7 +43,7 @@ pub(crate) fn ceil_three_quarters(value: usize) -> usize {
 }
 
 pub(crate) fn floor_half_reserve_slots(reserve_fraction: f64, value: usize) -> usize {
-    ((reserve_fraction * value as f64) / 2.0).floor() as usize
+    floor_to_usize((reserve_fraction * usize_to_f64(value)) / 2.0)
 }
 
 pub(crate) fn greatest_common_divisor(mut a: usize, mut b: usize) -> usize {

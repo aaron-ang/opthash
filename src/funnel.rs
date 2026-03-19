@@ -7,14 +7,14 @@ use crate::common::{
     control::{CTRL_EMPTY, ControlByte, Controls, control_fingerprint, fingerprint_bit},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
-        advance_wrapping_index, greatest_common_divisor, round_up_to_group,
-        sanitize_reserve_fraction,
+        advance_wrapping_index, ceil_to_usize, floor_to_usize, greatest_common_divisor,
+        max_insertions, round_to_usize, round_up_to_group, sanitize_reserve_fraction, usize_to_f64,
     },
 };
 
 const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct FunnelOptions {
     pub capacity: usize,
     pub reserve_fraction: f64,
@@ -32,6 +32,7 @@ impl Default for FunnelOptions {
 }
 
 impl FunnelOptions {
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             capacity,
@@ -70,11 +71,10 @@ impl<K, V> BucketLevel<K, V> {
 
     #[inline]
     fn bucket_count(&self) -> usize {
-        if self.bucket_size == 0 {
-            0
-        } else {
-            self.table.capacity() / self.bucket_size
-        }
+        self.table
+            .capacity()
+            .checked_div(self.bucket_size)
+            .unwrap_or(0)
     }
 
     #[inline]
@@ -139,11 +139,7 @@ struct SpecialFallback<K, V> {
 
 impl<K, V> SpecialFallback<K, V> {
     fn with_capacity(capacity: usize, bucket_size: usize) -> Self {
-        let bucket_count = if bucket_size == 0 {
-            0
-        } else {
-            capacity / bucket_size
-        };
+        let bucket_count = capacity.checked_div(bucket_size).unwrap_or(0);
         Self {
             table: RawTable::new(capacity),
             len: 0,
@@ -161,11 +157,10 @@ impl<K, V> SpecialFallback<K, V> {
 
     #[inline]
     fn bucket_count(&self) -> usize {
-        if self.bucket_size == 0 {
-            0
-        } else {
-            self.table.capacity() / self.bucket_size
-        }
+        self.table
+            .capacity()
+            .checked_div(self.bucket_size)
+            .unwrap_or(0)
     }
 
     #[inline]
@@ -246,14 +241,17 @@ impl<K, V> FunnelHashMap<K, V>
 where
     K: Eq + Hash,
 {
+    #[must_use]
     pub fn new() -> Self {
         Self::with_options(FunnelOptions::default())
     }
 
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self::with_options(FunnelOptions::with_capacity(capacity))
     }
 
+    #[must_use]
     pub fn with_options(options: FunnelOptions) -> Self {
         Self::with_options_and_hasher(options, RandomState::new())
     }
@@ -262,8 +260,7 @@ where
         let reserve_fraction =
             sanitize_reserve_fraction(options.reserve_fraction).min(MAX_FUNNEL_RESERVE_FRACTION);
         let capacity = options.capacity;
-        let max_insertions =
-            capacity.saturating_sub((reserve_fraction * capacity as f64).floor() as usize);
+        let max_insertions = max_insertions(capacity, reserve_fraction);
 
         let level_count = compute_level_count(reserve_fraction);
         let bucket_width = round_up_to_group(compute_bucket_width(reserve_fraction));
@@ -281,11 +278,7 @@ where
             special_capacity = capacity.saturating_sub(main_capacity);
         }
 
-        let total_main_buckets = if bucket_width == 0 {
-            0
-        } else {
-            main_capacity / bucket_width
-        };
+        let total_main_buckets = main_capacity.checked_div(bucket_width).unwrap_or(0);
         let level_bucket_counts = partition_funnel_buckets(total_main_buckets, level_count);
         let levels = level_bucket_counts
             .into_iter()
@@ -307,18 +300,24 @@ where
         }
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
+    /// # Panics
+    ///
+    /// Panics if a resize succeeds but no free slot can be found for the new key.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let key_hash = self.hash_key(&key);
         let key_fingerprint = control_fingerprint(key_hash);
@@ -412,7 +411,7 @@ where
                 level_idx,
                 slot_idx,
             } => {
-                let bucket_idx = self.level_bucket_index(
+                let bucket_idx = Self::level_bucket_index(
                     key_hash,
                     level_idx,
                     self.levels[level_idx].bucket_count(),
@@ -584,8 +583,9 @@ where
     }
 
     #[inline]
-    fn level_bucket_index(&self, key_hash: u64, level_idx: usize, bucket_count: usize) -> usize {
-        (key_hash.rotate_left((level_idx as u32 * 7) % 64) as usize) % bucket_count
+    fn level_bucket_index(key_hash: u64, level_idx: usize, bucket_count: usize) -> usize {
+        let rotation = (u32::try_from(level_idx).expect("level index fits in u32") * 7) % 64;
+        hash_to_usize(key_hash.rotate_left(rotation)) % bucket_count
     }
 
     #[inline]
@@ -593,26 +593,26 @@ where
         if group_count <= 1 {
             return (0, 1);
         }
-        let start = (key_hash.rotate_left(11) as usize) % group_count;
+        let start = hash_to_usize(key_hash.rotate_left(11)) % group_count;
         let steps = &self.special.primary.group_steps;
-        let step = steps[(key_hash.rotate_left(43) as usize) % steps.len()];
+        let step = steps[hash_to_usize(key_hash.rotate_left(43)) % steps.len()];
         (start, step)
     }
 
     #[inline]
-    fn special_fallback_bucket_a(&self, key_hash: u64, bucket_count: usize) -> usize {
-        (key_hash.rotate_left(19) as usize) % bucket_count
+    fn special_fallback_bucket_a(key_hash: u64, bucket_count: usize) -> usize {
+        hash_to_usize(key_hash.rotate_left(19)) % bucket_count
     }
 
     #[inline]
-    fn special_fallback_bucket_b(&self, key_hash: u64, bucket_count: usize) -> usize {
-        (key_hash.rotate_left(37) as usize) % bucket_count
+    fn special_fallback_bucket_b(key_hash: u64, bucket_count: usize) -> usize {
+        hash_to_usize(key_hash.rotate_left(37)) % bucket_count
     }
 
     #[inline]
     fn choose_slot_for_new_key(&self, key_hash: u64) -> Option<SlotLocation> {
         for (level_idx, level) in self.levels.iter().enumerate() {
-            if let Some(slot_idx) = self.first_free_in_level_bucket(key_hash, level_idx, level) {
+            if let Some(slot_idx) = Self::first_free_in_level_bucket(key_hash, level_idx, level) {
                 return Some(SlotLocation::Level {
                     level_idx,
                     slot_idx,
@@ -692,7 +692,6 @@ where
     }
 
     fn first_free_in_level_bucket(
-        &self,
         key_hash: u64,
         level_idx: usize,
         level: &BucketLevel<K, V>,
@@ -706,7 +705,7 @@ where
             return None;
         }
 
-        let bucket_idx = self.level_bucket_index(key_hash, level_idx, bucket_count);
+        let bucket_idx = Self::level_bucket_index(key_hash, level_idx, bucket_count);
         if level.bucket_live[bucket_idx] >= level.bucket_size {
             return None;
         }
@@ -752,8 +751,8 @@ where
             return None;
         }
 
-        let bucket_a = self.special_fallback_bucket_a(key_hash, bucket_count);
-        let bucket_b = self.special_fallback_bucket_b(key_hash, bucket_count);
+        let bucket_a = Self::special_fallback_bucket_a(key_hash, bucket_count);
+        let bucket_b = Self::special_fallback_bucket_b(key_hash, bucket_count);
 
         if fallback.bucket_live[bucket_a] < fallback.bucket_size {
             let range = fallback.bucket_range(bucket_a);
@@ -773,7 +772,6 @@ where
     }
 
     fn find_in_level_bucket<Q>(
-        &self,
         key_hash: u64,
         key_fingerprint: u8,
         key: &Q,
@@ -793,7 +791,7 @@ where
             return LookupStep::Continue;
         }
 
-        let bucket_idx = self.level_bucket_index(key_hash, level_idx, bucket_count);
+        let bucket_idx = Self::level_bucket_index(key_hash, level_idx, bucket_count);
         let fingerprint_mask = fingerprint_bit(key_fingerprint);
         if level.bucket_summaries[bucket_idx] & fingerprint_mask == 0 {
             if level.bucket_tombstones[bucket_idx] == 0
@@ -852,7 +850,7 @@ where
                 let mut match_mask = primary.table.group_match_mask(group_idx, key_fingerprint);
                 while match_mask != 0 {
                     let relative_idx = match_mask.trailing_zeros() as usize;
-                    let slot_idx = primary.table.group_start(group_idx) + relative_idx;
+                    let slot_idx = RawTable::<Entry<K, V>>::group_start(group_idx) + relative_idx;
                     let entry = unsafe { primary.table.get_ref(slot_idx) };
                     if entry.key.borrow() == key {
                         return LookupStep::Found(slot_idx);
@@ -893,8 +891,8 @@ where
         }
 
         let fingerprint_mask = fingerprint_bit(key_fingerprint);
-        let bucket_a = self.special_fallback_bucket_a(key_hash, bucket_count);
-        let bucket_b = self.special_fallback_bucket_b(key_hash, bucket_count);
+        let bucket_a = Self::special_fallback_bucket_a(key_hash, bucket_count);
+        let bucket_b = Self::special_fallback_bucket_b(key_hash, bucket_count);
 
         for bucket_idx in [bucket_a, bucket_b] {
             if fallback.bucket_summaries[bucket_idx] & fingerprint_mask == 0 {
@@ -936,7 +934,7 @@ where
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
-            match self.find_in_level_bucket(key_hash, key_fingerprint, key, level_idx, level) {
+            match Self::find_in_level_bucket(key_hash, key_fingerprint, key, level_idx, level) {
                 LookupStep::Found(slot_idx) => {
                     return Some(SlotLocation::Level {
                         level_idx,
@@ -998,7 +996,7 @@ where
         let mut entries = Vec::new();
         {
             let primary = &mut self.special.primary;
-            let group_start = primary.table.group_start(group_idx);
+            let group_start = RawTable::<Entry<K, V>>::group_start(group_idx);
             let group_len = primary.table.group_len(group_idx);
             for slot_idx in group_start..group_start + group_len {
                 if primary.table.control_at(slot_idx).is_occupied() {
@@ -1063,7 +1061,7 @@ where
     fn rebuild_primary_group_summary(&mut self, group_idx: usize) {
         let primary = &mut self.special.primary;
         primary.group_summaries[group_idx] = 0;
-        let group_start = primary.table.group_start(group_idx);
+        let group_start = RawTable::<Entry<K, V>>::group_start(group_idx);
         let group_len = primary.table.group_len(group_idx);
         for slot_idx in group_start..group_start + group_len {
             let control = primary.table.control_at(slot_idx);
@@ -1102,18 +1100,16 @@ where
 }
 
 fn compute_level_count(reserve_fraction: f64) -> usize {
-    (4.0 * (1.0 / reserve_fraction).log2() + 10.0)
-        .ceil()
-        .max(1.0) as usize
+    ceil_to_usize((4.0 * (1.0 / reserve_fraction).log2() + 10.0).max(1.0))
 }
 
 fn compute_bucket_width(reserve_fraction: f64) -> usize {
-    (2.0 * (1.0 / reserve_fraction).log2()).ceil().max(1.0) as usize
+    ceil_to_usize((2.0 * (1.0 / reserve_fraction).log2()).max(1.0))
 }
 
 fn log_log_probe_limit(capacity: usize) -> usize {
-    let n = capacity.max(4) as f64;
-    n.log2().max(2.0).log2().ceil().max(1.0) as usize
+    let n = usize_to_f64(capacity.max(4));
+    ceil_to_usize(n.log2().max(2.0).log2().max(1.0))
 }
 
 fn build_group_steps(group_count: usize) -> Box<[usize]> {
@@ -1133,6 +1129,12 @@ fn build_group_steps(group_count: usize) -> Box<[usize]> {
     steps.into_boxed_slice()
 }
 
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
+fn hash_to_usize(hash: u64) -> usize {
+    hash as usize
+}
+
 fn choose_special_capacity(
     total_capacity: usize,
     reserve_fraction: f64,
@@ -1142,8 +1144,9 @@ fn choose_special_capacity(
         return 0;
     }
 
-    let lower_bound = ((reserve_fraction * total_capacity as f64) / 2.0).ceil() as usize;
-    let upper_bound = ((3.0 * reserve_fraction * total_capacity as f64) / 4.0).floor() as usize;
+    let total_capacity_f64 = usize_to_f64(total_capacity);
+    let lower_bound = ceil_to_usize((reserve_fraction * total_capacity_f64) / 2.0);
+    let upper_bound = floor_to_usize((3.0 * reserve_fraction * total_capacity_f64) / 4.0);
     let lower_bound = lower_bound.min(total_capacity);
     let upper_bound = upper_bound.min(total_capacity);
 
@@ -1155,9 +1158,9 @@ fn choose_special_capacity(
         }
     }
 
-    let target = ((5.0 * reserve_fraction * total_capacity as f64) / 8.0)
-        .round()
-        .clamp(0.0, total_capacity as f64) as usize;
+    let target = round_to_usize(
+        ((5.0 * reserve_fraction * total_capacity_f64) / 8.0).clamp(0.0, total_capacity_f64),
+    );
 
     let mut best_special_capacity = total_capacity % bucket_size.max(1);
     let mut best_distance = usize::MAX;
@@ -1185,13 +1188,11 @@ fn partition_funnel_buckets(total_buckets: usize, level_count: usize) -> Vec<usi
 
     let first_level_guess = {
         let ratio = 0.75f64;
-        let denom = 1.0 - ratio.powi(level_count as i32);
+        let denom = 1.0 - ratio.powi(i32::try_from(level_count).expect("level count fits in i32"));
         if denom <= 0.0 {
             total_buckets.max(1)
         } else {
-            (((total_buckets as f64) * (1.0 - ratio)) / denom)
-                .round()
-                .max(0.0) as usize
+            round_to_usize((((usize_to_f64(total_buckets)) * (1.0 - ratio)) / denom).max(0.0))
         }
     };
 
@@ -1352,8 +1353,7 @@ mod tests {
     fn insert_resizes_when_threshold_is_reached() {
         let capacity = 64;
         let mut map = FunnelHashMap::with_capacity(capacity);
-        let max_insertions =
-            capacity.saturating_sub((DEFAULT_RESERVE_FRACTION * capacity as f64).floor() as usize);
+        let max_insertions = max_insertions(capacity, DEFAULT_RESERVE_FRACTION);
 
         for key in 0..max_insertions + 10 {
             let _ = map.insert(key, key * 10);
