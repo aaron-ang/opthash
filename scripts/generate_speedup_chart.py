@@ -129,7 +129,7 @@ def plot_chart(rows: list[dict[str, float | str]]) -> None:
     ax.set_ylabel("Speed up, higher is better", fontsize=14)
 
     ax.set_title(
-        "Throughput Speedup of HashMap over std::HashMap",
+        "Throughput Speedup over std::HashMap",
         fontsize=23,
         pad=28,
         color="#2B2F36",

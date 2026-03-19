@@ -9,7 +9,7 @@ Both are open-addressing hash maps that achieve optimal expected probe complexit
 - **`ElasticHashMap<K, V>`** — Multi-level table with geometrically halving levels. Keys are placed via batch-based insertion across levels using stride-based probing.
 - **`FunnelHashMap<K, V>`** — Multi-level bucketed table with a 3/4-ratio geometric progression and a special overflow array (primary + fallback) for keys that don't fit in any level.
 
-Both support `insert`, `get`, `get_mut`, `contains_key`, `remove`, and `clear`. Maps start with zero allocation (`new()`) and grow dynamically on demand.
+Both support `insert`, `get`, `get_mut`, `contains_key`, `remove`, and `clear`. Maps start with zero allocation (`new()`) and grow dynamically on demand. Advanced tuning is available through `ElasticOptions`, `FunnelOptions`, and `with_options(...)`.
 
 ## Benchmarks
 
@@ -31,9 +31,16 @@ Criterion also generates an interactive HTML report at `target/criterion/report/
 ## Usage
 
 ```rust
-use opthash::{ElasticHashMap, FunnelHashMap};
+use opthash::{ElasticHashMap, ElasticOptions, FunnelHashMap};
 
 let mut map = FunnelHashMap::new();
 map.insert("key", 42);
 assert_eq!(map.get("key"), Some(&42));
+
+let tuned = ElasticHashMap::<u64, u64>::with_options(ElasticOptions {
+    capacity: 1024,
+    reserve_fraction: 0.10,
+    probe_scale: 12.0,
+});
+assert_eq!(tuned.len(), 0);
 ```
