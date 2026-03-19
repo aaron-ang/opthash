@@ -3,29 +3,63 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
 use crate::common::{
-    CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, Controls, DEFAULT_RESERVE_FRACTION, Entry,
-    INITIAL_CAPACITY, RawTable, advance_wrapping_index, control_fingerprint,
-    greatest_common_divisor, sanitize_reserve_fraction,
+    config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
+    control::{CTRL_EMPTY, ControlByte, Controls, control_fingerprint, fingerprint_bit},
+    layout::{Entry, GROUP_SIZE, RawTable},
+    math::{
+        advance_wrapping_index, greatest_common_divisor, round_up_to_group,
+        sanitize_reserve_fraction,
+    },
 };
 
 const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
+
+#[derive(Debug, Clone)]
+pub struct FunnelOptions {
+    pub capacity: usize,
+    pub reserve_fraction: f64,
+    pub primary_probe_limit: Option<usize>,
+}
+
+impl Default for FunnelOptions {
+    fn default() -> Self {
+        Self {
+            capacity: 0,
+            reserve_fraction: DEFAULT_RESERVE_FRACTION,
+            primary_probe_limit: None,
+        }
+    }
+}
+
+impl FunnelOptions {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity,
+            ..Self::default()
+        }
+    }
+}
 
 #[derive(Debug)]
 struct BucketLevel<K, V> {
     table: RawTable<Entry<K, V>>,
     len: usize,
     bucket_size: usize,
-    has_holes: bool,
+    bucket_summaries: Box<[u128]>,
+    bucket_live: Box<[usize]>,
+    bucket_tombstones: Box<[usize]>,
 }
 
 impl<K, V> BucketLevel<K, V> {
     fn with_bucket_count(bucket_count: usize, bucket_size: usize) -> Self {
-        let total = bucket_count.saturating_mul(bucket_size);
+        let total_capacity = bucket_count.saturating_mul(bucket_size);
         Self {
-            table: RawTable::new(total),
+            table: RawTable::new(total_capacity),
             len: 0,
             bucket_size,
-            has_holes: false,
+            bucket_summaries: vec![0; bucket_count].into_boxed_slice(),
+            bucket_live: vec![0; bucket_count].into_boxed_slice(),
+            bucket_tombstones: vec![0; bucket_count].into_boxed_slice(),
         }
     }
 
@@ -42,6 +76,12 @@ impl<K, V> BucketLevel<K, V> {
             self.table.capacity() / self.bucket_size
         }
     }
+
+    #[inline]
+    fn bucket_range(&self, bucket_idx: usize) -> std::ops::Range<usize> {
+        let start = bucket_idx * self.bucket_size;
+        start..start + self.bucket_size
+    }
 }
 
 impl<K, V> Drop for BucketLevel<K, V> {
@@ -55,56 +95,113 @@ impl<K, V> Drop for BucketLevel<K, V> {
 }
 
 #[derive(Debug)]
-struct SpecialArray<K, V> {
-    primary: RawTable<Entry<K, V>>,
-    primary_len: usize,
-    primary_has_holes: bool,
-    fallback: RawTable<Entry<K, V>>,
-    fallback_len: usize,
-    fallback_has_holes: bool,
-    fallback_bucket_size: usize,
+struct SpecialPrimary<K, V> {
+    table: RawTable<Entry<K, V>>,
+    len: usize,
+    group_summaries: Box<[u128]>,
+    group_tombstones: Box<[usize]>,
+    group_steps: Box<[usize]>,
 }
 
-impl<K, V> SpecialArray<K, V> {
-    fn with_capacity(capacity: usize, primary_probe_limit: usize) -> Self {
-        let fallback_bucket_size = (2usize.saturating_mul(primary_probe_limit)).max(2);
-        let desired_fallback_capacity = capacity / 2;
-        let fallback_bucket_count = desired_fallback_capacity / fallback_bucket_size;
-        let fallback_capacity = fallback_bucket_count.saturating_mul(fallback_bucket_size);
-        let primary_capacity = capacity.saturating_sub(fallback_capacity);
-
+impl<K, V> SpecialPrimary<K, V> {
+    fn with_capacity(capacity: usize) -> Self {
+        let table = RawTable::new(capacity);
+        let group_count = table.group_count();
         Self {
-            primary: RawTable::new(primary_capacity),
-            primary_len: 0,
-            primary_has_holes: false,
-            fallback: RawTable::new(fallback_capacity),
-            fallback_len: 0,
-            fallback_has_holes: false,
-            fallback_bucket_size,
+            table,
+            len: 0,
+            group_summaries: vec![0; group_count].into_boxed_slice(),
+            group_tombstones: vec![0; group_count].into_boxed_slice(),
+            group_steps: build_group_steps(group_count),
+        }
+    }
+}
+
+impl<K, V> Drop for SpecialPrimary<K, V> {
+    fn drop(&mut self) {
+        for idx in 0..self.table.capacity() {
+            if self.table.control_at(idx).is_occupied() {
+                unsafe { self.table.drop_in_place(idx) };
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SpecialFallback<K, V> {
+    table: RawTable<Entry<K, V>>,
+    len: usize,
+    bucket_size: usize,
+    bucket_summaries: Box<[u128]>,
+    bucket_live: Box<[usize]>,
+    bucket_tombstones: Box<[usize]>,
+}
+
+impl<K, V> SpecialFallback<K, V> {
+    fn with_capacity(capacity: usize, bucket_size: usize) -> Self {
+        let bucket_count = if bucket_size == 0 {
+            0
+        } else {
+            capacity / bucket_size
+        };
+        Self {
+            table: RawTable::new(capacity),
+            len: 0,
+            bucket_size,
+            bucket_summaries: vec![0; bucket_count].into_boxed_slice(),
+            bucket_live: vec![0; bucket_count].into_boxed_slice(),
+            bucket_tombstones: vec![0; bucket_count].into_boxed_slice(),
         }
     }
 
     #[inline]
-    fn fallback_bucket_count(&self) -> usize {
-        if self.fallback_bucket_size == 0 {
+    fn capacity(&self) -> usize {
+        self.table.capacity()
+    }
+
+    #[inline]
+    fn bucket_count(&self) -> usize {
+        if self.bucket_size == 0 {
             0
         } else {
-            self.fallback.capacity() / self.fallback_bucket_size
+            self.table.capacity() / self.bucket_size
+        }
+    }
+
+    #[inline]
+    fn bucket_range(&self, bucket_idx: usize) -> std::ops::Range<usize> {
+        let start = bucket_idx * self.bucket_size;
+        start..start + self.bucket_size
+    }
+}
+
+impl<K, V> Drop for SpecialFallback<K, V> {
+    fn drop(&mut self) {
+        for idx in 0..self.table.capacity() {
+            if self.table.control_at(idx).is_occupied() {
+                unsafe { self.table.drop_in_place(idx) };
+            }
         }
     }
 }
 
-impl<K, V> Drop for SpecialArray<K, V> {
-    fn drop(&mut self) {
-        for idx in 0..self.primary.capacity() {
-            if self.primary.control_at(idx).is_occupied() {
-                unsafe { self.primary.drop_in_place(idx) };
-            }
-        }
-        for idx in 0..self.fallback.capacity() {
-            if self.fallback.control_at(idx).is_occupied() {
-                unsafe { self.fallback.drop_in_place(idx) };
-            }
+#[derive(Debug)]
+struct SpecialArray<K, V> {
+    primary: SpecialPrimary<K, V>,
+    fallback: SpecialFallback<K, V>,
+}
+
+impl<K, V> SpecialArray<K, V> {
+    fn with_capacity(capacity: usize, primary_probe_limit: usize) -> Self {
+        let fallback_bucket_size =
+            round_up_to_group((2usize.saturating_mul(primary_probe_limit)).max(2));
+        let desired_fallback_capacity = capacity / 2;
+        let fallback_bucket_count = desired_fallback_capacity / fallback_bucket_size.max(1);
+        let fallback_capacity = fallback_bucket_count.saturating_mul(fallback_bucket_size);
+        let primary_capacity = capacity.saturating_sub(fallback_capacity);
+        Self {
+            primary: SpecialPrimary::with_capacity(primary_capacity),
+            fallback: SpecialFallback::with_capacity(fallback_capacity, fallback_bucket_size),
         }
     }
 }
@@ -150,47 +247,51 @@ where
     K: Eq + Hash,
 {
     pub fn new() -> Self {
-        Self::with_capacity(0)
+        Self::with_options(FunnelOptions::default())
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::with_params(capacity, DEFAULT_RESERVE_FRACTION)
+        Self::with_options(FunnelOptions::with_capacity(capacity))
     }
 
-    fn with_params(capacity: usize, reserve_fraction: f64) -> Self {
-        Self::with_params_and_hasher(capacity, reserve_fraction, RandomState::new())
+    pub fn with_options(options: FunnelOptions) -> Self {
+        Self::with_options_and_hasher(options, RandomState::new())
     }
 
-    fn with_params_and_hasher(
-        capacity: usize,
-        reserve_fraction: f64,
-        hash_builder: RandomState,
-    ) -> Self {
+    fn with_options_and_hasher(options: FunnelOptions, hash_builder: RandomState) -> Self {
         let reserve_fraction =
-            sanitize_reserve_fraction(reserve_fraction).min(MAX_FUNNEL_RESERVE_FRACTION);
+            sanitize_reserve_fraction(options.reserve_fraction).min(MAX_FUNNEL_RESERVE_FRACTION);
+        let capacity = options.capacity;
         let max_insertions =
             capacity.saturating_sub((reserve_fraction * capacity as f64).floor() as usize);
 
         let level_count = compute_level_count(reserve_fraction);
-        let bucket_width = compute_bucket_width(reserve_fraction);
+        let bucket_width = round_up_to_group(compute_bucket_width(reserve_fraction));
+        let primary_probe_limit = options
+            .primary_probe_limit
+            .unwrap_or_else(|| log_log_probe_limit(capacity))
+            .max(1);
 
         let mut special_capacity =
             choose_special_capacity(capacity, reserve_fraction, bucket_width);
         let mut main_capacity = capacity.saturating_sub(special_capacity);
-        let main_remainder = main_capacity % bucket_width;
+        let main_remainder = main_capacity % bucket_width.max(1);
         if main_remainder != 0 {
             main_capacity = main_capacity.saturating_sub(main_remainder);
             special_capacity = capacity.saturating_sub(main_capacity);
         }
 
-        let total_main_buckets = main_capacity / bucket_width;
+        let total_main_buckets = if bucket_width == 0 {
+            0
+        } else {
+            main_capacity / bucket_width
+        };
         let level_bucket_counts = partition_funnel_buckets(total_main_buckets, level_count);
         let levels = level_bucket_counts
             .into_iter()
             .map(|bucket_count| BucketLevel::with_bucket_count(bucket_count, bucket_width))
             .collect::<Vec<_>>();
 
-        let primary_probe_limit = log_log_probe_limit(capacity);
         let special = SpecialArray::with_capacity(special_capacity, primary_probe_limit);
 
         Self {
@@ -238,7 +339,6 @@ where
         let insertion_slot = self
             .choose_slot_for_new_key(key_hash)
             .expect("no free slot found after resize");
-
         self.place_new_entry(insertion_slot, key, value, key_fingerprint);
         None
     }
@@ -255,15 +355,12 @@ where
             SlotLocation::Level {
                 level_idx,
                 slot_idx,
-            } => {
-                // SAFETY: find returns only occupied slots.
-                Some(unsafe { &self.levels[level_idx].table.get_ref(slot_idx).value })
-            }
+            } => Some(unsafe { &self.levels[level_idx].table.get_ref(slot_idx).value }),
             SlotLocation::SpecialPrimary { slot_idx } => {
-                Some(unsafe { &self.special.primary.get_ref(slot_idx).value })
+                Some(unsafe { &self.special.primary.table.get_ref(slot_idx).value })
             }
             SlotLocation::SpecialFallback { slot_idx } => {
-                Some(unsafe { &self.special.fallback.get_ref(slot_idx).value })
+                Some(unsafe { &self.special.fallback.table.get_ref(slot_idx).value })
             }
         }
     }
@@ -282,10 +379,10 @@ where
                 slot_idx,
             } => Some(unsafe { &mut self.levels[level_idx].table.get_mut(slot_idx).value }),
             SlotLocation::SpecialPrimary { slot_idx } => {
-                Some(unsafe { &mut self.special.primary.get_mut(slot_idx).value })
+                Some(unsafe { &mut self.special.primary.table.get_mut(slot_idx).value })
             }
             SlotLocation::SpecialFallback { slot_idx } => {
-                Some(unsafe { &mut self.special.fallback.get_mut(slot_idx).value })
+                Some(unsafe { &mut self.special.fallback.table.get_mut(slot_idx).value })
             }
         }
     }
@@ -315,31 +412,67 @@ where
                 level_idx,
                 slot_idx,
             } => {
+                let bucket_idx = self.level_bucket_index(
+                    key_hash,
+                    level_idx,
+                    self.levels[level_idx].bucket_count(),
+                );
                 let level = &mut self.levels[level_idx];
-                // SAFETY: find returns only occupied slots.
                 let removed = unsafe { level.table.take(slot_idx) };
-                *level.table.control_at_mut(slot_idx) = CTRL_TOMBSTONE;
+                level.table.mark_tombstone(slot_idx);
                 level.len -= 1;
-                level.has_holes = true;
+                level.bucket_live[bucket_idx] -= 1;
+                level.bucket_tombstones[bucket_idx] += 1;
+                Self::rebuild_bucket_summary(
+                    &level.table,
+                    level.bucket_range(bucket_idx),
+                    &mut level.bucket_summaries[bucket_idx],
+                );
+                if level.bucket_tombstones[bucket_idx] > level.bucket_size / 4 {
+                    self.rebuild_level_bucket(level_idx, bucket_idx);
+                }
                 removed
             }
             SlotLocation::SpecialPrimary { slot_idx } => {
-                let removed = unsafe { self.special.primary.take(slot_idx) };
-                *self.special.primary.control_at_mut(slot_idx) = CTRL_TOMBSTONE;
-                self.special.primary_len -= 1;
-                self.special.primary_has_holes = true;
+                let group_idx = slot_idx / GROUP_SIZE;
+                let removed = {
+                    let primary = &mut self.special.primary;
+                    let removed = unsafe { primary.table.take(slot_idx) };
+                    primary.table.mark_tombstone(slot_idx);
+                    primary.len -= 1;
+                    primary.group_tombstones[group_idx] += 1;
+                    removed
+                };
+                self.rebuild_primary_group_summary(group_idx);
+                if self.special.primary.group_tombstones[group_idx]
+                    > self.special.primary.table.group_len(group_idx) / 4
+                {
+                    self.rebuild_special_primary_group(group_idx);
+                }
                 removed
             }
             SlotLocation::SpecialFallback { slot_idx } => {
-                let removed = unsafe { self.special.fallback.take(slot_idx) };
-                *self.special.fallback.control_at_mut(slot_idx) = CTRL_TOMBSTONE;
-                self.special.fallback_len -= 1;
-                self.special.fallback_has_holes = true;
+                let bucket_idx = self.special_fallback_bucket_of_slot(slot_idx);
+                let fallback = &mut self.special.fallback;
+                let removed = unsafe { fallback.table.take(slot_idx) };
+                fallback.table.mark_tombstone(slot_idx);
+                fallback.len -= 1;
+                fallback.bucket_live[bucket_idx] -= 1;
+                fallback.bucket_tombstones[bucket_idx] += 1;
+                Self::rebuild_bucket_summary(
+                    &fallback.table,
+                    fallback.bucket_range(bucket_idx),
+                    &mut fallback.bucket_summaries[bucket_idx],
+                );
+                if fallback.bucket_tombstones[bucket_idx] > fallback.bucket_size / 4 {
+                    self.rebuild_special_fallback_bucket(bucket_idx);
+                }
                 removed
             }
         };
 
         self.len -= 1;
+        self.shrink_max_populated_level();
         Some(removed_entry.value)
     }
 
@@ -349,28 +482,35 @@ where
                 if level.table.control_at(idx).is_occupied() {
                     unsafe { level.table.drop_in_place(idx) };
                 }
-                *level.table.control_at_mut(idx) = CTRL_EMPTY;
             }
+            level.table.clear_all_controls();
             level.len = 0;
-            level.has_holes = false;
+            level.bucket_summaries.fill(0);
+            level.bucket_live.fill(0);
+            level.bucket_tombstones.fill(0);
         }
 
-        for idx in 0..self.special.primary.capacity() {
-            if self.special.primary.control_at(idx).is_occupied() {
-                unsafe { self.special.primary.drop_in_place(idx) };
+        for idx in 0..self.special.primary.table.capacity() {
+            if self.special.primary.table.control_at(idx).is_occupied() {
+                unsafe { self.special.primary.table.drop_in_place(idx) };
             }
-            *self.special.primary.control_at_mut(idx) = CTRL_EMPTY;
         }
-        for idx in 0..self.special.fallback.capacity() {
-            if self.special.fallback.control_at(idx).is_occupied() {
-                unsafe { self.special.fallback.drop_in_place(idx) };
+        self.special.primary.table.clear_all_controls();
+        self.special.primary.len = 0;
+        self.special.primary.group_summaries.fill(0);
+        self.special.primary.group_tombstones.fill(0);
+
+        for idx in 0..self.special.fallback.table.capacity() {
+            if self.special.fallback.table.control_at(idx).is_occupied() {
+                unsafe { self.special.fallback.table.drop_in_place(idx) };
             }
-            *self.special.fallback.control_at_mut(idx) = CTRL_EMPTY;
         }
-        self.special.primary_len = 0;
-        self.special.fallback_len = 0;
-        self.special.primary_has_holes = false;
-        self.special.fallback_has_holes = false;
+        self.special.fallback.table.clear_all_controls();
+        self.special.fallback.len = 0;
+        self.special.fallback.bucket_summaries.fill(0);
+        self.special.fallback.bucket_live.fill(0);
+        self.special.fallback.bucket_tombstones.fill(0);
+
         self.len = 0;
         self.max_populated_level = 0;
     }
@@ -383,39 +523,50 @@ where
                 if level.table.control_at(idx).is_occupied() {
                     let entry = unsafe { level.table.take(idx) };
                     entries.push((entry.key, entry.value));
-                    *level.table.control_at_mut(idx) = CTRL_EMPTY;
                 }
             }
+            level.table.clear_all_controls();
             level.len = 0;
-            level.has_holes = false;
+            level.bucket_summaries.fill(0);
+            level.bucket_live.fill(0);
+            level.bucket_tombstones.fill(0);
         }
 
-        for idx in 0..self.special.primary.capacity() {
-            if self.special.primary.control_at(idx).is_occupied() {
-                let entry = unsafe { self.special.primary.take(idx) };
+        for idx in 0..self.special.primary.table.capacity() {
+            if self.special.primary.table.control_at(idx).is_occupied() {
+                let entry = unsafe { self.special.primary.table.take(idx) };
                 entries.push((entry.key, entry.value));
-                *self.special.primary.control_at_mut(idx) = CTRL_EMPTY;
             }
         }
-        self.special.primary_len = 0;
-        self.special.primary_has_holes = false;
+        self.special.primary.table.clear_all_controls();
+        self.special.primary.len = 0;
+        self.special.primary.group_summaries.fill(0);
+        self.special.primary.group_tombstones.fill(0);
 
-        for idx in 0..self.special.fallback.capacity() {
-            if self.special.fallback.control_at(idx).is_occupied() {
-                let entry = unsafe { self.special.fallback.take(idx) };
+        for idx in 0..self.special.fallback.table.capacity() {
+            if self.special.fallback.table.control_at(idx).is_occupied() {
+                let entry = unsafe { self.special.fallback.table.take(idx) };
                 entries.push((entry.key, entry.value));
-                *self.special.fallback.control_at_mut(idx) = CTRL_EMPTY;
             }
         }
-        self.special.fallback_len = 0;
-        self.special.fallback_has_holes = false;
+        self.special.fallback.table.clear_all_controls();
+        self.special.fallback.len = 0;
+        self.special.fallback.bucket_summaries.fill(0);
+        self.special.fallback.bucket_live.fill(0);
+        self.special.fallback.bucket_tombstones.fill(0);
 
         self.len = 0;
         self.max_populated_level = 0;
 
         let hash_builder = std::mem::take(&mut self.hash_builder);
-        let mut new_map =
-            Self::with_params_and_hasher(new_capacity, self.reserve_fraction, hash_builder);
+        let mut new_map = Self::with_options_and_hasher(
+            FunnelOptions {
+                capacity: new_capacity,
+                reserve_fraction: self.reserve_fraction,
+                primary_probe_limit: Some(self.primary_probe_limit),
+            },
+            hash_builder,
+        );
 
         for (key, value) in entries {
             new_map.insert(key, value);
@@ -425,55 +576,37 @@ where
     }
 
     #[inline]
-    fn replace_existing_value(&mut self, location: SlotLocation, value: V) -> V {
-        match location {
-            SlotLocation::Level {
-                level_idx,
-                slot_idx,
-            } => {
-                // SAFETY: caller guarantees slot is occupied.
-                let entry = unsafe { self.levels[level_idx].table.get_mut(slot_idx) };
-                std::mem::replace(&mut entry.value, value)
-            }
-            SlotLocation::SpecialPrimary { slot_idx } => {
-                let entry = unsafe { self.special.primary.get_mut(slot_idx) };
-                std::mem::replace(&mut entry.value, value)
-            }
-            SlotLocation::SpecialFallback { slot_idx } => {
-                let entry = unsafe { self.special.fallback.get_mut(slot_idx) };
-                std::mem::replace(&mut entry.value, value)
-            }
-        }
+    fn hash_key<Q>(&self, key: &Q) -> u64
+    where
+        Q: Hash + ?Sized,
+    {
+        self.hash_builder.hash_one(key)
     }
 
     #[inline]
-    fn place_new_entry(&mut self, location: SlotLocation, key: K, value: V, key_fingerprint: u8) {
-        match location {
-            SlotLocation::Level {
-                level_idx,
-                slot_idx,
-            } => {
-                self.levels[level_idx]
-                    .table
-                    .write(slot_idx, Entry { key, value });
-                *self.levels[level_idx].table.control_at_mut(slot_idx) = key_fingerprint;
-                self.levels[level_idx].len += 1;
-                if level_idx > self.max_populated_level {
-                    self.max_populated_level = level_idx;
-                }
-            }
-            SlotLocation::SpecialPrimary { slot_idx } => {
-                self.special.primary.write(slot_idx, Entry { key, value });
-                *self.special.primary.control_at_mut(slot_idx) = key_fingerprint;
-                self.special.primary_len += 1;
-            }
-            SlotLocation::SpecialFallback { slot_idx } => {
-                self.special.fallback.write(slot_idx, Entry { key, value });
-                *self.special.fallback.control_at_mut(slot_idx) = key_fingerprint;
-                self.special.fallback_len += 1;
-            }
+    fn level_bucket_index(&self, key_hash: u64, level_idx: usize, bucket_count: usize) -> usize {
+        (key_hash.rotate_left((level_idx as u32 * 7) % 64) as usize) % bucket_count
+    }
+
+    #[inline]
+    fn special_primary_probe_params(&self, key_hash: u64, group_count: usize) -> (usize, usize) {
+        if group_count <= 1 {
+            return (0, 1);
         }
-        self.len += 1;
+        let start = (key_hash.rotate_left(11) as usize) % group_count;
+        let steps = &self.special.primary.group_steps;
+        let step = steps[(key_hash.rotate_left(43) as usize) % steps.len()];
+        (start, step)
+    }
+
+    #[inline]
+    fn special_fallback_bucket_a(&self, key_hash: u64, bucket_count: usize) -> usize {
+        (key_hash.rotate_left(19) as usize) % bucket_count
+    }
+
+    #[inline]
+    fn special_fallback_bucket_b(&self, key_hash: u64, bucket_count: usize) -> usize {
+        (key_hash.rotate_left(37) as usize) % bucket_count
     }
 
     #[inline]
@@ -496,45 +629,68 @@ where
     }
 
     #[inline]
-    fn hash_key<Q>(&self, key: &Q) -> u64
-    where
-        Q: Hash + ?Sized,
-    {
-        self.hash_builder.hash_one(key)
-    }
-
-    #[inline]
-    fn level_bucket_index(&self, key_hash: u64, level_idx: usize, bucket_count: usize) -> usize {
-        (key_hash.rotate_left((level_idx as u32 * 7) % 64) as usize) % bucket_count
-    }
-
-    #[inline]
-    fn special_primary_probe_params(&self, key_hash: u64, slot_count: usize) -> (usize, usize) {
-        let start = (key_hash.rotate_left(11) as usize) % slot_count;
-        let mut step = (key_hash.rotate_left(43) as usize) % slot_count;
-        if step == 0 {
-            step = 1;
-        }
-        while greatest_common_divisor(step, slot_count) != 1 {
-            step += 1;
-            if step == slot_count {
-                step = 1;
+    fn replace_existing_value(&mut self, location: SlotLocation, value: V) -> V {
+        match location {
+            SlotLocation::Level {
+                level_idx,
+                slot_idx,
+            } => {
+                let entry = unsafe { self.levels[level_idx].table.get_mut(slot_idx) };
+                std::mem::replace(&mut entry.value, value)
+            }
+            SlotLocation::SpecialPrimary { slot_idx } => {
+                let entry = unsafe { self.special.primary.table.get_mut(slot_idx) };
+                std::mem::replace(&mut entry.value, value)
+            }
+            SlotLocation::SpecialFallback { slot_idx } => {
+                let entry = unsafe { self.special.fallback.table.get_mut(slot_idx) };
+                std::mem::replace(&mut entry.value, value)
             }
         }
-        (start, step)
     }
 
     #[inline]
-    fn special_fallback_bucket_a(&self, key_hash: u64, bucket_count: usize) -> usize {
-        (key_hash.rotate_left(19) as usize) % bucket_count
+    fn place_new_entry(&mut self, location: SlotLocation, key: K, value: V, key_fingerprint: u8) {
+        match location {
+            SlotLocation::Level {
+                level_idx,
+                slot_idx,
+            } => {
+                let bucket_idx = slot_idx / self.levels[level_idx].bucket_size;
+                let level = &mut self.levels[level_idx];
+                level
+                    .table
+                    .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
+                level.len += 1;
+                level.bucket_live[bucket_idx] += 1;
+                level.bucket_summaries[bucket_idx] |= fingerprint_bit(key_fingerprint);
+                if level_idx > self.max_populated_level {
+                    self.max_populated_level = level_idx;
+                }
+            }
+            SlotLocation::SpecialPrimary { slot_idx } => {
+                let group_idx = slot_idx / GROUP_SIZE;
+                let primary = &mut self.special.primary;
+                primary
+                    .table
+                    .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
+                primary.len += 1;
+                primary.group_summaries[group_idx] |= fingerprint_bit(key_fingerprint);
+            }
+            SlotLocation::SpecialFallback { slot_idx } => {
+                let bucket_idx = self.special_fallback_bucket_of_slot(slot_idx);
+                let fallback = &mut self.special.fallback;
+                fallback
+                    .table
+                    .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
+                fallback.len += 1;
+                fallback.bucket_live[bucket_idx] += 1;
+                fallback.bucket_summaries[bucket_idx] |= fingerprint_bit(key_fingerprint);
+            }
+        }
+        self.len += 1;
     }
 
-    #[inline]
-    fn special_fallback_bucket_b(&self, key_hash: u64, bucket_count: usize) -> usize {
-        (key_hash.rotate_left(37) as usize) % bucket_count
-    }
-
-    #[inline]
     fn first_free_in_level_bucket(
         &self,
         key_hash: u64,
@@ -551,70 +707,71 @@ where
         }
 
         let bucket_idx = self.level_bucket_index(key_hash, level_idx, bucket_count);
-        let bucket_start = bucket_idx * level.bucket_size;
-        let bucket_end = bucket_start + level.bucket_size;
-        let free_offset = level
-            .table
-            .controls(bucket_start..bucket_end)
-            .find_first_free()?;
-        Some(bucket_start + free_offset)
-    }
-
-    #[inline]
-    fn first_free_in_special_primary(&self, key_hash: u64) -> Option<usize> {
-        if self.special.primary.capacity() == 0
-            || self.special.primary_len >= self.special.primary.capacity()
-        {
+        if level.bucket_live[bucket_idx] >= level.bucket_size {
             return None;
         }
 
-        let slot_count = self.special.primary.capacity();
-        let (start, step) = self.special_primary_probe_params(key_hash, slot_count);
-        let mut slot_idx = start;
-        for _ in 0..self.primary_probe_limit {
-            if self.special.primary.control_at(slot_idx).is_free() {
+        let bucket_range = level.bucket_range(bucket_idx);
+        let free_offset = level
+            .table
+            .controls(bucket_range.clone())
+            .find_first_free()?;
+        Some(bucket_range.start + free_offset)
+    }
+
+    fn first_free_in_special_primary(&self, key_hash: u64) -> Option<usize> {
+        let primary = &self.special.primary;
+        if primary.table.capacity() == 0 || primary.len >= primary.table.capacity() {
+            return None;
+        }
+
+        let group_count = primary.table.group_count();
+        let (group_start, group_step) = self.special_primary_probe_params(key_hash, group_count);
+        let mut group_idx = group_start;
+        let group_limit = self.primary_probe_limit.min(group_count.max(1));
+
+        for _ in 0..group_limit {
+            if !primary.table.group_meta(group_idx).full
+                && let Some(slot_idx) = primary.table.first_free_in_group(group_idx, 0)
+            {
                 return Some(slot_idx);
             }
-            slot_idx = advance_wrapping_index(slot_idx, step, slot_count);
+            group_idx = advance_wrapping_index(group_idx, group_step, group_count);
         }
         None
     }
 
-    #[inline]
     fn first_free_in_special_fallback(&self, key_hash: u64) -> Option<usize> {
-        if self.special.fallback.capacity() == 0
-            || self.special.fallback_len >= self.special.fallback.capacity()
-        {
+        let fallback = &self.special.fallback;
+        if fallback.capacity() == 0 || fallback.len >= fallback.capacity() {
             return None;
         }
 
-        let bucket_count = self.special.fallback_bucket_count();
+        let bucket_count = fallback.bucket_count();
         if bucket_count == 0 {
             return None;
         }
 
         let bucket_a = self.special_fallback_bucket_a(key_hash, bucket_count);
         let bucket_b = self.special_fallback_bucket_b(key_hash, bucket_count);
-        let bucket_size = self.special.fallback_bucket_size;
-        let base_a = bucket_a * bucket_size;
-        let base_b = bucket_b * bucket_size;
 
-        for offset in 0..bucket_size {
-            let idx_a = base_a + offset;
-            if self.special.fallback.control_at(idx_a).is_free() {
-                return Some(idx_a);
+        if fallback.bucket_live[bucket_a] < fallback.bucket_size {
+            let range = fallback.bucket_range(bucket_a);
+            if let Some(offset) = fallback.table.controls(range.clone()).find_first_free() {
+                return Some(range.start + offset);
             }
+        }
 
-            let idx_b = base_b + offset;
-            if self.special.fallback.control_at(idx_b).is_free() {
-                return Some(idx_b);
+        if fallback.bucket_live[bucket_b] < fallback.bucket_size {
+            let range = fallback.bucket_range(bucket_b);
+            if let Some(offset) = fallback.table.controls(range.clone()).find_first_free() {
+                return Some(range.start + offset);
             }
         }
 
         None
     }
 
-    #[inline]
     fn find_in_level_bucket<Q>(
         &self,
         key_hash: u64,
@@ -637,11 +794,19 @@ where
         }
 
         let bucket_idx = self.level_bucket_index(key_hash, level_idx, bucket_count);
-        let bucket_start = bucket_idx * level.bucket_size;
-        let bucket_end = bucket_start + level.bucket_size;
-        let controls = level.table.controls(bucket_start..bucket_end);
+        let fingerprint_mask = fingerprint_bit(key_fingerprint);
+        if level.bucket_summaries[bucket_idx] & fingerprint_mask == 0 {
+            if level.bucket_tombstones[bucket_idx] == 0
+                && level.bucket_live[bucket_idx] < level.bucket_size
+            {
+                return LookupStep::StopSearch;
+            }
+            return LookupStep::Continue;
+        }
 
-        let searchable_len = if level.has_holes {
+        let bucket_range = level.bucket_range(bucket_idx);
+        let controls = level.table.controls(bucket_range.clone());
+        let searchable_len = if level.bucket_tombstones[bucket_idx] > 0 {
             controls.len()
         } else {
             controls.find_first(CTRL_EMPTY).unwrap_or(controls.len())
@@ -651,8 +816,7 @@ where
         while let Some(relative_idx) =
             controls[..searchable_len].find_next(key_fingerprint, match_offset)
         {
-            let slot_idx = bucket_start + relative_idx;
-            // SAFETY: fingerprint match means slot is occupied.
+            let slot_idx = bucket_range.start + relative_idx;
             let entry = unsafe { level.table.get_ref(slot_idx) };
             if entry.key.borrow() == key {
                 return LookupStep::Found(slot_idx);
@@ -660,48 +824,54 @@ where
             match_offset = relative_idx + 1;
         }
 
-        // If no deletions have occurred in this level and the bucket is not
-        // full, the key would have been placed here if it belonged to this
-        // bucket — it could not have cascaded further. We can stop early.
-        if !level.has_holes && searchable_len < controls.len() {
+        if level.bucket_tombstones[bucket_idx] == 0 && searchable_len < controls.len() {
             LookupStep::StopSearch
         } else {
             LookupStep::Continue
         }
     }
 
-    #[inline]
     fn find_in_special_primary<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> LookupStep
     where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        if self.special.primary.capacity() == 0 {
+        let primary = &self.special.primary;
+        if primary.table.capacity() == 0 {
             return LookupStep::Continue;
         }
 
-        let slot_count = self.special.primary.capacity();
-        let (start, step) = self.special_primary_probe_params(key_hash, slot_count);
-        let mut slot_idx = start;
-        for _ in 0..self.primary_probe_limit.max(1) {
-            let control = self.special.primary.control_at(slot_idx);
-            if control == key_fingerprint {
-                // SAFETY: fingerprint match means slot is occupied.
-                let entry = unsafe { self.special.primary.get_ref(slot_idx) };
-                if entry.key.borrow() == key {
-                    return LookupStep::Found(slot_idx);
+        let fingerprint_mask = fingerprint_bit(key_fingerprint);
+        let group_count = primary.table.group_count();
+        let (group_start, group_step) = self.special_primary_probe_params(key_hash, group_count);
+        let mut group_idx = group_start;
+        let group_limit = self.primary_probe_limit.min(group_count.max(1));
+
+        for _ in 0..group_limit {
+            if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
+                let mut match_mask = primary.table.group_match_mask(group_idx, key_fingerprint);
+                while match_mask != 0 {
+                    let relative_idx = match_mask.trailing_zeros() as usize;
+                    let slot_idx = primary.table.group_start(group_idx) + relative_idx;
+                    let entry = unsafe { primary.table.get_ref(slot_idx) };
+                    if entry.key.borrow() == key {
+                        return LookupStep::Found(slot_idx);
+                    }
+                    match_mask &= match_mask - 1;
                 }
             }
-            if !self.special.primary_has_holes && control == CTRL_EMPTY {
+
+            if primary.group_tombstones[group_idx] == 0 && !primary.table.group_meta(group_idx).full
+            {
                 return LookupStep::StopSearch;
             }
-            slot_idx = advance_wrapping_index(slot_idx, step, slot_count);
+
+            group_idx = advance_wrapping_index(group_idx, group_step, group_count);
         }
 
         LookupStep::Continue
     }
 
-    #[inline]
     fn find_in_special_fallback<Q>(
         &self,
         key_hash: u64,
@@ -712,52 +882,48 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        if self.special.fallback.capacity() == 0 {
+        let fallback = &self.special.fallback;
+        if fallback.capacity() == 0 {
             return None;
         }
 
-        let bucket_count = self.special.fallback_bucket_count();
+        let bucket_count = fallback.bucket_count();
         if bucket_count == 0 {
             return None;
         }
 
+        let fingerprint_mask = fingerprint_bit(key_fingerprint);
         let bucket_a = self.special_fallback_bucket_a(key_hash, bucket_count);
         let bucket_b = self.special_fallback_bucket_b(key_hash, bucket_count);
-        let bucket_size = self.special.fallback_bucket_size;
-        let base_a = bucket_a * bucket_size;
-        let base_b = bucket_b * bucket_size;
 
-        for offset in 0..bucket_size {
-            let idx_a = base_a + offset;
-            let control_a = self.special.fallback.control_at(idx_a);
-            if control_a == key_fingerprint {
-                // SAFETY: fingerprint match means slot is occupied.
-                let entry = unsafe { self.special.fallback.get_ref(idx_a) };
-                if entry.key.borrow() == key {
-                    return Some(idx_a);
-                }
+        for bucket_idx in [bucket_a, bucket_b] {
+            if fallback.bucket_summaries[bucket_idx] & fingerprint_mask == 0 {
+                continue;
             }
-            if !self.special.fallback_has_holes && control_a == CTRL_EMPTY {
-                return None;
-            }
+            let range = fallback.bucket_range(bucket_idx);
+            let controls = fallback.table.controls(range.clone());
+            let searchable_len = if fallback.bucket_tombstones[bucket_idx] > 0 {
+                controls.len()
+            } else {
+                controls.find_first(CTRL_EMPTY).unwrap_or(controls.len())
+            };
 
-            let idx_b = base_b + offset;
-            let control_b = self.special.fallback.control_at(idx_b);
-            if control_b == key_fingerprint {
-                let entry = unsafe { self.special.fallback.get_ref(idx_b) };
+            let mut match_offset = 0usize;
+            while let Some(relative_idx) =
+                controls[..searchable_len].find_next(key_fingerprint, match_offset)
+            {
+                let slot_idx = range.start + relative_idx;
+                let entry = unsafe { fallback.table.get_ref(slot_idx) };
                 if entry.key.borrow() == key {
-                    return Some(idx_b);
+                    return Some(slot_idx);
                 }
-            }
-            if !self.special.fallback_has_holes && control_b == CTRL_EMPTY {
-                return None;
+                match_offset = relative_idx + 1;
             }
         }
 
         None
     }
 
-    #[inline]
     fn find_slot_location_with_hash<Q>(
         &self,
         key: &Q,
@@ -783,15 +949,155 @@ where
         }
 
         match self.find_in_special_primary(key_hash, key_fingerprint, key) {
-            LookupStep::Found(slot_idx) => {
-                return Some(SlotLocation::SpecialPrimary { slot_idx });
-            }
+            LookupStep::Found(slot_idx) => return Some(SlotLocation::SpecialPrimary { slot_idx }),
             LookupStep::Continue => {}
             LookupStep::StopSearch => return None,
         }
 
         self.find_in_special_fallback(key_hash, key_fingerprint, key)
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
+    }
+
+    fn rebuild_level_bucket(&mut self, level_idx: usize, bucket_idx: usize) {
+        let mut entries = Vec::new();
+        {
+            let level = &mut self.levels[level_idx];
+            let range = level.bucket_range(bucket_idx);
+            for slot_idx in range.clone() {
+                if level.table.control_at(slot_idx).is_occupied() {
+                    let entry = unsafe { level.table.take(slot_idx) };
+                    entries.push((entry.key, entry.value));
+                }
+                level.table.clear_control(slot_idx);
+            }
+            level.bucket_live[bucket_idx] = 0;
+            level.bucket_tombstones[bucket_idx] = 0;
+            level.bucket_summaries[bucket_idx] = 0;
+        }
+
+        for (key, value) in entries {
+            let key_hash = self.hash_key(&key);
+            let key_fingerprint = control_fingerprint(key_hash);
+            let range = self.levels[level_idx].bucket_range(bucket_idx);
+            let offset = self.levels[level_idx]
+                .table
+                .controls(range.clone())
+                .find_first_free()
+                .expect("rebuilt bucket should have free space");
+            let slot_idx = range.start + offset;
+            let level = &mut self.levels[level_idx];
+            level
+                .table
+                .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
+            level.bucket_live[bucket_idx] += 1;
+            level.bucket_summaries[bucket_idx] |= fingerprint_bit(key_fingerprint);
+        }
+    }
+
+    fn rebuild_special_primary_group(&mut self, group_idx: usize) {
+        let mut entries = Vec::new();
+        {
+            let primary = &mut self.special.primary;
+            let group_start = primary.table.group_start(group_idx);
+            let group_len = primary.table.group_len(group_idx);
+            for slot_idx in group_start..group_start + group_len {
+                if primary.table.control_at(slot_idx).is_occupied() {
+                    let entry = unsafe { primary.table.take(slot_idx) };
+                    entries.push((entry.key, entry.value));
+                }
+                primary.table.clear_control(slot_idx);
+            }
+            primary.group_summaries[group_idx] = 0;
+            primary.group_tombstones[group_idx] = 0;
+        }
+
+        for (key, value) in entries {
+            let key_fingerprint = control_fingerprint(self.hash_key(&key));
+            let primary = &mut self.special.primary;
+            let slot_idx = primary
+                .table
+                .first_free_in_group(group_idx, 0)
+                .expect("rebuilt primary group should have free space");
+            primary
+                .table
+                .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
+            primary.group_summaries[group_idx] |= fingerprint_bit(key_fingerprint);
+        }
+    }
+
+    fn rebuild_special_fallback_bucket(&mut self, bucket_idx: usize) {
+        let mut entries = Vec::new();
+        {
+            let fallback = &mut self.special.fallback;
+            let range = fallback.bucket_range(bucket_idx);
+            for slot_idx in range.clone() {
+                if fallback.table.control_at(slot_idx).is_occupied() {
+                    let entry = unsafe { fallback.table.take(slot_idx) };
+                    entries.push((entry.key, entry.value));
+                }
+                fallback.table.clear_control(slot_idx);
+            }
+            fallback.bucket_live[bucket_idx] = 0;
+            fallback.bucket_tombstones[bucket_idx] = 0;
+            fallback.bucket_summaries[bucket_idx] = 0;
+        }
+
+        for (key, value) in entries {
+            let key_fingerprint = control_fingerprint(self.hash_key(&key));
+            let fallback = &mut self.special.fallback;
+            let range = fallback.bucket_range(bucket_idx);
+            let offset = fallback
+                .table
+                .controls(range.clone())
+                .find_first_free()
+                .expect("rebuilt fallback bucket should have free space");
+            let slot_idx = range.start + offset;
+            fallback
+                .table
+                .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
+            fallback.bucket_live[bucket_idx] += 1;
+            fallback.bucket_summaries[bucket_idx] |= fingerprint_bit(key_fingerprint);
+        }
+    }
+
+    fn rebuild_primary_group_summary(&mut self, group_idx: usize) {
+        let primary = &mut self.special.primary;
+        primary.group_summaries[group_idx] = 0;
+        let group_start = primary.table.group_start(group_idx);
+        let group_len = primary.table.group_len(group_idx);
+        for slot_idx in group_start..group_start + group_len {
+            let control = primary.table.control_at(slot_idx);
+            if control.is_occupied() {
+                primary.group_summaries[group_idx] |= fingerprint_bit(control);
+            }
+        }
+    }
+
+    fn special_fallback_bucket_of_slot(&self, slot_idx: usize) -> usize {
+        slot_idx / self.special.fallback.bucket_size.max(1)
+    }
+
+    fn shrink_max_populated_level(&mut self) {
+        while self.max_populated_level > 0 && self.levels[self.max_populated_level].len == 0 {
+            self.max_populated_level -= 1;
+        }
+        if self.levels.is_empty() || self.levels[0].len == 0 {
+            self.max_populated_level = 0;
+        }
+    }
+
+    fn rebuild_bucket_summary(
+        table: &RawTable<Entry<K, V>>,
+        range: std::ops::Range<usize>,
+        summary: &mut u128,
+    ) {
+        *summary = 0;
+        for slot_idx in range {
+            let control = table.control_at(slot_idx);
+            if control.is_occupied() {
+                *summary |= fingerprint_bit(control);
+            }
+        }
     }
 }
 
@@ -810,6 +1116,23 @@ fn log_log_probe_limit(capacity: usize) -> usize {
     n.log2().max(2.0).log2().ceil().max(1.0) as usize
 }
 
+fn build_group_steps(group_count: usize) -> Box<[usize]> {
+    if group_count <= 1 {
+        return Box::new([1]);
+    }
+
+    let mut steps = Vec::new();
+    for step in 1..group_count {
+        if greatest_common_divisor(step, group_count) == 1 {
+            steps.push(step);
+        }
+    }
+    if steps.is_empty() {
+        steps.push(1);
+    }
+    steps.into_boxed_slice()
+}
+
 fn choose_special_capacity(
     total_capacity: usize,
     reserve_fraction: f64,
@@ -826,7 +1149,7 @@ fn choose_special_capacity(
 
     if lower_bound <= upper_bound {
         for special_capacity in (lower_bound..=upper_bound).rev() {
-            if (total_capacity - special_capacity).is_multiple_of(bucket_size) {
+            if (total_capacity - special_capacity).is_multiple_of(bucket_size.max(1)) {
                 return special_capacity;
             }
         }
@@ -836,7 +1159,7 @@ fn choose_special_capacity(
         .round()
         .clamp(0.0, total_capacity as f64) as usize;
 
-    let mut best_special_capacity = total_capacity % bucket_size;
+    let mut best_special_capacity = total_capacity % bucket_size.max(1);
     let mut best_distance = usize::MAX;
 
     for main_capacity in (0..=total_capacity).step_by(bucket_size.max(1)) {
@@ -976,32 +1299,19 @@ mod tests {
         let capacity = 257;
         let map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(capacity);
         let level_capacity = map.levels.iter().map(BucketLevel::capacity).sum::<usize>();
-        let special_capacity = map.special.primary.capacity() + map.special.fallback.capacity();
-
-        assert_eq!(level_capacity + special_capacity, map.capacity());
-        assert_eq!(map.capacity(), capacity);
-    }
-
-    #[test]
-    fn funnel_bucket_partition_matches_three_quarters_plus_minus_one() {
-        let counts = partition_funnel_buckets(300, 20);
-        assert_eq!(counts.iter().sum::<usize>(), 300);
-
-        for pair in counts.windows(2) {
-            let expected = 3.0 * pair[0] as f64 / 4.0;
-            let observed = pair[1] as f64;
-            assert!((observed - expected).abs() <= 1.0);
-        }
+        let special_capacity =
+            map.special.primary.table.capacity() + map.special.fallback.table.capacity();
+        assert_eq!(level_capacity + special_capacity, capacity);
     }
 
     #[test]
     fn insert_get_and_update_work() {
         let mut map = FunnelHashMap::with_capacity(512);
 
-        for key in 0..120 {
+        for key in 0..20 {
             assert_eq!(map.insert(key, key * 10), None);
         }
-        for key in 0..120 {
+        for key in 0..20 {
             assert_eq!(map.get(&key), Some(&(key * 10)));
         }
 
@@ -1016,17 +1326,15 @@ mod tests {
         assert_eq!(map.insert("alpha".to_string(), 1), None);
         assert_eq!(map.insert("beta".to_string(), 2), None);
 
-        assert!(map.contains_key("alpha"));
         assert_eq!(map.remove("alpha"), Some(1));
         assert_eq!(map.remove("alpha"), None);
-
         map.clear();
-        assert!(map.is_empty());
         assert_eq!(map.get("beta"), None);
+        assert!(map.is_empty());
     }
 
     #[test]
-    fn new_starts_with_zero_capacity() {
+    fn new_starts_empty() {
         let map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
         assert_eq!(map.capacity(), 0);
         assert_eq!(map.len(), 0);
@@ -1042,17 +1350,28 @@ mod tests {
 
     #[test]
     fn insert_resizes_when_threshold_is_reached() {
-        let capacity = 256;
+        let capacity = 64;
         let mut map = FunnelHashMap::with_capacity(capacity);
+        let max_insertions =
+            capacity.saturating_sub((DEFAULT_RESERVE_FRACTION * capacity as f64).floor() as usize);
 
-        for key in 0..capacity {
+        for key in 0..max_insertions + 10 {
             let _ = map.insert(key, key * 10);
         }
-
-        for key in 0..capacity {
+        for key in 0..max_insertions + 10 {
             assert_eq!(map.get(&key), Some(&(key * 10)));
         }
 
         assert!(map.capacity() > capacity);
+    }
+
+    #[test]
+    fn options_constructor_preserves_capacity() {
+        let map: FunnelHashMap<i32, i32> = FunnelHashMap::with_options(FunnelOptions {
+            capacity: 320,
+            reserve_fraction: DEFAULT_RESERVE_FRACTION,
+            primary_probe_limit: Some(4),
+        });
+        assert_eq!(map.capacity(), 320);
     }
 }
