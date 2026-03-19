@@ -1,6 +1,6 @@
 # opthash
 
-Rust implementations of **Elastic Hashing** and **Funnel Hashing** from [*Optimal Bounds for Open Addressing Without Reordering*](https://arxiv.org/abs/2501.02305) (Farach-Colton, Krapivin, Kuszmaul, 2025).
+Rust implementations of **Elastic Hashing** and **Funnel Hashing** from [_Optimal Bounds for Open Addressing Without Reordering_](https://arxiv.org/abs/2501.02305) (Farach-Colton, Krapivin, Kuszmaul, 2025).
 
 Both are open-addressing hash maps that achieve optimal expected probe complexity without reordering elements after insertion.
 
@@ -15,7 +15,13 @@ Both support `insert`, `get`, `get_mut`, `contains_key`, `remove`, and `clear`. 
 
 Current Criterion throughput results on Apple M1 (aarch64, NEON SIMD), normalized so `std::HashMap` is the `1.0x` baseline:
 
-![Benchmark speedup chart](assets/benchmark-speedup.svg)
+Core workloads:
+
+![Core benchmark speedup chart](assets/benchmark-speedup-core.svg)
+
+Secondary workloads:
+
+![Secondary benchmark speedup chart](assets/benchmark-speedup-secondary.svg)
 
 Regenerate the benchmark chart:
 
