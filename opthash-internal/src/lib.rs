@@ -9,47 +9,195 @@ pub const CONTROL_GROUP_SIZE: usize = 16;
 pub const CTRL_EMPTY: u8 = 0;
 pub const CTRL_TOMBSTONE: u8 = 0x80;
 
-#[must_use]
-pub fn preferred_group_width() -> usize {
-    #[cfg(target_arch = "x86_64")]
-    {
-        static WIDTH: OnceLock<usize> = OnceLock::new();
-        *WIDTH.get_or_init(|| {
-            if std::is_x86_feature_detected!("avx2") {
-                32
-            } else {
-                CONTROL_GROUP_SIZE
+pub struct ControlOps;
+pub struct ProbeOps;
+
+impl ControlOps {
+    /// # Panics
+    ///
+    /// Panics if the masked 7-bit fingerprint cannot be represented as `u8`.
+    #[must_use]
+    pub fn control_fingerprint(hash: u64) -> u8 {
+        let low = u8::try_from(hash & 0x7F).expect("7-bit fingerprint fits in u8");
+        low.max(1)
+    }
+
+    #[must_use]
+    pub fn fingerprint_bit(fingerprint: u8) -> u128 {
+        1u128 << u32::from(fingerprint.saturating_sub(1))
+    }
+
+    #[must_use]
+    pub fn find_first_free_in_controls(controls: &[u8]) -> Option<usize> {
+        if controls.len() < CONTROL_GROUP_SIZE {
+            return controls
+                .iter()
+                .position(|&control| control == CTRL_EMPTY || control == CTRL_TOMBSTONE);
+        }
+
+        let wide = Self::preferred_group_width();
+        let mut index = 0usize;
+        while wide > CONTROL_GROUP_SIZE && index + wide <= controls.len() {
+            let mask = Self::control_match_free_group(&controls[index..index + wide]);
+            if mask != 0 {
+                return Some(index + mask.trailing_zeros() as usize);
             }
-        })
+            index += wide;
+        }
+
+        while index + CONTROL_GROUP_SIZE <= controls.len() {
+            let mask = Self::control_match_free_group(&controls[index..index + CONTROL_GROUP_SIZE]);
+            if mask != 0 {
+                return Some(index + mask.trailing_zeros() as usize);
+            }
+            index += CONTROL_GROUP_SIZE;
+        }
+
+        controls[index..]
+            .iter()
+            .position(|&control| control == CTRL_EMPTY || control == CTRL_TOMBSTONE)
+            .map(|offset| index + offset)
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        CONTROL_GROUP_SIZE
+    #[must_use]
+    pub fn find_next_fingerprint_in_controls(
+        controls: &[u8],
+        fingerprint: u8,
+        start: usize,
+    ) -> Option<usize> {
+        if start >= controls.len() {
+            return None;
+        }
+
+        if controls.len() - start < CONTROL_GROUP_SIZE {
+            return controls[start..]
+                .iter()
+                .position(|&control| control == fingerprint)
+                .map(|offset| start + offset);
+        }
+
+        let wide = Self::preferred_group_width();
+        let mut index = start;
+        while wide > CONTROL_GROUP_SIZE && index + wide <= controls.len() {
+            let mask =
+                Self::control_match_fingerprint_group(&controls[index..index + wide], fingerprint);
+            if mask != 0 {
+                return Some(index + mask.trailing_zeros() as usize);
+            }
+            index += wide;
+        }
+
+        while index + CONTROL_GROUP_SIZE <= controls.len() {
+            let mask = Self::control_match_fingerprint_group(
+                &controls[index..index + CONTROL_GROUP_SIZE],
+                fingerprint,
+            );
+            if mask != 0 {
+                return Some(index + mask.trailing_zeros() as usize);
+            }
+            index += CONTROL_GROUP_SIZE;
+        }
+
+        controls[index..]
+            .iter()
+            .position(|&control| control == fingerprint)
+            .map(|offset| index + offset)
+    }
+
+    #[must_use]
+    pub fn preferred_group_width() -> usize {
+        #[cfg(target_arch = "x86_64")]
+        {
+            static WIDTH: OnceLock<usize> = OnceLock::new();
+            *WIDTH.get_or_init(|| {
+                if std::is_x86_feature_detected!("avx2") {
+                    32
+                } else {
+                    CONTROL_GROUP_SIZE
+                }
+            })
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            CONTROL_GROUP_SIZE
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `chunk` is not 16 or 32 bytes long.
+    #[must_use]
+    pub fn control_match_free_group(chunk: &[u8]) -> u32 {
+        match chunk.len() {
+            CONTROL_GROUP_SIZE => u32::from(unsafe { free_mask_16(chunk.as_ptr()) }),
+            32 => unsafe { free_mask_32(chunk.as_ptr()) },
+            _ => panic!("group matching requires 16 or 32 byte chunks"),
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `chunk` is not 16 or 32 bytes long.
+    #[must_use]
+    pub fn control_match_fingerprint_group(chunk: &[u8], target: u8) -> u32 {
+        match chunk.len() {
+            CONTROL_GROUP_SIZE => u32::from(unsafe { eq_mask_16(chunk.as_ptr(), target) }),
+            32 => unsafe { eq_mask_32(chunk.as_ptr(), target) },
+            _ => panic!("group matching requires 16 or 32 byte chunks"),
+        }
     }
 }
 
-/// # Panics
-///
-/// Panics if `chunk` is not 16 or 32 bytes long.
-#[must_use]
-pub fn control_match_free_group(chunk: &[u8]) -> u32 {
-    match chunk.len() {
-        CONTROL_GROUP_SIZE => u32::from(unsafe { free_mask_16(chunk.as_ptr()) }),
-        32 => unsafe { free_mask_32(chunk.as_ptr()) },
-        _ => panic!("group matching requires 16 or 32 byte chunks"),
+impl ProbeOps {
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    #[must_use]
+    pub fn log_log_probe_limit(capacity: usize) -> usize {
+        let n = capacity.max(4) as f64;
+        n.log2().max(2.0).log2().ceil().max(1.0) as usize
     }
-}
 
-/// # Panics
-///
-/// Panics if `chunk` is not 16 or 32 bytes long.
-#[must_use]
-pub fn control_match_fingerprint_group(chunk: &[u8], target: u8) -> u32 {
-    match chunk.len() {
-        CONTROL_GROUP_SIZE => u32::from(unsafe { eq_mask_16(chunk.as_ptr(), target) }),
-        32 => unsafe { eq_mask_32(chunk.as_ptr(), target) },
-        _ => panic!("group matching requires 16 or 32 byte chunks"),
+    #[allow(clippy::cast_possible_truncation)]
+    #[must_use]
+    pub fn hash_to_usize(hash: u64) -> usize {
+        hash as usize
+    }
+
+    #[must_use]
+    pub fn greatest_common_divisor(mut a: usize, mut b: usize) -> usize {
+        while b != 0 {
+            let next = a % b;
+            a = b;
+            b = next;
+        }
+        a
+    }
+
+    #[must_use]
+    pub fn advance_wrapping_index(index: usize, step: usize, len: usize) -> usize {
+        if len == 0 { 0 } else { (index + step) % len }
+    }
+
+    #[must_use]
+    pub fn build_group_steps(group_count: usize) -> Box<[usize]> {
+        if group_count <= 1 {
+            return Box::new([1]);
+        }
+
+        let mut steps = Vec::new();
+        for step in 1..group_count {
+            if Self::greatest_common_divisor(step, group_count) == 1 {
+                steps.push(step);
+            }
+        }
+        if steps.is_empty() {
+            steps.push(1);
+        }
+        steps.into_boxed_slice()
     }
 }
 

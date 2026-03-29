@@ -2,13 +2,15 @@ use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
+use opthash_internal::ProbeOps;
+
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
     control::{CTRL_EMPTY, ControlByte, Controls, control_fingerprint, fingerprint_bit},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
-        advance_wrapping_index, ceil_to_usize, floor_to_usize, greatest_common_divisor,
-        max_insertions, round_to_usize, round_up_to_group, sanitize_reserve_fraction, usize_to_f64,
+        advance_wrapping_index, ceil_to_usize, floor_to_usize, max_insertions, round_to_usize,
+        round_up_to_group, sanitize_reserve_fraction, usize_to_f64,
     },
 };
 
@@ -112,7 +114,7 @@ impl<K, V> SpecialPrimary<K, V> {
             len: 0,
             group_summaries: vec![0; group_count].into_boxed_slice(),
             group_tombstones: vec![0; group_count].into_boxed_slice(),
-            group_steps: build_group_steps(group_count),
+            group_steps: ProbeOps::build_group_steps(group_count),
         }
     }
 }
@@ -274,7 +276,7 @@ where
         let bucket_width = round_up_to_group(compute_bucket_width(reserve_fraction));
         let primary_probe_limit = options
             .primary_probe_limit
-            .unwrap_or_else(|| log_log_probe_limit(capacity))
+            .unwrap_or_else(|| ProbeOps::log_log_probe_limit(capacity))
             .max(1);
 
         let mut special_capacity =
@@ -593,7 +595,7 @@ where
     #[inline]
     fn level_bucket_index(key_hash: u64, level_idx: usize, bucket_count: usize) -> usize {
         let rotation = (u32::try_from(level_idx).expect("level index fits in u32") * 7) % 64;
-        hash_to_usize(key_hash.rotate_left(rotation)) % bucket_count
+        ProbeOps::hash_to_usize(key_hash.rotate_left(rotation)) % bucket_count
     }
 
     #[inline]
@@ -601,20 +603,20 @@ where
         if group_count <= 1 {
             return (0, 1);
         }
-        let start = hash_to_usize(key_hash.rotate_left(11)) % group_count;
+        let start = ProbeOps::hash_to_usize(key_hash.rotate_left(11)) % group_count;
         let steps = &self.special.primary.group_steps;
-        let step = steps[hash_to_usize(key_hash.rotate_left(43)) % steps.len()];
+        let step = steps[ProbeOps::hash_to_usize(key_hash.rotate_left(43)) % steps.len()];
         (start, step)
     }
 
     #[inline]
     fn special_fallback_bucket_a(key_hash: u64, bucket_count: usize) -> usize {
-        hash_to_usize(key_hash.rotate_left(19)) % bucket_count
+        ProbeOps::hash_to_usize(key_hash.rotate_left(19)) % bucket_count
     }
 
     #[inline]
     fn special_fallback_bucket_b(key_hash: u64, bucket_count: usize) -> usize {
-        hash_to_usize(key_hash.rotate_left(37)) % bucket_count
+        ProbeOps::hash_to_usize(key_hash.rotate_left(37)) % bucket_count
     }
 
     #[inline]
@@ -1121,34 +1123,6 @@ fn compute_level_count(reserve_fraction: f64) -> usize {
 
 fn compute_bucket_width(reserve_fraction: f64) -> usize {
     ceil_to_usize((2.0 * (1.0 / reserve_fraction).log2()).max(1.0))
-}
-
-fn log_log_probe_limit(capacity: usize) -> usize {
-    let n = usize_to_f64(capacity.max(4));
-    ceil_to_usize(n.log2().max(2.0).log2().max(1.0))
-}
-
-fn build_group_steps(group_count: usize) -> Box<[usize]> {
-    if group_count <= 1 {
-        return Box::new([1]);
-    }
-
-    let mut steps = Vec::new();
-    for step in 1..group_count {
-        if greatest_common_divisor(step, group_count) == 1 {
-            steps.push(step);
-        }
-    }
-    if steps.is_empty() {
-        steps.push(1);
-    }
-    steps.into_boxed_slice()
-}
-
-#[allow(clippy::cast_possible_truncation)]
-#[inline]
-fn hash_to_usize(hash: u64) -> usize {
-    hash as usize
 }
 
 fn choose_special_capacity(

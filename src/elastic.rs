@@ -2,13 +2,15 @@ use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
+use opthash_internal::ProbeOps;
+
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
     control::{ControlByte, control_fingerprint},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
         advance_wrapping_index, ceil_three_quarters, ceil_to_usize, floor_half_reserve_slots,
-        greatest_common_divisor, max_insertions, sanitize_reserve_fraction, usize_to_f64,
+        max_insertions, sanitize_reserve_fraction, usize_to_f64,
     },
 };
 
@@ -61,7 +63,7 @@ impl<K, V> Level<K, V> {
     ) -> Self {
         let table = RawTable::new(capacity);
         let group_count = table.group_count();
-        let group_steps = build_group_steps(group_count);
+        let group_steps = ProbeOps::build_group_steps(group_count);
         let limited_probe_budgets =
             build_probe_budgets(capacity, group_count, reserve_fraction, probe_scale);
 
@@ -556,9 +558,9 @@ where
         }
 
         let mixed = key_hash ^ level.salt;
-        let group_start = hash_to_usize(mixed) % group_count;
-        let step =
-            level.group_steps[hash_to_usize(mixed.rotate_left(29)) % level.group_steps.len()];
+        let group_start = ProbeOps::hash_to_usize(mixed) % group_count;
+        let step = level.group_steps
+            [ProbeOps::hash_to_usize(mixed.rotate_left(29)) % level.group_steps.len()];
         (group_start, step)
     }
 
@@ -618,29 +620,6 @@ fn level_salt(level_idx: usize) -> u64 {
             .expect("level index fits in u64")
             .wrapping_add(1),
     )
-}
-
-#[allow(clippy::cast_possible_truncation)]
-#[inline]
-fn hash_to_usize(hash: u64) -> usize {
-    hash as usize
-}
-
-fn build_group_steps(group_count: usize) -> Box<[usize]> {
-    if group_count <= 1 {
-        return Box::new([1]);
-    }
-
-    let mut steps = Vec::new();
-    for step in 1..group_count {
-        if greatest_common_divisor(step, group_count) == 1 {
-            steps.push(step);
-        }
-    }
-    if steps.is_empty() {
-        steps.push(1);
-    }
-    steps.into_boxed_slice()
 }
 
 fn build_probe_budgets(

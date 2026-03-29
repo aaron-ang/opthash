@@ -1,5 +1,5 @@
 use super::layout::GROUP_SIZE;
-use opthash_internal::{eq_mask_16, eq_mask_32, free_mask_16, free_mask_32, preferred_group_width};
+use opthash_internal::{ControlOps, eq_mask_16, eq_mask_32, free_mask_16, free_mask_32};
 
 pub(crate) use opthash_internal::{CTRL_EMPTY, CTRL_TOMBSTONE};
 
@@ -22,13 +22,12 @@ impl ControlByte for u8 {
 
 #[inline]
 pub(crate) fn control_fingerprint(hash: u64) -> u8 {
-    let low = u8::try_from(hash & 0x7F).expect("7-bit fingerprint fits in u8");
-    low.max(1)
+    ControlOps::control_fingerprint(hash)
 }
 
 #[inline]
 pub(crate) fn fingerprint_bit(fingerprint: u8) -> u128 {
-    1u128 << u32::from(fingerprint.saturating_sub(1))
+    ControlOps::fingerprint_bit(fingerprint)
 }
 
 #[inline]
@@ -53,34 +52,7 @@ pub(crate) trait Controls {
 impl Controls for [u8] {
     #[inline]
     fn find_first_free(&self) -> Option<usize> {
-        if self.len() < GROUP_SIZE {
-            return self.iter().position(ControlByte::is_free);
-        }
-
-        let mut index = 0usize;
-        let wide = preferred_group_width();
-        while wide > GROUP_SIZE && index + wide <= self.len() {
-            let mask = self[index..index + wide].match_free_group();
-            if mask != 0 {
-                return Some(index + mask.trailing_zeros() as usize);
-            }
-            index += wide;
-        }
-        while index + GROUP_SIZE <= self.len() {
-            let mask = self[index..index + GROUP_SIZE].match_free_group();
-            if mask != 0 {
-                return Some(index + mask.trailing_zeros() as usize);
-            }
-            index += GROUP_SIZE;
-        }
-
-        for (offset, control) in self[index..].iter().enumerate() {
-            if control.is_free() {
-                return Some(index + offset);
-            }
-        }
-
-        None
+        ControlOps::find_first_free_in_controls(self)
     }
 
     #[inline]
@@ -90,43 +62,7 @@ impl Controls for [u8] {
 
     #[inline]
     fn find_next(&self, target: u8, start: usize) -> Option<usize> {
-        if start >= self.len() {
-            return None;
-        }
-
-        if self.len() - start < GROUP_SIZE {
-            for (offset, &control) in self[start..].iter().enumerate() {
-                if control == target {
-                    return Some(start + offset);
-                }
-            }
-            return None;
-        }
-
-        let mut index = start;
-        let wide = preferred_group_width();
-        while wide > GROUP_SIZE && index + wide <= self.len() {
-            let mask = self[index..index + wide].match_fingerprint_group(target);
-            if mask != 0 {
-                return Some(index + mask.trailing_zeros() as usize);
-            }
-            index += wide;
-        }
-        while index + GROUP_SIZE <= self.len() {
-            let mask = self[index..index + GROUP_SIZE].match_fingerprint_group(target);
-            if mask != 0 {
-                return Some(index + mask.trailing_zeros() as usize);
-            }
-            index += GROUP_SIZE;
-        }
-
-        for (offset, &control) in self[index..].iter().enumerate() {
-            if control == target {
-                return Some(index + offset);
-            }
-        }
-
-        None
+        ControlOps::find_next_fingerprint_in_controls(self, target, start)
     }
 
     #[inline]

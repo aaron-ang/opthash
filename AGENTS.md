@@ -30,3 +30,7 @@ Example path: `target/criterion/get_hit_throughput/elastic/change/estimates.json
 - `src/elastic.rs` — `ElasticHashMap` (tests inline)
 - `src/funnel.rs` — `FunnelHashMap` (tests inline)
 - `src/common/` — shared internals: control-byte SIMD ops, layout math, config
+
+## Refactoring guidelines
+
+- If a low-level helper is used by both the root crate and benchmarks, move it into `opthash-internal/` instead of duplicating it or exposing bench-only API from `src/`.

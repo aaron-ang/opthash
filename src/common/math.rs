@@ -1,6 +1,8 @@
 use super::config::{DEFAULT_RESERVE_FRACTION, MAX_RESERVE_FRACTION, MIN_RESERVE_FRACTION};
 use super::layout::GROUP_SIZE;
 
+pub(crate) use opthash_internal::ProbeOps;
+
 #[allow(clippy::cast_precision_loss)]
 #[inline]
 pub(crate) fn usize_to_f64(value: usize) -> f64 {
@@ -46,19 +48,9 @@ pub(crate) fn floor_half_reserve_slots(reserve_fraction: f64, value: usize) -> u
     floor_to_usize((reserve_fraction * usize_to_f64(value)) / 2.0)
 }
 
-pub(crate) fn greatest_common_divisor(mut a: usize, mut b: usize) -> usize {
-    while b != 0 {
-        let remainder = a % b;
-        a = b;
-        b = remainder;
-    }
-    a
-}
-
 #[inline]
 pub(crate) fn advance_wrapping_index(current: usize, step: usize, len: usize) -> usize {
-    let next = current + step;
-    if next >= len { next - len } else { next }
+    ProbeOps::advance_wrapping_index(current, step, len)
 }
 
 #[inline]
