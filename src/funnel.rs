@@ -48,20 +48,28 @@ struct BucketLevel<K, V> {
     table: RawTable<Entry<K, V>>,
     len: usize,
     bucket_size: usize,
+    bucket_count: usize,
+    hash_rotation: u32,
     bucket_summaries: Box<[u128]>,
     bucket_live: Box<[usize]>,
+    bucket_live_masks: Box<[u128]>,
+    bucket_search_len: Box<[usize]>,
     bucket_tombstones: Box<[usize]>,
 }
 
 impl<K, V> BucketLevel<K, V> {
-    fn with_bucket_count(bucket_count: usize, bucket_size: usize) -> Self {
+    fn with_bucket_count(bucket_count: usize, bucket_size: usize, hash_rotation: u32) -> Self {
         let total_capacity = bucket_count.saturating_mul(bucket_size);
         Self {
             table: RawTable::new(total_capacity),
             len: 0,
             bucket_size,
+            bucket_count,
+            hash_rotation,
             bucket_summaries: vec![0; bucket_count].into_boxed_slice(),
             bucket_live: vec![0; bucket_count].into_boxed_slice(),
+            bucket_live_masks: vec![0; bucket_count].into_boxed_slice(),
+            bucket_search_len: vec![0; bucket_count].into_boxed_slice(),
             bucket_tombstones: vec![0; bucket_count].into_boxed_slice(),
         }
     }
@@ -72,17 +80,25 @@ impl<K, V> BucketLevel<K, V> {
     }
 
     #[inline]
-    fn bucket_count(&self) -> usize {
-        self.table
-            .capacity()
-            .checked_div(self.bucket_size)
-            .unwrap_or(0)
+    fn bucket_index(&self, key_hash: u64) -> usize {
+        ProbeOps::hash_to_usize(key_hash.rotate_left(self.hash_rotation)) % self.bucket_count
     }
 
     #[inline]
     fn bucket_range(&self, bucket_idx: usize) -> std::ops::Range<usize> {
         let start = bucket_idx * self.bucket_size;
         start..start + self.bucket_size
+    }
+
+    #[inline]
+    fn bucket_live_mask(&self, bucket_idx: usize) -> u128 {
+        self.bucket_live_masks[bucket_idx]
+    }
+
+    #[inline]
+    fn update_bucket_search_len(&mut self, bucket_idx: usize) {
+        self.bucket_search_len[bucket_idx] =
+            live_mask_search_len(self.bucket_live_masks[bucket_idx], self.bucket_size);
     }
 }
 
@@ -134,6 +150,7 @@ struct SpecialFallback<K, V> {
     table: RawTable<Entry<K, V>>,
     len: usize,
     bucket_size: usize,
+    bucket_count: usize,
     bucket_summaries: Box<[u128]>,
     bucket_live: Box<[usize]>,
     bucket_tombstones: Box<[usize]>,
@@ -150,6 +167,7 @@ impl<K, V> SpecialFallback<K, V> {
             table: RawTable::new(capacity),
             len: 0,
             bucket_size,
+            bucket_count,
             bucket_summaries: vec![0; bucket_count].into_boxed_slice(),
             bucket_live: vec![0; bucket_count].into_boxed_slice(),
             bucket_tombstones: vec![0; bucket_count].into_boxed_slice(),
@@ -163,11 +181,7 @@ impl<K, V> SpecialFallback<K, V> {
 
     #[inline]
     fn bucket_count(&self) -> usize {
-        if self.bucket_size == 0 {
-            0
-        } else {
-            self.table.capacity().div_ceil(self.bucket_size)
-        }
+        self.bucket_count
     }
 
     #[inline]
@@ -292,7 +306,12 @@ where
         let level_bucket_counts = partition_funnel_buckets(total_main_buckets, level_count);
         let levels = level_bucket_counts
             .into_iter()
-            .map(|bucket_count| BucketLevel::with_bucket_count(bucket_count, bucket_width))
+            .enumerate()
+            .map(|(level_idx, bucket_count)| {
+                let hash_rotation =
+                    (u32::try_from(level_idx).expect("level index fits in u32") * 7) % 64;
+                BucketLevel::with_bucket_count(bucket_count, bucket_width, hash_rotation)
+            })
             .collect::<Vec<_>>();
 
         let special = SpecialArray::with_capacity(special_capacity, primary_probe_limit);
@@ -421,16 +440,17 @@ where
                 level_idx,
                 slot_idx,
             } => {
-                let bucket_idx = Self::level_bucket_index(
-                    key_hash,
-                    level_idx,
-                    self.levels[level_idx].bucket_count(),
-                );
                 let level = &mut self.levels[level_idx];
+                let bucket_idx = level.bucket_index(key_hash);
                 let removed = unsafe { level.table.take(slot_idx) };
                 level.table.mark_tombstone(slot_idx);
                 level.len -= 1;
                 level.bucket_live[bucket_idx] -= 1;
+                level.bucket_live_masks[bucket_idx] &= !bucket_offset_bit(
+                    level.bucket_size,
+                    slot_idx - level.bucket_range(bucket_idx).start,
+                );
+                level.update_bucket_search_len(bucket_idx);
                 level.bucket_tombstones[bucket_idx] += 1;
                 Self::rebuild_bucket_summary(
                     &level.table,
@@ -496,6 +516,8 @@ where
             level.len = 0;
             level.bucket_summaries.fill(0);
             level.bucket_live.fill(0);
+            level.bucket_live_masks.fill(0);
+            level.bucket_search_len.fill(0);
             level.bucket_tombstones.fill(0);
         }
 
@@ -538,6 +560,8 @@ where
             level.len = 0;
             level.bucket_summaries.fill(0);
             level.bucket_live.fill(0);
+            level.bucket_live_masks.fill(0);
+            level.bucket_search_len.fill(0);
             level.bucket_tombstones.fill(0);
         }
 
@@ -593,12 +617,6 @@ where
     }
 
     #[inline]
-    fn level_bucket_index(key_hash: u64, level_idx: usize, bucket_count: usize) -> usize {
-        let rotation = (u32::try_from(level_idx).expect("level index fits in u32") * 7) % 64;
-        ProbeOps::hash_to_usize(key_hash.rotate_left(rotation)) % bucket_count
-    }
-
-    #[inline]
     fn special_primary_probe_params(&self, key_hash: u64, group_count: usize) -> (usize, usize) {
         if group_count <= 1 {
             return (0, 1);
@@ -622,7 +640,7 @@ where
     #[inline]
     fn choose_slot_for_new_key(&self, key_hash: u64) -> Option<SlotLocation> {
         for (level_idx, level) in self.levels.iter().enumerate() {
-            if let Some(slot_idx) = Self::first_free_in_level_bucket(key_hash, level_idx, level) {
+            if let Some(slot_idx) = Self::first_free_in_level_bucket(key_hash, level) {
                 return Some(SlotLocation::Level {
                     level_idx,
                     slot_idx,
@@ -673,6 +691,11 @@ where
                     .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
                 level.len += 1;
                 level.bucket_live[bucket_idx] += 1;
+                let bucket_offset = slot_idx - level.bucket_range(bucket_idx).start;
+                level.bucket_live_masks[bucket_idx] |=
+                    bucket_offset_bit(level.bucket_size, bucket_offset);
+                level.bucket_search_len[bucket_idx] =
+                    level.bucket_search_len[bucket_idx].max(bucket_offset + 1);
                 level.bucket_summaries[bucket_idx] |= fingerprint_bit(key_fingerprint);
                 if level_idx > self.max_populated_level {
                     self.max_populated_level = level_idx;
@@ -701,31 +724,27 @@ where
         self.len += 1;
     }
 
-    fn first_free_in_level_bucket(
-        key_hash: u64,
-        level_idx: usize,
-        level: &BucketLevel<K, V>,
-    ) -> Option<usize> {
+    fn first_free_in_level_bucket(key_hash: u64, level: &BucketLevel<K, V>) -> Option<usize> {
         if level.capacity() == 0 || level.len >= level.capacity() {
             return None;
         }
 
-        let bucket_count = level.bucket_count();
-        if bucket_count == 0 {
+        if level.bucket_count == 0 {
             return None;
         }
 
-        let bucket_idx = Self::level_bucket_index(key_hash, level_idx, bucket_count);
+        let bucket_idx = level.bucket_index(key_hash);
         if level.bucket_live[bucket_idx] >= level.bucket_size {
             return None;
         }
 
-        let bucket_range = level.bucket_range(bucket_idx);
-        let free_offset = level
-            .table
-            .controls(bucket_range.clone())
-            .find_first_free()?;
-        Some(bucket_range.start + free_offset)
+        let free_mask = valid_bucket_mask(level.bucket_size) & !level.bucket_live_mask(bucket_idx);
+        if free_mask == 0 {
+            return None;
+        }
+
+        let free_offset = free_mask.trailing_zeros() as usize;
+        Some(level.bucket_range(bucket_idx).start + free_offset)
     }
 
     fn first_free_in_special_primary(&self, key_hash: u64) -> Option<usize> {
@@ -793,7 +812,6 @@ where
         key_hash: u64,
         key_fingerprint: u8,
         key: &Q,
-        level_idx: usize,
         level: &BucketLevel<K, V>,
     ) -> LookupStep
     where
@@ -804,17 +822,19 @@ where
             return LookupStep::Continue;
         }
 
-        let bucket_count = level.bucket_count();
-        if bucket_count == 0 {
+        if level.bucket_count == 0 {
             return LookupStep::Continue;
         }
 
-        let bucket_idx = Self::level_bucket_index(key_hash, level_idx, bucket_count);
+        let bucket_idx = level.bucket_index(key_hash);
         let fingerprint_mask = fingerprint_bit(key_fingerprint);
-        if level.bucket_summaries[bucket_idx] & fingerprint_mask == 0 {
-            if level.bucket_tombstones[bucket_idx] == 0
-                && level.bucket_live[bucket_idx] < level.bucket_size
-            {
+        let bucket_summary = level.bucket_summaries[bucket_idx];
+        let bucket_tombstones = level.bucket_tombstones[bucket_idx];
+        let bucket_live = level.bucket_live[bucket_idx];
+        let searchable_len = level.bucket_search_len[bucket_idx];
+
+        if bucket_summary & fingerprint_mask == 0 {
+            if bucket_tombstones == 0 && bucket_live < level.bucket_size {
                 return LookupStep::StopSearch;
             }
             return LookupStep::Continue;
@@ -822,25 +842,41 @@ where
 
         let bucket_range = level.bucket_range(bucket_idx);
         let controls = level.table.controls(bucket_range.clone());
-        let searchable_len = if level.bucket_tombstones[bucket_idx] > 0 {
-            controls.len()
-        } else {
-            controls.find_first(CTRL_EMPTY).unwrap_or(controls.len())
-        };
-
-        let mut match_offset = 0usize;
-        while let Some(relative_idx) =
-            controls[..searchable_len].find_next(key_fingerprint, match_offset)
-        {
-            let slot_idx = bucket_range.start + relative_idx;
-            let entry = unsafe { level.table.get_ref(slot_idx) };
-            if entry.key.borrow() == key {
-                return LookupStep::Found(slot_idx);
-            }
-            match_offset = relative_idx + 1;
+        if searchable_len == 0 {
+            return if bucket_tombstones == 0 {
+                LookupStep::StopSearch
+            } else {
+                LookupStep::Continue
+            };
         }
 
-        if level.bucket_tombstones[bucket_idx] == 0 && searchable_len < controls.len() {
+        if controls.len() <= 32 {
+            let mut match_mask = controls.match_fingerprint_group(key_fingerprint);
+            match_mask &= valid_bucket_lookup_mask(searchable_len);
+            while match_mask != 0 {
+                let relative_idx = match_mask.trailing_zeros() as usize;
+                let slot_idx = bucket_range.start + relative_idx;
+                let entry = unsafe { level.table.get_ref(slot_idx) };
+                if entry.key.borrow() == key {
+                    return LookupStep::Found(slot_idx);
+                }
+                match_mask &= match_mask - 1;
+            }
+        } else {
+            let mut match_offset = 0usize;
+            while let Some(relative_idx) =
+                controls[..searchable_len].find_next(key_fingerprint, match_offset)
+            {
+                let slot_idx = bucket_range.start + relative_idx;
+                let entry = unsafe { level.table.get_ref(slot_idx) };
+                if entry.key.borrow() == key {
+                    return LookupStep::Found(slot_idx);
+                }
+                match_offset = relative_idx + 1;
+            }
+        }
+
+        if bucket_tombstones == 0 && searchable_len < level.bucket_size {
             LookupStep::StopSearch
         } else {
             LookupStep::Continue
@@ -913,12 +949,14 @@ where
         let bucket_b = Self::special_fallback_bucket_b(key_hash, bucket_count);
 
         for bucket_idx in [bucket_a, bucket_b] {
-            if fallback.bucket_summaries[bucket_idx] & fingerprint_mask == 0 {
+            let bucket_summary = fallback.bucket_summaries[bucket_idx];
+            if bucket_summary & fingerprint_mask == 0 {
                 continue;
             }
             let range = fallback.bucket_range(bucket_idx);
             let controls = fallback.table.controls(range.clone());
-            let searchable_len = if fallback.bucket_tombstones[bucket_idx] > 0 {
+            let bucket_tombstones = fallback.bucket_tombstones[bucket_idx];
+            let searchable_len = if bucket_tombstones > 0 {
                 controls.len()
             } else {
                 controls.find_first(CTRL_EMPTY).unwrap_or(controls.len())
@@ -952,7 +990,7 @@ where
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
-            match Self::find_in_level_bucket(key_hash, key_fingerprint, key, level_idx, level) {
+            match Self::find_in_level_bucket(key_hash, key_fingerprint, key, level) {
                 LookupStep::Found(slot_idx) => {
                     return Some(SlotLocation::Level {
                         level_idx,
@@ -987,6 +1025,8 @@ where
                 level.table.clear_control(slot_idx);
             }
             level.bucket_live[bucket_idx] = 0;
+            level.bucket_live_masks[bucket_idx] = 0;
+            level.bucket_search_len[bucket_idx] = 0;
             level.bucket_tombstones[bucket_idx] = 0;
             level.bucket_summaries[bucket_idx] = 0;
         }
@@ -1006,6 +1046,9 @@ where
                 .table
                 .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
             level.bucket_live[bucket_idx] += 1;
+            level.bucket_live_masks[bucket_idx] |= bucket_offset_bit(level.bucket_size, offset);
+            level.bucket_search_len[bucket_idx] =
+                level.bucket_search_len[bucket_idx].max(offset + 1);
             level.bucket_summaries[bucket_idx] |= fingerprint_bit(key_fingerprint);
         }
     }
@@ -1119,6 +1162,43 @@ where
 
 fn compute_level_count(reserve_fraction: f64) -> usize {
     ceil_to_usize((4.0 * (1.0 / reserve_fraction).log2() + 10.0).max(1.0))
+}
+
+#[inline]
+fn valid_bucket_mask(bucket_size: usize) -> u128 {
+    if bucket_size >= u128::BITS as usize {
+        u128::MAX
+    } else {
+        (1u128 << bucket_size) - 1
+    }
+}
+
+#[inline]
+fn valid_bucket_lookup_mask(searchable_len: usize) -> u32 {
+    if searchable_len >= u32::BITS as usize {
+        u32::MAX
+    } else if searchable_len == 0 {
+        0
+    } else {
+        (1u32 << searchable_len) - 1
+    }
+}
+
+#[inline]
+fn bucket_offset_bit(bucket_size: usize, offset: usize) -> u128 {
+    debug_assert!(offset < bucket_size);
+    debug_assert!(bucket_size <= u128::BITS as usize);
+    1u128 << offset
+}
+
+#[inline]
+fn live_mask_search_len(mask: u128, bucket_size: usize) -> usize {
+    let live_mask = mask & valid_bucket_mask(bucket_size);
+    if live_mask == 0 {
+        0
+    } else {
+        (u128::BITS as usize) - live_mask.leading_zeros() as usize
+    }
 }
 
 fn compute_bucket_width(reserve_fraction: f64) -> usize {
