@@ -2,7 +2,6 @@ pub(crate) mod config;
 pub(crate) mod control;
 pub(crate) mod layout;
 pub(crate) mod math;
-mod simd;
 
 #[cfg(test)]
 mod tests {

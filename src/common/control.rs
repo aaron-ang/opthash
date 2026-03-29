@@ -1,8 +1,7 @@
 use super::layout::GROUP_SIZE;
-use super::simd::{eq_mask_16, eq_mask_32, free_mask_16, free_mask_32, preferred_group_width};
+use opthash_internal::{eq_mask_16, eq_mask_32, free_mask_16, free_mask_32, preferred_group_width};
 
-pub(crate) const CTRL_EMPTY: u8 = 0;
-pub(crate) const CTRL_TOMBSTONE: u8 = 0x80;
+pub(crate) use opthash_internal::{CTRL_EMPTY, CTRL_TOMBSTONE};
 
 pub(crate) trait ControlByte {
     fn is_occupied(&self) -> bool;
@@ -133,8 +132,8 @@ impl Controls for [u8] {
     #[inline]
     fn match_free_group(&self) -> u32 {
         match self.len() {
-            GROUP_SIZE => u32::from(free_mask_16(self.as_ptr())),
-            32 => free_mask_32(self.as_ptr()),
+            GROUP_SIZE => u32::from(unsafe { free_mask_16(self.as_ptr()) }),
+            32 => unsafe { free_mask_32(self.as_ptr()) },
             _ => panic!("group matching requires 16 or 32 byte chunks"),
         }
     }
@@ -142,8 +141,8 @@ impl Controls for [u8] {
     #[inline]
     fn match_fingerprint_group(&self, target: u8) -> u32 {
         match self.len() {
-            GROUP_SIZE => u32::from(eq_mask_16(self.as_ptr(), target)),
-            32 => eq_mask_32(self.as_ptr(), target),
+            GROUP_SIZE => u32::from(unsafe { eq_mask_16(self.as_ptr(), target) }),
+            32 => unsafe { eq_mask_32(self.as_ptr(), target) },
             _ => panic!("group matching requires 16 or 32 byte chunks"),
         }
     }

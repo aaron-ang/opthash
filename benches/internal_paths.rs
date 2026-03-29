@@ -2,10 +2,8 @@ use std::collections::HashMap as StdHashMap;
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use opthash::{
-    ElasticHashMap, FunnelHashMap,
-    bench_support::{CTRL_EMPTY, control_match_fingerprint_group, control_match_free_group},
-};
+use opthash::{ElasticHashMap, FunnelHashMap};
+use opthash_internal::{CTRL_EMPTY, control_match_fingerprint_group, control_match_free_group};
 
 const CONTROL_SCAN_COUNT: usize = 1_024;
 const CONTROL_GROUP_OPS: usize = 4_096;

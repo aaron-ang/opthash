@@ -5,10 +5,12 @@ use core::arch::aarch64::{
 #[cfg(target_arch = "x86_64")]
 use std::sync::OnceLock;
 
-use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
-use super::layout::GROUP_SIZE;
+pub const CONTROL_GROUP_SIZE: usize = 16;
+pub const CTRL_EMPTY: u8 = 0;
+pub const CTRL_TOMBSTONE: u8 = 0x80;
 
-pub(super) fn preferred_group_width() -> usize {
+#[must_use]
+pub fn preferred_group_width() -> usize {
     #[cfg(target_arch = "x86_64")]
     {
         static WIDTH: OnceLock<usize> = OnceLock::new();
@@ -16,31 +18,59 @@ pub(super) fn preferred_group_width() -> usize {
             if std::is_x86_feature_detected!("avx2") {
                 32
             } else {
-                GROUP_SIZE
+                CONTROL_GROUP_SIZE
             }
         })
     }
 
     #[cfg(not(target_arch = "x86_64"))]
     {
-        GROUP_SIZE
+        CONTROL_GROUP_SIZE
     }
 }
 
-pub(super) fn eq_mask_16(ptr: *const u8, target: u8) -> u16 {
+/// # Panics
+///
+/// Panics if `chunk` is not 16 or 32 bytes long.
+#[must_use]
+pub fn control_match_free_group(chunk: &[u8]) -> u32 {
+    match chunk.len() {
+        CONTROL_GROUP_SIZE => u32::from(unsafe { free_mask_16(chunk.as_ptr()) }),
+        32 => unsafe { free_mask_32(chunk.as_ptr()) },
+        _ => panic!("group matching requires 16 or 32 byte chunks"),
+    }
+}
+
+/// # Panics
+///
+/// Panics if `chunk` is not 16 or 32 bytes long.
+#[must_use]
+pub fn control_match_fingerprint_group(chunk: &[u8], target: u8) -> u32 {
+    match chunk.len() {
+        CONTROL_GROUP_SIZE => u32::from(unsafe { eq_mask_16(chunk.as_ptr(), target) }),
+        32 => unsafe { eq_mask_32(chunk.as_ptr(), target) },
+        _ => panic!("group matching requires 16 or 32 byte chunks"),
+    }
+}
+
+/// # Safety
+///
+/// `ptr` must be valid to read `CONTROL_GROUP_SIZE` bytes.
+#[must_use]
+pub unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> u16 {
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe { eq_mask_16_neon(ptr, target) }
+        unsafe { return eq_mask_16_neon(ptr, target) };
     }
 
     #[cfg(target_arch = "x86_64")]
     {
-        unsafe { eq_mask_16_sse2(ptr, target) }
+        unsafe { return eq_mask_16_sse2(ptr, target) };
     }
 
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[allow(unreachable_code)]
     {
-        let slice = unsafe { std::slice::from_raw_parts(ptr, GROUP_SIZE) };
+        let slice = unsafe { std::slice::from_raw_parts(ptr, CONTROL_GROUP_SIZE) };
         let mut mask = 0u16;
         for (idx, &value) in slice.iter().enumerate() {
             if value == target {
@@ -51,24 +81,32 @@ pub(super) fn eq_mask_16(ptr: *const u8, target: u8) -> u16 {
     }
 }
 
-pub(super) fn free_mask_16(ptr: *const u8) -> u16 {
+/// # Safety
+///
+/// `ptr` must be valid to read `CONTROL_GROUP_SIZE` bytes.
+#[must_use]
+pub unsafe fn free_mask_16(ptr: *const u8) -> u16 {
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe { free_mask_16_neon(ptr) }
+        unsafe { return free_mask_16_neon(ptr) };
     }
 
     #[cfg(target_arch = "x86_64")]
     {
-        unsafe { free_mask_16_sse2(ptr) }
+        unsafe { return free_mask_16_sse2(ptr) };
     }
 
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[allow(unreachable_code)]
     {
-        eq_mask_16(ptr, CTRL_EMPTY) | eq_mask_16(ptr, CTRL_TOMBSTONE)
+        unsafe { eq_mask_16(ptr, CTRL_EMPTY) | eq_mask_16(ptr, CTRL_TOMBSTONE) }
     }
 }
 
-pub(super) fn eq_mask_32(ptr: *const u8, target: u8) -> u32 {
+/// # Safety
+///
+/// `ptr` must be valid to read 32 bytes.
+#[must_use]
+pub unsafe fn eq_mask_32(ptr: *const u8, target: u8) -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") {
@@ -76,12 +114,16 @@ pub(super) fn eq_mask_32(ptr: *const u8, target: u8) -> u32 {
         }
     }
 
-    let lo = u32::from(eq_mask_16(ptr, target));
-    let hi = u32::from(eq_mask_16(unsafe { ptr.add(GROUP_SIZE) }, target));
-    lo | (hi << GROUP_SIZE)
+    let lo = u32::from(unsafe { eq_mask_16(ptr, target) });
+    let hi = u32::from(unsafe { eq_mask_16(ptr.add(CONTROL_GROUP_SIZE), target) });
+    lo | (hi << CONTROL_GROUP_SIZE)
 }
 
-pub(super) fn free_mask_32(ptr: *const u8) -> u32 {
+/// # Safety
+///
+/// `ptr` must be valid to read 32 bytes.
+#[must_use]
+pub unsafe fn free_mask_32(ptr: *const u8) -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") {
@@ -89,13 +131,13 @@ pub(super) fn free_mask_32(ptr: *const u8) -> u32 {
         }
     }
 
-    let lo = u32::from(free_mask_16(ptr));
-    let hi = u32::from(free_mask_16(unsafe { ptr.add(GROUP_SIZE) }));
-    lo | (hi << GROUP_SIZE)
+    let lo = u32::from(unsafe { free_mask_16(ptr) });
+    let hi = u32::from(unsafe { free_mask_16(ptr.add(CONTROL_GROUP_SIZE)) });
+    lo | (hi << CONTROL_GROUP_SIZE)
 }
 
 #[cfg(target_arch = "aarch64")]
-static NEON_BIT_POWERS: [u8; GROUP_SIZE] =
+static NEON_BIT_POWERS: [u8; CONTROL_GROUP_SIZE] =
     [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
 
 #[cfg(target_arch = "aarch64")]
@@ -139,10 +181,13 @@ unsafe fn free_mask_16_neon(ptr: *const u8) -> u16 {
 unsafe fn eq_mask_16_sse2(ptr: *const u8, target: u8) -> u16 {
     use std::arch::x86_64::*;
     unsafe {
-        let data = _mm_loadu_si128(ptr as *const __m128i);
+        let data = _mm_loadu_si128(ptr.cast::<__m128i>());
         let target_vec = _mm_set1_epi8(target as i8);
         let cmp = _mm_cmpeq_epi8(data, target_vec);
-        _mm_movemask_epi8(cmp) as u16
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            _mm_movemask_epi8(cmp) as u16
+        }
     }
 }
 
@@ -151,11 +196,14 @@ unsafe fn eq_mask_16_sse2(ptr: *const u8, target: u8) -> u16 {
 unsafe fn free_mask_16_sse2(ptr: *const u8) -> u16 {
     use std::arch::x86_64::*;
     unsafe {
-        let data = _mm_loadu_si128(ptr as *const __m128i);
+        let data = _mm_loadu_si128(ptr.cast::<__m128i>());
         let empty = _mm_cmpeq_epi8(data, _mm_setzero_si128());
         let tombstone = _mm_cmpeq_epi8(data, _mm_set1_epi8(CTRL_TOMBSTONE as i8));
         let free = _mm_or_si128(empty, tombstone);
-        _mm_movemask_epi8(free) as u16
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            _mm_movemask_epi8(free) as u16
+        }
     }
 }
 
@@ -164,10 +212,13 @@ unsafe fn free_mask_16_sse2(ptr: *const u8) -> u16 {
 unsafe fn eq_mask_32_avx2(ptr: *const u8, target: u8) -> u32 {
     use std::arch::x86_64::*;
     unsafe {
-        let data = _mm256_loadu_si256(ptr as *const __m256i);
+        let data = _mm256_loadu_si256(ptr.cast::<__m256i>());
         let target_vec = _mm256_set1_epi8(target as i8);
         let cmp = _mm256_cmpeq_epi8(data, target_vec);
-        _mm256_movemask_epi8(cmp) as u32
+        #[allow(clippy::cast_sign_loss)]
+        {
+            _mm256_movemask_epi8(cmp) as u32
+        }
     }
 }
 
@@ -176,10 +227,13 @@ unsafe fn eq_mask_32_avx2(ptr: *const u8, target: u8) -> u32 {
 unsafe fn free_mask_32_avx2(ptr: *const u8) -> u32 {
     use std::arch::x86_64::*;
     unsafe {
-        let data = _mm256_loadu_si256(ptr as *const __m256i);
+        let data = _mm256_loadu_si256(ptr.cast::<__m256i>());
         let empty = _mm256_cmpeq_epi8(data, _mm256_setzero_si256());
         let tombstone = _mm256_cmpeq_epi8(data, _mm256_set1_epi8(CTRL_TOMBSTONE as i8));
         let free = _mm256_or_si256(empty, tombstone);
-        _mm256_movemask_epi8(free) as u32
+        #[allow(clippy::cast_sign_loss)]
+        {
+            _mm256_movemask_epi8(free) as u32
+        }
     }
 }
