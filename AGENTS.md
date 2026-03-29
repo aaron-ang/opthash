@@ -5,7 +5,7 @@ Run all of these after every refactor. Check benchmark results in `target/criter
 ## Commands
 
 ```bash
-cargo fmt --check                           # Check formatting
+cargo fmt                                   # Format code
 cargo clippy -- -W clippy::pedantic         # Lint with pedantic warnings
 cargo test                                  # Run all tests
 cargo bench                                 # Run all benchmarks
@@ -36,3 +36,11 @@ To generate speedup charts against `std::HashMap`, run `uv run scripts/generate_
 ## Refactoring guidelines
 
 - If a low-level helper is used by both the root crate and benchmarks, move it into `opthash-internal/` instead of duplicating it or exposing bench-only API from `src/`.
+- Prefer layout and locality wins before adding more metadata.
+- Keep hot metadata contiguous. If fields are read together, store them together.
+- Avoid metadata that is expensive to maintain on every insert or delete unless benchmarks prove it wins overall.
+- Cache routing state that is reused in hot paths. Do not recompute it per probe.
+- Preserve SIMD-friendly control-byte scans: contiguous groups, cheap bitmask iteration, and early rejection before touching payloads.
+- Reject optimizations that improve only microbenchmarks but regress the public `throughput` suite.
+- Profile hot functions before and after changes. In this repo, focus on `find_*`, `first_free_*`, `place_new_entry`, and constructor/resize paths.
+- Use `target/criterion/` as the final gate. If the relevant benchmark regresses, the optimization does not stay.
