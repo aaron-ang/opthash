@@ -365,24 +365,74 @@ where
         let key_hash = self.hash_key(&key);
         let key_fingerprint = control_fingerprint(key_hash);
 
-        if let Some(location) = self.find_slot_location_with_hash(&key, key_hash, key_fingerprint) {
-            return Some(self.replace_existing_value(location, value));
-        }
-
-        if self.len >= self.max_insertions {
-            let new_capacity = if self.capacity == 0 {
-                INITIAL_CAPACITY
-            } else {
-                self.capacity.saturating_mul(2)
+        let level_candidate =
+            match self.find_in_levels_with_candidate(&key, key_hash, key_fingerprint) {
+                Ok(location) => return Some(self.replace_existing_value(location, value)),
+                Err(level_candidate) => level_candidate,
             };
-            self.resize(new_capacity);
+
+        if let Some(location) = level_candidate
+            && self.special.primary.len == 0
+            && self.special.fallback.len == 0
+        {
+            return self.insert_at_location_after_resize_check(
+                Some(location),
+                key_hash,
+                key,
+                value,
+                key_fingerprint,
+            );
         }
 
-        let insertion_slot = self
-            .choose_slot_for_new_key(key_hash)
-            .expect("no free slot found after resize");
-        self.place_new_entry(insertion_slot, key, value, key_fingerprint);
-        None
+        let (primary_step, primary_candidate) =
+            self.find_in_special_primary_with_candidate(key_hash, key_fingerprint, &key);
+        match primary_step {
+            LookupStep::Found(slot_idx) => {
+                return Some(
+                    self.replace_existing_value(SlotLocation::SpecialPrimary { slot_idx }, value),
+                );
+            }
+            LookupStep::StopSearch => {
+                if let Some(location) = level_candidate {
+                    return self.insert_at_location_after_resize_check(
+                        Some(location),
+                        key_hash,
+                        key,
+                        value,
+                        key_fingerprint,
+                    );
+                }
+                return self.insert_at_location_after_resize_check(
+                    primary_candidate.map(|slot_idx| SlotLocation::SpecialPrimary { slot_idx }),
+                    key_hash,
+                    key,
+                    value,
+                    key_fingerprint,
+                );
+            }
+            LookupStep::Continue => {}
+        }
+
+        let (fallback_match, fallback_candidate) =
+            self.find_in_special_fallback_with_candidate(key_hash, key_fingerprint, &key);
+        if let Some(slot_idx) = fallback_match {
+            return Some(
+                self.replace_existing_value(SlotLocation::SpecialFallback { slot_idx }, value),
+            );
+        }
+
+        let insertion_slot = level_candidate
+            .or_else(|| primary_candidate.map(|slot_idx| SlotLocation::SpecialPrimary { slot_idx }))
+            .or_else(|| {
+                fallback_candidate.map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
+            });
+        self.insert_at_location_after_resize_check(
+            insertion_slot,
+            key_hash,
+            key,
+            value,
+            key_fingerprint,
+        )
     }
 
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
@@ -612,7 +662,7 @@ where
         );
 
         for (key, value) in entries {
-            new_map.insert(key, value);
+            new_map.insert_new_entry_unchecked(key, value);
         }
 
         *self = new_map;
@@ -666,6 +716,43 @@ where
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 
+    fn find_in_levels_with_candidate<Q>(
+        &self,
+        key: &Q,
+        key_hash: u64,
+        key_fingerprint: u8,
+    ) -> Result<SlotLocation, Option<SlotLocation>>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        let search_limit = (self.max_populated_level + 1).min(self.levels.len());
+        let mut candidate = None;
+
+        for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
+            let (lookup_step, slot_candidate) =
+                Self::find_in_level_bucket_with_candidate(key_hash, key_fingerprint, key, level);
+            if candidate.is_none() {
+                candidate = slot_candidate.map(|slot_idx| SlotLocation::Level {
+                    level_idx,
+                    slot_idx,
+                });
+            }
+            match lookup_step {
+                LookupStep::Found(slot_idx) => {
+                    return Ok(SlotLocation::Level {
+                        level_idx,
+                        slot_idx,
+                    });
+                }
+                LookupStep::Continue => {}
+                LookupStep::StopSearch => return Err(candidate),
+            }
+        }
+
+        Err(candidate)
+    }
+
     #[inline]
     fn replace_existing_value(&mut self, location: SlotLocation, value: V) -> V {
         match location {
@@ -685,6 +772,45 @@ where
                 std::mem::replace(&mut entry.value, value)
             }
         }
+    }
+
+    #[inline]
+    fn insert_new_entry_unchecked(&mut self, key: K, value: V) {
+        let key_hash = self.hash_key(&key);
+        let key_fingerprint = control_fingerprint(key_hash);
+        let location = self
+            .choose_slot_for_new_key(key_hash)
+            .expect("resized funnel map should have free slot");
+        self.place_new_entry(location, key, value, key_fingerprint);
+    }
+
+    #[inline]
+    fn insert_at_location_after_resize_check(
+        &mut self,
+        location: Option<SlotLocation>,
+        key_hash: u64,
+        key: K,
+        value: V,
+        key_fingerprint: u8,
+    ) -> Option<V> {
+        let final_location = if self.len >= self.max_insertions || location.is_none() {
+            let new_capacity = if self.capacity == 0 {
+                INITIAL_CAPACITY
+            } else {
+                self.capacity.saturating_mul(2)
+            };
+            self.resize(new_capacity);
+            self.choose_slot_for_new_key(key_hash)
+                .expect("no free slot found after resize")
+        } else {
+            match location {
+                Some(location) => location,
+                None => unreachable!("checked for resize above"),
+            }
+        };
+
+        self.place_new_entry(final_location, key, value, key_fingerprint);
+        None
     }
 
     #[inline]
@@ -770,9 +896,7 @@ where
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
 
         for _ in 0..group_limit {
-            if !primary.table.group_meta(group_idx).full
-                && let Some(slot_idx) = primary.table.first_free_in_group(group_idx, 0)
-            {
+            if let Some(slot_idx) = Self::first_free_in_special_primary_group(primary, group_idx) {
                 return Some(slot_idx);
             }
             group_idx = advance_wrapping_index(group_idx, group_step, group_count);
@@ -793,30 +917,65 @@ where
 
         let bucket_a = Self::special_fallback_bucket_a(key_hash, bucket_count);
         let bucket_b = Self::special_fallback_bucket_b(key_hash, bucket_count);
-        let bucket_a_len = fallback.bucket_len(bucket_a);
-        let alternate_bucket_len = fallback.bucket_len(bucket_b);
-        let max_bucket_len = bucket_a_len.max(alternate_bucket_len);
+        let primary_bucket_len = fallback.bucket_len(bucket_a);
+        let secondary_bucket_len = fallback.bucket_len(bucket_b);
+        let max_bucket_len = primary_bucket_len.max(secondary_bucket_len);
+        let primary_bucket_tombstones = fallback.bucket_tombstones[bucket_a];
+        let secondary_bucket_tombstones = fallback.bucket_tombstones[bucket_b];
+        let primary_bucket_live = fallback.bucket_live[bucket_a];
+        let secondary_bucket_live = fallback.bucket_live[bucket_b];
 
         for offset in 0..max_bucket_len {
-            if offset < bucket_a_len && fallback.bucket_live[bucket_a] < bucket_a_len {
-                let slot_idx = bucket_a * fallback.bucket_size + offset;
-                if fallback.table.control_at(slot_idx).is_free() {
-                    return Some(slot_idx);
+            if offset < primary_bucket_len && fallback.bucket_live[bucket_a] < primary_bucket_len {
+                if primary_bucket_tombstones == 0 {
+                    if offset == primary_bucket_live {
+                        return Some(bucket_a * fallback.bucket_size + offset);
+                    }
+                } else {
+                    let slot_idx = bucket_a * fallback.bucket_size + offset;
+                    if fallback.table.control_at(slot_idx).is_free() {
+                        return Some(slot_idx);
+                    }
                 }
             }
 
             if bucket_b != bucket_a
-                && offset < alternate_bucket_len
-                && fallback.bucket_live[bucket_b] < alternate_bucket_len
+                && offset < secondary_bucket_len
+                && fallback.bucket_live[bucket_b] < secondary_bucket_len
             {
-                let slot_idx = bucket_b * fallback.bucket_size + offset;
-                if fallback.table.control_at(slot_idx).is_free() {
-                    return Some(slot_idx);
+                if secondary_bucket_tombstones == 0 {
+                    if offset == secondary_bucket_live {
+                        return Some(bucket_b * fallback.bucket_size + offset);
+                    }
+                } else {
+                    let slot_idx = bucket_b * fallback.bucket_size + offset;
+                    if fallback.table.control_at(slot_idx).is_free() {
+                        return Some(slot_idx);
+                    }
                 }
             }
         }
 
         None
+    }
+
+    #[inline]
+    fn first_free_in_special_primary_group(
+        primary: &SpecialPrimary<K, V>,
+        group_idx: usize,
+    ) -> Option<usize> {
+        let group_meta = primary.table.group_meta(group_idx);
+        if group_meta.full {
+            return None;
+        }
+
+        if primary.group_tombstones[group_idx] == 0 {
+            return Some(
+                RawTable::<Entry<K, V>>::group_start(group_idx) + usize::from(group_meta.live),
+            );
+        }
+
+        primary.table.first_free_in_group(group_idx, 0)
     }
 
     fn find_in_level_bucket<Q>(
@@ -829,12 +988,25 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
+        Self::find_in_level_bucket_with_candidate(key_hash, key_fingerprint, key, level).0
+    }
+
+    fn find_in_level_bucket_with_candidate<Q>(
+        key_hash: u64,
+        key_fingerprint: u8,
+        key: &Q,
+        level: &BucketLevel<K, V>,
+    ) -> (LookupStep, Option<usize>)
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
         if level.len == 0 {
-            return LookupStep::Continue;
+            return (LookupStep::Continue, None);
         }
 
         if level.bucket_count == 0 {
-            return LookupStep::Continue;
+            return (LookupStep::Continue, None);
         }
 
         let bucket_idx = level.bucket_index(key_hash);
@@ -844,22 +1016,35 @@ where
         let bucket_tombstones = bucket_meta.tombstones;
         let bucket_live = bucket_meta.live;
         let searchable_len = bucket_meta.search_len;
+        let free_candidate = if bucket_live < level.bucket_size {
+            let free_mask = valid_bucket_mask(level.bucket_size) & !bucket_meta.live_mask;
+            if free_mask == 0 {
+                None
+            } else {
+                Some(level.bucket_range(bucket_idx).start + free_mask.trailing_zeros() as usize)
+            }
+        } else {
+            None
+        };
 
         if bucket_summary & fingerprint_mask == 0 {
             if bucket_tombstones == 0 && bucket_live < level.bucket_size {
-                return LookupStep::StopSearch;
+                return (LookupStep::StopSearch, free_candidate);
             }
-            return LookupStep::Continue;
+            return (LookupStep::Continue, free_candidate);
         }
 
         let bucket_range = level.bucket_range(bucket_idx);
         let controls = level.table.controls(bucket_range.clone());
         if searchable_len == 0 {
-            return if bucket_tombstones == 0 {
-                LookupStep::StopSearch
-            } else {
-                LookupStep::Continue
-            };
+            return (
+                if bucket_tombstones == 0 {
+                    LookupStep::StopSearch
+                } else {
+                    LookupStep::Continue
+                },
+                free_candidate,
+            );
         }
 
         if controls.len() <= 32 {
@@ -870,7 +1055,7 @@ where
                 let slot_idx = bucket_range.start + relative_idx;
                 let entry = unsafe { level.table.get_ref(slot_idx) };
                 if entry.key.borrow() == key {
-                    return LookupStep::Found(slot_idx);
+                    return (LookupStep::Found(slot_idx), free_candidate);
                 }
                 match_mask &= match_mask - 1;
             }
@@ -882,17 +1067,20 @@ where
                 let slot_idx = bucket_range.start + relative_idx;
                 let entry = unsafe { level.table.get_ref(slot_idx) };
                 if entry.key.borrow() == key {
-                    return LookupStep::Found(slot_idx);
+                    return (LookupStep::Found(slot_idx), free_candidate);
                 }
                 match_offset = relative_idx + 1;
             }
         }
 
-        if bucket_tombstones == 0 && searchable_len < level.bucket_size {
-            LookupStep::StopSearch
-        } else {
-            LookupStep::Continue
-        }
+        (
+            if bucket_tombstones == 0 && searchable_len < level.bucket_size {
+                LookupStep::StopSearch
+            } else {
+                LookupStep::Continue
+            },
+            free_candidate,
+        )
     }
 
     fn find_in_special_primary<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> LookupStep
@@ -901,7 +1089,7 @@ where
         Q: Eq + ?Sized,
     {
         let primary = &self.special.primary;
-        if primary.table.capacity() == 0 {
+        if primary.table.capacity() == 0 || primary.len == 0 {
             return LookupStep::Continue;
         }
 
@@ -936,6 +1124,63 @@ where
         LookupStep::Continue
     }
 
+    fn find_in_special_primary_with_candidate<Q>(
+        &self,
+        key_hash: u64,
+        key_fingerprint: u8,
+        key: &Q,
+    ) -> (LookupStep, Option<usize>)
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        let primary = &self.special.primary;
+        if primary.table.capacity() == 0 {
+            return (LookupStep::Continue, None);
+        }
+        if primary.len == 0 {
+            return (
+                LookupStep::Continue,
+                self.first_free_in_special_primary(key_hash),
+            );
+        }
+
+        let fingerprint_mask = fingerprint_bit(key_fingerprint);
+        let group_count = primary.table.group_count();
+        let (group_start, group_step) = self.special_primary_probe_params(key_hash, group_count);
+        let mut group_idx = group_start;
+        let group_limit = self.primary_probe_limit.min(group_count.max(1));
+        let mut candidate = None;
+
+        for _ in 0..group_limit {
+            if candidate.is_none() && !primary.table.group_meta(group_idx).full {
+                candidate = primary.table.first_free_in_group(group_idx, 0);
+            }
+
+            if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
+                let mut match_mask = primary.table.group_match_mask(group_idx, key_fingerprint);
+                while match_mask != 0 {
+                    let relative_idx = match_mask.trailing_zeros() as usize;
+                    let slot_idx = RawTable::<Entry<K, V>>::group_start(group_idx) + relative_idx;
+                    let entry = unsafe { primary.table.get_ref(slot_idx) };
+                    if entry.key.borrow() == key {
+                        return (LookupStep::Found(slot_idx), candidate);
+                    }
+                    match_mask &= match_mask - 1;
+                }
+            }
+
+            if primary.group_tombstones[group_idx] == 0 && !primary.table.group_meta(group_idx).full
+            {
+                return (LookupStep::StopSearch, candidate);
+            }
+
+            group_idx = advance_wrapping_index(group_idx, group_step, group_count);
+        }
+
+        (LookupStep::Continue, candidate)
+    }
+
     fn find_in_special_fallback<Q>(
         &self,
         key_hash: u64,
@@ -947,7 +1192,7 @@ where
         Q: Eq + ?Sized,
     {
         let fallback = &self.special.fallback;
-        if fallback.capacity() == 0 {
+        if fallback.capacity() == 0 || fallback.len == 0 {
             return None;
         }
 
@@ -990,6 +1235,65 @@ where
         None
     }
 
+    fn find_in_special_fallback_with_candidate<Q>(
+        &self,
+        key_hash: u64,
+        key_fingerprint: u8,
+        key: &Q,
+    ) -> (Option<usize>, Option<usize>)
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        let fallback = &self.special.fallback;
+        if fallback.capacity() == 0 {
+            return (None, None);
+        }
+        if fallback.len == 0 {
+            return (None, self.first_free_in_special_fallback(key_hash));
+        }
+
+        let bucket_count = fallback.bucket_count();
+        if bucket_count == 0 {
+            return (None, None);
+        }
+
+        let bucket_a = Self::special_fallback_bucket_a(key_hash, bucket_count);
+        let bucket_b = Self::special_fallback_bucket_b(key_hash, bucket_count);
+        let primary_bucket_len = fallback.bucket_len(bucket_a);
+        let secondary_bucket_len = fallback.bucket_len(bucket_b);
+        let max_bucket_len = primary_bucket_len.max(secondary_bucket_len);
+        let mut candidate = None;
+
+        for offset in 0..max_bucket_len {
+            if candidate.is_none()
+                && offset < primary_bucket_len
+                && fallback.bucket_live[bucket_a] < primary_bucket_len
+            {
+                let slot_idx = bucket_a * fallback.bucket_size + offset;
+                if fallback.table.control_at(slot_idx).is_free() {
+                    candidate = Some(slot_idx);
+                }
+            }
+
+            if candidate.is_none()
+                && bucket_b != bucket_a
+                && offset < secondary_bucket_len
+                && fallback.bucket_live[bucket_b] < secondary_bucket_len
+            {
+                let slot_idx = bucket_b * fallback.bucket_size + offset;
+                if fallback.table.control_at(slot_idx).is_free() {
+                    candidate = Some(slot_idx);
+                }
+            }
+        }
+
+        (
+            self.find_in_special_fallback(key_hash, key_fingerprint, key),
+            candidate,
+        )
+    }
+
     fn find_slot_location_with_hash<Q>(
         &self,
         key: &Q,
@@ -1012,6 +1316,10 @@ where
                 LookupStep::Continue => {}
                 LookupStep::StopSearch => return None,
             }
+        }
+
+        if self.special.primary.len == 0 && self.special.fallback.len == 0 {
+            return None;
         }
 
         match self.find_in_special_primary(key_hash, key_fingerprint, key) {
@@ -1317,18 +1625,28 @@ fn build_funnel_bucket_sequence(
         let ideal_next_bucket_count = ((3 * previous_bucket_count + 2) / 4)
             .clamp(min_next_bucket_count, max_next_bucket_count);
 
-        let chosen_bucket_count = (min_next_bucket_count..=max_next_bucket_count)
-            .filter(|&candidate_bucket_count| candidate_bucket_count <= remaining)
-            .filter(|&candidate_bucket_count| {
-                let remaining_after_candidate = remaining - candidate_bucket_count;
-                let (tail_min_sum, tail_max_sum) =
-                    possible_tail_sum_range(candidate_bucket_count, levels_after);
-                remaining_after_candidate >= tail_min_sum
-                    && remaining_after_candidate <= tail_max_sum
-            })
-            .min_by_key(|&candidate_bucket_count| {
-                candidate_bucket_count.abs_diff(ideal_next_bucket_count)
-            })?;
+        let mut chosen_bucket_count = None;
+        let mut best_distance = usize::MAX;
+        let candidate_upper_bound = max_next_bucket_count.min(remaining);
+        for candidate_bucket_count in min_next_bucket_count..=candidate_upper_bound {
+            let remaining_after_candidate = remaining - candidate_bucket_count;
+            let (tail_min_sum, tail_max_sum) =
+                possible_tail_sum_range(candidate_bucket_count, levels_after);
+            if remaining_after_candidate < tail_min_sum || remaining_after_candidate > tail_max_sum
+            {
+                continue;
+            }
+
+            let distance = candidate_bucket_count.abs_diff(ideal_next_bucket_count);
+            if distance < best_distance {
+                best_distance = distance;
+                chosen_bucket_count = Some(candidate_bucket_count);
+                if distance == 0 {
+                    break;
+                }
+            }
+        }
+        let chosen_bucket_count = chosen_bucket_count?;
 
         bucket_counts.push(chosen_bucket_count);
         remaining -= chosen_bucket_count;
