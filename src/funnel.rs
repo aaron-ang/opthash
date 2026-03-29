@@ -43,6 +43,22 @@ impl FunnelOptions {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct BucketMeta {
+    summary: u128,
+    live_mask: u128,
+    search_len: usize,
+    live: usize,
+    tombstones: usize,
+}
+
+impl BucketMeta {
+    #[inline]
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Debug)]
 struct BucketLevel<K, V> {
     table: RawTable<Entry<K, V>>,
@@ -50,11 +66,7 @@ struct BucketLevel<K, V> {
     bucket_size: usize,
     bucket_count: usize,
     hash_rotation: u32,
-    bucket_summaries: Box<[u128]>,
-    bucket_live: Box<[usize]>,
-    bucket_live_masks: Box<[u128]>,
-    bucket_search_len: Box<[usize]>,
-    bucket_tombstones: Box<[usize]>,
+    bucket_meta: Box<[BucketMeta]>,
 }
 
 impl<K, V> BucketLevel<K, V> {
@@ -66,11 +78,7 @@ impl<K, V> BucketLevel<K, V> {
             bucket_size,
             bucket_count,
             hash_rotation,
-            bucket_summaries: vec![0; bucket_count].into_boxed_slice(),
-            bucket_live: vec![0; bucket_count].into_boxed_slice(),
-            bucket_live_masks: vec![0; bucket_count].into_boxed_slice(),
-            bucket_search_len: vec![0; bucket_count].into_boxed_slice(),
-            bucket_tombstones: vec![0; bucket_count].into_boxed_slice(),
+            bucket_meta: vec![BucketMeta::default(); bucket_count].into_boxed_slice(),
         }
     }
 
@@ -91,14 +99,20 @@ impl<K, V> BucketLevel<K, V> {
     }
 
     #[inline]
-    fn bucket_live_mask(&self, bucket_idx: usize) -> u128 {
-        self.bucket_live_masks[bucket_idx]
+    fn bucket_meta(&self, bucket_idx: usize) -> &BucketMeta {
+        &self.bucket_meta[bucket_idx]
+    }
+
+    #[inline]
+    fn bucket_meta_mut(&mut self, bucket_idx: usize) -> &mut BucketMeta {
+        &mut self.bucket_meta[bucket_idx]
     }
 
     #[inline]
     fn update_bucket_search_len(&mut self, bucket_idx: usize) {
-        self.bucket_search_len[bucket_idx] =
-            live_mask_search_len(self.bucket_live_masks[bucket_idx], self.bucket_size);
+        let bucket_size = self.bucket_size;
+        let meta = self.bucket_meta_mut(bucket_idx);
+        meta.search_len = live_mask_search_len(meta.live_mask, bucket_size);
     }
 }
 
@@ -445,19 +459,23 @@ where
                 let removed = unsafe { level.table.take(slot_idx) };
                 level.table.mark_tombstone(slot_idx);
                 level.len -= 1;
-                level.bucket_live[bucket_idx] -= 1;
-                level.bucket_live_masks[bucket_idx] &= !bucket_offset_bit(
-                    level.bucket_size,
-                    slot_idx - level.bucket_range(bucket_idx).start,
-                );
+                let bucket_offset = slot_idx - level.bucket_range(bucket_idx).start;
+                {
+                    let bucket_size = level.bucket_size;
+                    let meta = level.bucket_meta_mut(bucket_idx);
+                    meta.live -= 1;
+                    meta.live_mask &= !bucket_offset_bit(bucket_size, bucket_offset);
+                    meta.tombstones += 1;
+                }
                 level.update_bucket_search_len(bucket_idx);
-                level.bucket_tombstones[bucket_idx] += 1;
+                let mut bucket_summary = 0;
                 Self::rebuild_bucket_summary(
                     &level.table,
                     level.bucket_range(bucket_idx),
-                    &mut level.bucket_summaries[bucket_idx],
+                    &mut bucket_summary,
                 );
-                if level.bucket_tombstones[bucket_idx] > level.bucket_size / 4 {
+                level.bucket_meta_mut(bucket_idx).summary = bucket_summary;
+                if level.bucket_meta(bucket_idx).tombstones > level.bucket_size / 4 {
                     self.rebuild_level_bucket(level_idx, bucket_idx);
                 }
                 removed
@@ -514,11 +532,7 @@ where
             }
             level.table.clear_all_controls();
             level.len = 0;
-            level.bucket_summaries.fill(0);
-            level.bucket_live.fill(0);
-            level.bucket_live_masks.fill(0);
-            level.bucket_search_len.fill(0);
-            level.bucket_tombstones.fill(0);
+            level.bucket_meta.fill(BucketMeta::default());
         }
 
         for idx in 0..self.special.primary.table.capacity() {
@@ -558,11 +572,7 @@ where
             }
             level.table.clear_all_controls();
             level.len = 0;
-            level.bucket_summaries.fill(0);
-            level.bucket_live.fill(0);
-            level.bucket_live_masks.fill(0);
-            level.bucket_search_len.fill(0);
-            level.bucket_tombstones.fill(0);
+            level.bucket_meta.fill(BucketMeta::default());
         }
 
         for idx in 0..self.special.primary.table.capacity() {
@@ -690,13 +700,13 @@ where
                     .table
                     .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
                 level.len += 1;
-                level.bucket_live[bucket_idx] += 1;
                 let bucket_offset = slot_idx - level.bucket_range(bucket_idx).start;
-                level.bucket_live_masks[bucket_idx] |=
-                    bucket_offset_bit(level.bucket_size, bucket_offset);
-                level.bucket_search_len[bucket_idx] =
-                    level.bucket_search_len[bucket_idx].max(bucket_offset + 1);
-                level.bucket_summaries[bucket_idx] |= fingerprint_bit(key_fingerprint);
+                let bucket_size = level.bucket_size;
+                let meta = level.bucket_meta_mut(bucket_idx);
+                meta.live += 1;
+                meta.live_mask |= bucket_offset_bit(bucket_size, bucket_offset);
+                meta.search_len = meta.search_len.max(bucket_offset + 1);
+                meta.summary |= fingerprint_bit(key_fingerprint);
                 if level_idx > self.max_populated_level {
                     self.max_populated_level = level_idx;
                 }
@@ -734,11 +744,12 @@ where
         }
 
         let bucket_idx = level.bucket_index(key_hash);
-        if level.bucket_live[bucket_idx] >= level.bucket_size {
+        let bucket_meta = level.bucket_meta(bucket_idx);
+        if bucket_meta.live >= level.bucket_size {
             return None;
         }
 
-        let free_mask = valid_bucket_mask(level.bucket_size) & !level.bucket_live_mask(bucket_idx);
+        let free_mask = valid_bucket_mask(level.bucket_size) & !bucket_meta.live_mask;
         if free_mask == 0 {
             return None;
         }
@@ -828,10 +839,11 @@ where
 
         let bucket_idx = level.bucket_index(key_hash);
         let fingerprint_mask = fingerprint_bit(key_fingerprint);
-        let bucket_summary = level.bucket_summaries[bucket_idx];
-        let bucket_tombstones = level.bucket_tombstones[bucket_idx];
-        let bucket_live = level.bucket_live[bucket_idx];
-        let searchable_len = level.bucket_search_len[bucket_idx];
+        let bucket_meta = level.bucket_meta(bucket_idx);
+        let bucket_summary = bucket_meta.summary;
+        let bucket_tombstones = bucket_meta.tombstones;
+        let bucket_live = bucket_meta.live;
+        let searchable_len = bucket_meta.search_len;
 
         if bucket_summary & fingerprint_mask == 0 {
             if bucket_tombstones == 0 && bucket_live < level.bucket_size {
@@ -1024,11 +1036,7 @@ where
                 }
                 level.table.clear_control(slot_idx);
             }
-            level.bucket_live[bucket_idx] = 0;
-            level.bucket_live_masks[bucket_idx] = 0;
-            level.bucket_search_len[bucket_idx] = 0;
-            level.bucket_tombstones[bucket_idx] = 0;
-            level.bucket_summaries[bucket_idx] = 0;
+            level.bucket_meta[bucket_idx].clear();
         }
 
         for (key, value) in entries {
@@ -1045,11 +1053,12 @@ where
             level
                 .table
                 .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
-            level.bucket_live[bucket_idx] += 1;
-            level.bucket_live_masks[bucket_idx] |= bucket_offset_bit(level.bucket_size, offset);
-            level.bucket_search_len[bucket_idx] =
-                level.bucket_search_len[bucket_idx].max(offset + 1);
-            level.bucket_summaries[bucket_idx] |= fingerprint_bit(key_fingerprint);
+            let bucket_size = level.bucket_size;
+            let meta = level.bucket_meta_mut(bucket_idx);
+            meta.live += 1;
+            meta.live_mask |= bucket_offset_bit(bucket_size, offset);
+            meta.search_len = meta.search_len.max(offset + 1);
+            meta.summary |= fingerprint_bit(key_fingerprint);
         }
     }
 
