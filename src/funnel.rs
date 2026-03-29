@@ -139,7 +139,11 @@ struct SpecialFallback<K, V> {
 
 impl<K, V> SpecialFallback<K, V> {
     fn with_capacity(capacity: usize, bucket_size: usize) -> Self {
-        let bucket_count = capacity.checked_div(bucket_size).unwrap_or(0);
+        let bucket_count = if bucket_size == 0 {
+            0
+        } else {
+            capacity.div_ceil(bucket_size)
+        };
         Self {
             table: RawTable::new(capacity),
             len: 0,
@@ -157,16 +161,23 @@ impl<K, V> SpecialFallback<K, V> {
 
     #[inline]
     fn bucket_count(&self) -> usize {
-        self.table
-            .capacity()
-            .checked_div(self.bucket_size)
-            .unwrap_or(0)
+        if self.bucket_size == 0 {
+            0
+        } else {
+            self.table.capacity().div_ceil(self.bucket_size)
+        }
     }
 
     #[inline]
     fn bucket_range(&self, bucket_idx: usize) -> std::ops::Range<usize> {
         let start = bucket_idx * self.bucket_size;
-        start..start + self.bucket_size
+        let end = (start + self.bucket_size).min(self.table.capacity());
+        start..end
+    }
+
+    #[inline]
+    fn bucket_len(&self, bucket_idx: usize) -> usize {
+        self.bucket_range(bucket_idx).len()
     }
 }
 
@@ -188,12 +199,9 @@ struct SpecialArray<K, V> {
 
 impl<K, V> SpecialArray<K, V> {
     fn with_capacity(capacity: usize, primary_probe_limit: usize) -> Self {
-        let fallback_bucket_size =
-            round_up_to_group((2usize.saturating_mul(primary_probe_limit)).max(2));
-        let desired_fallback_capacity = capacity / 2;
-        let fallback_bucket_count = desired_fallback_capacity / fallback_bucket_size.max(1);
-        let fallback_capacity = fallback_bucket_count.saturating_mul(fallback_bucket_size);
-        let primary_capacity = capacity.saturating_sub(fallback_capacity);
+        let fallback_bucket_size = (2usize.saturating_mul(primary_probe_limit)).max(2);
+        let primary_capacity = capacity.div_ceil(2);
+        let fallback_capacity = capacity.saturating_sub(primary_capacity);
         Self {
             primary: SpecialPrimary::with_capacity(primary_capacity),
             fallback: SpecialFallback::with_capacity(fallback_capacity, fallback_bucket_size),
@@ -463,7 +471,7 @@ where
                     fallback.bucket_range(bucket_idx),
                     &mut fallback.bucket_summaries[bucket_idx],
                 );
-                if fallback.bucket_tombstones[bucket_idx] > fallback.bucket_size / 4 {
+                if fallback.bucket_tombstones[bucket_idx] > fallback.bucket_len(bucket_idx) / 4 {
                     self.rebuild_special_fallback_bucket(bucket_idx);
                 }
                 removed
@@ -753,18 +761,26 @@ where
 
         let bucket_a = Self::special_fallback_bucket_a(key_hash, bucket_count);
         let bucket_b = Self::special_fallback_bucket_b(key_hash, bucket_count);
+        let bucket_a_len = fallback.bucket_len(bucket_a);
+        let alternate_bucket_len = fallback.bucket_len(bucket_b);
+        let max_bucket_len = bucket_a_len.max(alternate_bucket_len);
 
-        if fallback.bucket_live[bucket_a] < fallback.bucket_size {
-            let range = fallback.bucket_range(bucket_a);
-            if let Some(offset) = fallback.table.controls(range.clone()).find_first_free() {
-                return Some(range.start + offset);
+        for offset in 0..max_bucket_len {
+            if offset < bucket_a_len && fallback.bucket_live[bucket_a] < bucket_a_len {
+                let slot_idx = bucket_a * fallback.bucket_size + offset;
+                if fallback.table.control_at(slot_idx).is_free() {
+                    return Some(slot_idx);
+                }
             }
-        }
 
-        if fallback.bucket_live[bucket_b] < fallback.bucket_size {
-            let range = fallback.bucket_range(bucket_b);
-            if let Some(offset) = fallback.table.controls(range.clone()).find_first_free() {
-                return Some(range.start + offset);
+            if bucket_b != bucket_a
+                && offset < alternate_bucket_len
+                && fallback.bucket_live[bucket_b] < alternate_bucket_len
+            {
+                let slot_idx = bucket_b * fallback.bucket_size + offset;
+                if fallback.table.control_at(slot_idx).is_free() {
+                    return Some(slot_idx);
+                }
             }
         }
 
