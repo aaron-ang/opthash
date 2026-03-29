@@ -8,7 +8,16 @@ repository = "https://github.com/aaron-ang/opthash"
 license = "MIT OR Apache-2.0"
 keywords = ["hashmap", "open_addressing", "elastic_hashing", "funnel_hashing"]
 categories = ["algorithms", "data-structures"]
-exclude = ["/benches/", "/paper/", "/scripts/", "/requirements.txt"]
+exclude = [
+    "/benches/",
+    "/paper/",
+    "/scripts/",
+    "/.gitattributes",
+    "/.gitignore",
+    "/AGENTS.md",
+    "/CLAUDE.md",
+    "/requirements.txt",
+]
 
 [dependencies]
 
