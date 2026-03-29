@@ -25,6 +25,8 @@ Criterion auto-compares against the previous run. To check for regressions, read
 
 Example path: `target/criterion/get_hit_throughput/elastic/change/estimates.json`
 
+To generate speedup charts against `std::HashMap`, run `uv run scripts/generate_speedup_chart.py`. Charts are saved in `assets/`.
+
 ## Project structure
 
 - `src/elastic.rs` — `ElasticHashMap` (tests inline)
