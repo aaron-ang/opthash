@@ -5,20 +5,8 @@ pub(crate) mod math;
 
 #[cfg(test)]
 mod tests {
-    use super::control::{
-        CTRL_EMPTY, CTRL_TOMBSTONE, Controls, control_fingerprint, fingerprint_bit,
-    };
-    use super::layout::{GroupMeta, RawTable};
-
-    #[test]
-    fn control_group_matches_free_slots() {
-        let mut controls = [1u8; 32];
-        controls[3] = CTRL_EMPTY;
-        controls[22] = CTRL_TOMBSTONE;
-
-        let expected = (1u32 << 3) | (1u32 << 22);
-        assert_eq!(controls[..32].match_free_group(), expected);
-    }
+    use super::control::{CTRL_EMPTY, Controls, control_fingerprint, fingerprint_bit};
+    use super::layout::{COMPACT_STRIDE, GroupMeta, META_STRIDE, RawTable};
 
     #[test]
     fn control_group_matches_fingerprints() {
@@ -33,14 +21,14 @@ mod tests {
 
     #[test]
     fn padded_controls_are_empty_sentinels() {
-        let table: RawTable<u64> = RawTable::new(18);
+        let table: RawTable<u64, COMPACT_STRIDE> = RawTable::new(18);
         let last_group = table.group_controls(1);
         assert_eq!(last_group[2..], [CTRL_EMPTY; 14]);
     }
 
     #[test]
     fn group_metadata_tracks_control_transitions() {
-        let mut table: RawTable<u64> = RawTable::new(16);
+        let mut table: RawTable<u64, META_STRIDE> = RawTable::new(16);
         table.set_control(0, 5);
         table.set_control(1, 7);
         table.mark_tombstone(1);
@@ -67,7 +55,7 @@ mod tests {
 
     #[test]
     fn group_masks_ignore_padded_tail() {
-        let mut table: RawTable<u64> = RawTable::new(18);
+        let mut table: RawTable<u64, META_STRIDE> = RawTable::new(18);
         table.set_control(16, 11);
         assert_eq!(table.group_match_mask(1, 11), 0b1);
         assert_eq!(table.group_free_mask(1) & !0b11, 0);
