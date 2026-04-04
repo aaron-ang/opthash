@@ -69,11 +69,10 @@ def load_estimate_time_ns(workload: str, implementation: str):
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"failed to parse JSON from {path}: {exc}") from exc
 
-    if "slope" in data and "point_estimate" in data["slope"]:
-        return float(data["slope"]["point_estimate"])
     if "mean" in data and "point_estimate" in data["mean"]:
         return float(data["mean"]["point_estimate"])
-    raise RuntimeError(f"no usable slope.mean point estimate in {path}")
+
+    raise RuntimeError(f"no usable mean point estimate in {path}")
 
 
 def throughput_from_time_ns(operation_count: int, time_ns: float):
