@@ -386,3 +386,19 @@ unsafe fn free_mask_32_avx2(ptr: *const u8) -> u32 {
         }
     }
 }
+
+/// # Safety
+///
+/// `ptr` must be a valid, aligned pointer to readable memory (or null, in which
+/// case the prefetch is silently ignored by the hardware).
+#[inline]
+pub unsafe fn prefetch_read(ptr: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("prfm pldl1keep, [{}]", in(reg) ptr, options(nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+}

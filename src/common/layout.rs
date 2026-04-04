@@ -146,6 +146,12 @@ impl<T, const STRIDE: usize> RawTable<T, STRIDE> {
         group_idx * STRIDE + slot_offset
     }
 
+    /// Returns a raw pointer to the start of the given group's data block.
+    #[inline]
+    pub fn group_data_ptr(&self, group_idx: usize) -> *const u8 {
+        unsafe { self.data_ptr.as_ptr().add(Self::data_offset(group_idx, 0)) }
+    }
+
     /// Returns a slice of the 16 control bytes for the given group.
     #[inline]
     pub fn group_controls(&self, group_idx: usize) -> &[u8] {

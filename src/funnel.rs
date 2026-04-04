@@ -2,7 +2,7 @@ use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
-use opthash_internal::ProbeOps;
+use opthash_internal::{ProbeOps, prefetch_read};
 
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
@@ -1011,6 +1011,16 @@ where
         }
 
         let bucket_idx = level.bucket_index(key_hash);
+
+        // Prefetch the bucket's control bytes while we check the summary bitmask.
+        unsafe {
+            prefetch_read(
+                level
+                    .table
+                    .group_data_ptr(level.bucket_range(bucket_idx).start / GROUP_SIZE),
+            );
+        }
+
         let fingerprint_mask = fingerprint_bit(key_fingerprint);
         let bucket_meta = level.bucket_meta(bucket_idx);
         let bucket_summary = bucket_meta.summary;
@@ -1121,7 +1131,9 @@ where
                 return LookupStep::StopSearch;
             }
 
-            group_idx = advance_wrapping_index(group_idx, group_step, group_count);
+            let next = advance_wrapping_index(group_idx, group_step, group_count);
+            unsafe { prefetch_read(primary.table.group_data_ptr(next)) };
+            group_idx = next;
         }
 
         LookupStep::Continue
@@ -1179,7 +1191,9 @@ where
                 return (LookupStep::StopSearch, candidate);
             }
 
-            group_idx = advance_wrapping_index(group_idx, group_step, group_count);
+            let next = advance_wrapping_index(group_idx, group_step, group_count);
+            unsafe { prefetch_read(primary.table.group_data_ptr(next)) };
+            group_idx = next;
         }
 
         (LookupStep::Continue, candidate)
