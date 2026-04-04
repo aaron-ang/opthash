@@ -7,7 +7,7 @@ use opthash_internal::ProbeOps;
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
     control::{CTRL_EMPTY, ControlByte, Controls, control_fingerprint, fingerprint_bit},
-    layout::{Entry, GROUP_SIZE, RawTable},
+    layout::{COMPACT_STRIDE, Entry, GROUP_SIZE, META_STRIDE, RawTable},
     math::{
         advance_wrapping_index, ceil_to_usize, floor_to_usize, max_insertions, round_to_usize,
         round_up_to_group, sanitize_reserve_fraction, usize_to_f64,
@@ -61,7 +61,7 @@ impl BucketMeta {
 
 #[derive(Debug)]
 struct BucketLevel<K, V> {
-    table: RawTable<Entry<K, V>>,
+    table: RawTable<Entry<K, V>, COMPACT_STRIDE>,
     len: usize,
     bucket_size: usize,
     bucket_count: usize,
@@ -128,7 +128,7 @@ impl<K, V> Drop for BucketLevel<K, V> {
 
 #[derive(Debug)]
 struct SpecialPrimary<K, V> {
-    table: RawTable<Entry<K, V>>,
+    table: RawTable<Entry<K, V>, META_STRIDE>,
     len: usize,
     group_summaries: Box<[u128]>,
     group_tombstones: Box<[usize]>,
@@ -161,7 +161,7 @@ impl<K, V> Drop for SpecialPrimary<K, V> {
 
 #[derive(Debug)]
 struct SpecialFallback<K, V> {
-    table: RawTable<Entry<K, V>>,
+    table: RawTable<Entry<K, V>, COMPACT_STRIDE>,
     len: usize,
     bucket_size: usize,
     bucket_count: usize,
@@ -971,7 +971,8 @@ where
 
         if primary.group_tombstones[group_idx] == 0 {
             return Some(
-                RawTable::<Entry<K, V>>::group_start(group_idx) + usize::from(group_meta.live),
+                RawTable::<Entry<K, V>, META_STRIDE>::group_start(group_idx)
+                    + usize::from(group_meta.live),
             );
         }
 
@@ -1035,7 +1036,8 @@ where
         }
 
         let bucket_range = level.bucket_range(bucket_idx);
-        let controls = level.table.controls(bucket_range.clone());
+        debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
+        let controls = level.table.group_controls(bucket_range.start / GROUP_SIZE);
         if searchable_len == 0 {
             return (
                 if bucket_tombstones == 0 {
@@ -1104,7 +1106,8 @@ where
                 let mut match_mask = primary.table.group_match_mask(group_idx, key_fingerprint);
                 while match_mask != 0 {
                     let relative_idx = match_mask.trailing_zeros() as usize;
-                    let slot_idx = RawTable::<Entry<K, V>>::group_start(group_idx) + relative_idx;
+                    let slot_idx =
+                        RawTable::<Entry<K, V>, META_STRIDE>::group_start(group_idx) + relative_idx;
                     let entry = unsafe { primary.table.get_ref(slot_idx) };
                     if entry.key.borrow() == key {
                         return LookupStep::Found(slot_idx);
@@ -1161,7 +1164,8 @@ where
                 let mut match_mask = primary.table.group_match_mask(group_idx, key_fingerprint);
                 while match_mask != 0 {
                     let relative_idx = match_mask.trailing_zeros() as usize;
-                    let slot_idx = RawTable::<Entry<K, V>>::group_start(group_idx) + relative_idx;
+                    let slot_idx =
+                        RawTable::<Entry<K, V>, META_STRIDE>::group_start(group_idx) + relative_idx;
                     let entry = unsafe { primary.table.get_ref(slot_idx) };
                     if entry.key.borrow() == key {
                         return (LookupStep::Found(slot_idx), candidate);
@@ -1211,7 +1215,7 @@ where
                 continue;
             }
             let range = fallback.bucket_range(bucket_idx);
-            let controls = fallback.table.controls(range.clone());
+            let controls = fallback.table.bucket_controls(range.start, range.len());
             let bucket_tombstones = fallback.bucket_tombstones[bucket_idx];
             let searchable_len = if bucket_tombstones > 0 {
                 controls.len()
@@ -1353,7 +1357,7 @@ where
             let range = self.levels[level_idx].bucket_range(bucket_idx);
             let offset = self.levels[level_idx]
                 .table
-                .controls(range.clone())
+                .bucket_controls(range.start, range.len())
                 .find_first_free()
                 .expect("rebuilt bucket should have free space");
             let slot_idx = range.start + offset;
@@ -1374,7 +1378,7 @@ where
         let mut entries = Vec::new();
         {
             let primary = &mut self.special.primary;
-            let group_start = RawTable::<Entry<K, V>>::group_start(group_idx);
+            let group_start = RawTable::<Entry<K, V>, META_STRIDE>::group_start(group_idx);
             let group_len = primary.table.group_len(group_idx);
             for slot_idx in group_start..group_start + group_len {
                 if primary.table.control_at(slot_idx).is_occupied() {
@@ -1424,7 +1428,7 @@ where
             let range = fallback.bucket_range(bucket_idx);
             let offset = fallback
                 .table
-                .controls(range.clone())
+                .bucket_controls(range.start, range.len())
                 .find_first_free()
                 .expect("rebuilt fallback bucket should have free space");
             let slot_idx = range.start + offset;
@@ -1439,7 +1443,7 @@ where
     fn rebuild_primary_group_summary(&mut self, group_idx: usize) {
         let primary = &mut self.special.primary;
         primary.group_summaries[group_idx] = 0;
-        let group_start = RawTable::<Entry<K, V>>::group_start(group_idx);
+        let group_start = RawTable::<Entry<K, V>, META_STRIDE>::group_start(group_idx);
         let group_len = primary.table.group_len(group_idx);
         for slot_idx in group_start..group_start + group_len {
             let control = primary.table.control_at(slot_idx);
@@ -1462,8 +1466,8 @@ where
         }
     }
 
-    fn rebuild_bucket_summary(
-        table: &RawTable<Entry<K, V>>,
+    fn rebuild_bucket_summary<const S: usize>(
+        table: &RawTable<Entry<K, V>, S>,
         range: std::ops::Range<usize>,
         summary: &mut u128,
     ) {
