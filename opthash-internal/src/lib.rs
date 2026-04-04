@@ -16,6 +16,7 @@ impl ControlOps {
     /// # Panics
     ///
     /// Panics if the masked 7-bit fingerprint cannot be represented as `u8`.
+    #[inline]
     #[must_use]
     pub fn control_fingerprint(hash: u64) -> u8 {
         // Use the top 7 bits (bits 57-63): they carry more entropy after mixing than the low bits,
@@ -24,11 +25,13 @@ impl ControlOps {
         high.max(1)
     }
 
+    #[inline]
     #[must_use]
     pub fn fingerprint_bit(fingerprint: u8) -> u128 {
         1u128 << u32::from(fingerprint.saturating_sub(1))
     }
 
+    #[inline]
     #[must_use]
     pub fn find_first_free_in_controls(controls: &[u8]) -> Option<usize> {
         if controls.len() < CONTROL_GROUP_SIZE {
@@ -61,6 +64,7 @@ impl ControlOps {
             .map(|offset| index + offset)
     }
 
+    #[inline]
     #[must_use]
     pub fn find_next_fingerprint_in_controls(
         controls: &[u8],
@@ -106,6 +110,7 @@ impl ControlOps {
             .map(|offset| index + offset)
     }
 
+    #[inline]
     #[must_use]
     pub fn preferred_group_width() -> usize {
         #[cfg(target_arch = "x86_64")]
@@ -129,6 +134,7 @@ impl ControlOps {
     /// # Panics
     ///
     /// Panics if `chunk` is not 16 or 32 bytes long.
+    #[inline]
     #[must_use]
     pub fn control_match_free_group(chunk: &[u8]) -> u32 {
         match chunk.len() {
@@ -141,6 +147,7 @@ impl ControlOps {
     /// # Panics
     ///
     /// Panics if `chunk` is not 16 or 32 bytes long.
+    #[inline]
     #[must_use]
     pub fn control_match_fingerprint_group(chunk: &[u8], target: u8) -> u32 {
         match chunk.len() {
@@ -157,6 +164,7 @@ impl ProbeOps {
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss
     )]
+    #[inline]
     #[must_use]
     pub fn log_log_probe_limit(capacity: usize) -> usize {
         let n = capacity.max(4) as f64;
@@ -164,11 +172,13 @@ impl ProbeOps {
     }
 
     #[allow(clippy::cast_possible_truncation)]
+    #[inline]
     #[must_use]
     pub fn hash_to_usize(hash: u64) -> usize {
         hash as usize
     }
 
+    #[inline]
     #[must_use]
     pub fn greatest_common_divisor(mut a: usize, mut b: usize) -> usize {
         while b != 0 {
@@ -179,9 +189,14 @@ impl ProbeOps {
         a
     }
 
+    #[inline]
     #[must_use]
     pub fn advance_wrapping_index(index: usize, step: usize, len: usize) -> usize {
-        if len == 0 { 0 } else { (index + step) % len }
+        if len == 0 {
+            return 0;
+        }
+        let r = index + step;
+        if r >= len { r - len } else { r }
     }
 
     #[must_use]
