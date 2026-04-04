@@ -1,6 +1,6 @@
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{
-    vaddv_u8, vceqq_u8, vdupq_n_u8, vget_high_u8, vget_low_u8, vld1q_u8, vmulq_u8, vshrq_n_u8,
+    vaddv_u8, vandq_u8, vceqq_u8, vdupq_n_u8, vget_high_u8, vget_low_u8, vld1q_u8,
 };
 #[cfg(target_arch = "x86_64")]
 use std::sync::OnceLock;
@@ -18,8 +18,10 @@ impl ControlOps {
     /// Panics if the masked 7-bit fingerprint cannot be represented as `u8`.
     #[must_use]
     pub fn control_fingerprint(hash: u64) -> u8 {
-        let low = u8::try_from(hash & 0x7F).expect("7-bit fingerprint fits in u8");
-        low.max(1)
+        // Use the top 7 bits (bits 57-63): they carry more entropy after mixing than the low bits,
+        // reducing fingerprint false-positive rates.
+        let high = u8::try_from((hash >> 57) & 0x7F).expect("7-bit fingerprint fits in u8");
+        high.max(1)
     }
 
     #[must_use]
@@ -292,9 +294,8 @@ static NEON_BIT_POWERS: [u8; CONTROL_GROUP_SIZE] =
 #[inline]
 unsafe fn neon_movemask(cmp: core::arch::aarch64::uint8x16_t) -> u16 {
     unsafe {
-        let bits = vshrq_n_u8::<7>(cmp);
         let power_vec = vld1q_u8(NEON_BIT_POWERS.as_ptr());
-        let weighted = vmulq_u8(bits, power_vec);
+        let weighted = vandq_u8(cmp, power_vec);
         let lo = u16::from(vaddv_u8(vget_low_u8(weighted)));
         let hi = u16::from(vaddv_u8(vget_high_u8(weighted))) << 8;
         lo | hi
