@@ -18,7 +18,7 @@ Two Criterion benchmark suites compare `ElasticHashMap`, `FunnelHashMap`, and `s
 - **`cargo bench --bench throughput`** — end-to-end operations: insert, get (hit/miss/mixed/tiny), delete-heavy, resize-heavy
 - **`cargo bench --bench internal_paths`** — hot-path internals: control-byte scanning, miss-path rejection, bucket lookup with tombstones, delete churn, resize cost
 
-Criterion auto-compares against the previous run. To check for regressions, read the JSON files under `target/criterion/`:
+Criterion auto-compares against the previous run. **Always read results from the JSON files** — terminal output gets truncated and mixes runs. Parse `target/criterion/` after a single `cargo bench` invocation:
 
 - `target/criterion/<group>/<variant>/new/estimates.json` — absolute timing (`mean.point_estimate` in nanoseconds)
 - `target/criterion/<group>/<variant>/change/estimates.json` — relative change vs. previous run (`mean.point_estimate` as a fraction, e.g. +0.05 = 5% slower)
