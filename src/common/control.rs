@@ -1,5 +1,5 @@
 use super::layout::GROUP_SIZE;
-use opthash_internal::{ControlOps, eq_mask_16, eq_mask_32, free_mask_16, free_mask_32};
+use opthash_internal::{ControlOps, eq_mask_16, eq_mask_32};
 
 pub(crate) use opthash_internal::{CTRL_EMPTY, CTRL_TOMBSTONE};
 
@@ -45,7 +45,6 @@ pub(crate) trait Controls {
     fn find_first_free(&self) -> Option<usize>;
     fn find_first(&self, target: u8) -> Option<usize>;
     fn find_next(&self, target: u8, start: usize) -> Option<usize>;
-    fn match_free_group(&self) -> u32;
     fn match_fingerprint_group(&self, target: u8) -> u32;
 }
 
@@ -63,15 +62,6 @@ impl Controls for [u8] {
     #[inline]
     fn find_next(&self, target: u8, start: usize) -> Option<usize> {
         ControlOps::find_next_fingerprint_in_controls(self, target, start)
-    }
-
-    #[inline]
-    fn match_free_group(&self) -> u32 {
-        match self.len() {
-            GROUP_SIZE => u32::from(unsafe { free_mask_16(self.as_ptr()) }),
-            32 => unsafe { free_mask_32(self.as_ptr()) },
-            _ => panic!("group matching requires 16 or 32 byte chunks"),
-        }
     }
 
     #[inline]

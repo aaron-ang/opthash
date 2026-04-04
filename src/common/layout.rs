@@ -1,19 +1,28 @@
 use std::alloc::{self, Layout};
 use std::marker::PhantomData;
-use std::ops::Index;
 use std::ptr::{self, NonNull};
 
-use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, Controls, valid_group_mask};
+use opthash_internal::{eq_mask_16, free_mask_16};
+
+use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, valid_group_mask};
 use super::math::round_up_to_group;
 
 pub(crate) const GROUP_SIZE: usize = 16;
-const CONTROL_ALIGNMENT: usize = 32;
 
-#[derive(Debug)]
-pub(crate) struct Entry<K, V> {
-    pub(crate) key: K,
-    pub(crate) value: V,
-}
+/// Compact stride: control bytes only, no embedded metadata.
+pub(crate) const COMPACT_STRIDE: usize = GROUP_SIZE;
+
+/// Wide stride: 32-byte blocks with embedded `GroupMeta` after the control bytes.
+///   bytes  0-15: control bytes (fingerprints / sentinels)
+///   byte  16:    live count
+///   byte  17:    tombstone count
+///   byte  18:    full flag (0 = not full, 1 = full)
+///   bytes 19-31: padding
+pub(crate) const META_STRIDE: usize = 32;
+
+const META_LIVE_OFFSET: usize = 16;
+const META_TOMBSTONES_OFFSET: usize = 17;
+const META_FULL_OFFSET: usize = 18;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct GroupMeta {
@@ -22,27 +31,36 @@ pub(crate) struct GroupMeta {
     pub(crate) full: bool,
 }
 
-pub(crate) struct RawTable<T> {
+#[derive(Debug)]
+pub(crate) struct Entry<K, V> {
+    pub(crate) key: K,
+    pub(crate) value: V,
+}
+
+/// A raw table of slots with interleaved control bytes.
+///
+/// The `STRIDE` const generic controls the per-group block size:
+/// - `COMPACT_STRIDE` (16): flat control-byte array, no embedded metadata.
+/// - `META_STRIDE` (32): each group occupies a 32-byte block with controls + `GroupMeta`.
+pub(crate) struct RawTable<T, const STRIDE: usize> {
     slots_ptr: NonNull<T>,
-    controls_ptr: NonNull<u8>,
+    data_ptr: NonNull<u8>,
     capacity: usize,
-    padded_capacity: usize,
     group_count: usize,
-    groups: Box<[GroupMeta]>,
     _marker: PhantomData<T>,
 }
 
-impl<T> std::fmt::Debug for RawTable<T> {
+impl<T, const STRIDE: usize> std::fmt::Debug for RawTable<T, STRIDE> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RawTable")
             .field("capacity", &self.capacity)
-            .field("padded_capacity", &self.padded_capacity)
             .field("group_count", &self.group_count)
+            .field("stride", &STRIDE)
             .finish_non_exhaustive()
     }
 }
 
-impl<T> Drop for RawTable<T> {
+impl<T, const STRIDE: usize> Drop for RawTable<T, STRIDE> {
     fn drop(&mut self) {
         if self.capacity > 0 {
             unsafe {
@@ -52,27 +70,22 @@ impl<T> Drop for RawTable<T> {
                 );
             };
         }
-        if self.padded_capacity > 0 {
+        if self.group_count > 0 {
             unsafe {
-                alloc::dealloc(
-                    self.controls_ptr.as_ptr(),
-                    Self::controls_layout(self.padded_capacity),
-                );
+                alloc::dealloc(self.data_ptr.as_ptr(), Self::data_layout(self.group_count));
             };
         }
     }
 }
 
-impl<T> RawTable<T> {
+impl<T, const STRIDE: usize> RawTable<T, STRIDE> {
     pub fn new(capacity: usize) -> Self {
         if capacity == 0 {
             return Self {
                 slots_ptr: NonNull::dangling(),
-                controls_ptr: NonNull::dangling(),
+                data_ptr: NonNull::dangling(),
                 capacity: 0,
-                padded_capacity: 0,
                 group_count: 0,
-                groups: Box::new([]),
                 _marker: PhantomData,
             };
         }
@@ -85,26 +98,16 @@ impl<T> RawTable<T> {
         let slots_ptr = NonNull::new(raw_slots.cast::<T>())
             .unwrap_or_else(|| alloc::handle_alloc_error(slots_layout));
 
-        let controls_layout = Self::controls_layout(padded_capacity);
-        let raw_controls = unsafe { alloc::alloc(controls_layout) };
-        let controls_ptr = NonNull::new(raw_controls)
-            .unwrap_or_else(|| alloc::handle_alloc_error(controls_layout));
-
-        unsafe { ptr::write_bytes(controls_ptr.as_ptr(), CTRL_EMPTY, padded_capacity) };
-
-        let mut groups = vec![GroupMeta::default(); group_count].into_boxed_slice();
-        for group_idx in 0..group_count {
-            let logical_len = logical_group_len(capacity, group_idx);
-            groups[group_idx].full = logical_len == 0;
-        }
+        let data_layout = Self::data_layout(group_count);
+        let raw_data = unsafe { alloc::alloc_zeroed(data_layout) };
+        let data_ptr =
+            NonNull::new(raw_data).unwrap_or_else(|| alloc::handle_alloc_error(data_layout));
 
         Self {
             slots_ptr,
-            controls_ptr,
+            data_ptr,
             capacity,
-            padded_capacity,
             group_count,
-            groups,
             _marker: PhantomData,
         }
     }
@@ -113,9 +116,9 @@ impl<T> RawTable<T> {
         Layout::array::<T>(capacity).expect("slot layout overflow")
     }
 
-    fn controls_layout(padded_capacity: usize) -> Layout {
-        Layout::from_size_align(padded_capacity, CONTROL_ALIGNMENT)
-            .expect("control layout overflow")
+    fn data_layout(group_count: usize) -> Layout {
+        let align = STRIDE.max(GROUP_SIZE);
+        Layout::from_size_align(group_count * STRIDE, align).expect("data block layout overflow")
     }
 
     #[inline]
@@ -139,40 +142,52 @@ impl<T> RawTable<T> {
     }
 
     #[inline]
-    pub fn group_meta(&self, group_idx: usize) -> GroupMeta {
-        self.groups[group_idx]
+    fn data_offset(group_idx: usize, slot_offset: usize) -> usize {
+        group_idx * STRIDE + slot_offset
     }
 
-    #[inline]
-    pub fn controls<I>(&self, range: I) -> &I::Output
-    where
-        I: std::slice::SliceIndex<[u8]>,
-    {
-        self.logical_controls().index(range)
-    }
-
-    #[inline]
-    pub fn logical_controls(&self) -> &[u8] {
-        if self.capacity == 0 {
-            return &[];
-        }
-        unsafe { std::slice::from_raw_parts(self.controls_ptr.as_ptr(), self.capacity) }
-    }
-
+    /// Returns a slice of the 16 control bytes for the given group.
     #[inline]
     pub fn group_controls(&self, group_idx: usize) -> &[u8] {
         debug_assert!(group_idx < self.group_count);
         unsafe {
             std::slice::from_raw_parts(
-                self.controls_ptr.as_ptr().add(group_idx * GROUP_SIZE),
+                self.data_ptr.as_ptr().add(Self::data_offset(group_idx, 0)),
                 GROUP_SIZE,
+            )
+        }
+    }
+
+    /// Returns a slice of `len` contiguous control bytes starting at `start_slot`.
+    ///
+    /// `start_slot` and `start_slot + len` must fall within the same group block
+    /// (i.e., `len <= GROUP_SIZE` and the slot range must not cross a group boundary).
+    #[inline]
+    pub fn bucket_controls(&self, start_slot: usize, len: usize) -> &[u8] {
+        let group_idx = start_slot / GROUP_SIZE;
+        let offset = start_slot % GROUP_SIZE;
+        debug_assert!(group_idx < self.group_count);
+        debug_assert!(offset + len <= GROUP_SIZE, "bucket spans a group boundary");
+        unsafe {
+            std::slice::from_raw_parts(
+                self.data_ptr
+                    .as_ptr()
+                    .add(Self::data_offset(group_idx, offset)),
+                len,
             )
         }
     }
 
     #[inline]
     pub fn control_at(&self, idx: usize) -> u8 {
-        unsafe { *self.controls_ptr.as_ptr().add(idx) }
+        let group_idx = idx / GROUP_SIZE;
+        let slot_offset = idx % GROUP_SIZE;
+        unsafe {
+            *self
+                .data_ptr
+                .as_ptr()
+                .add(Self::data_offset(group_idx, slot_offset))
+        }
     }
 
     #[inline]
@@ -193,8 +208,11 @@ impl<T> RawTable<T> {
             return;
         }
 
-        unsafe { *self.controls_ptr.as_ptr().add(idx) = new_control };
-        self.adjust_group_meta(idx / GROUP_SIZE, old_control, new_control);
+        let group_idx = idx / GROUP_SIZE;
+        let slot_offset = idx % GROUP_SIZE;
+        let base = unsafe { self.data_ptr.as_ptr().add(Self::data_offset(group_idx, 0)) };
+        unsafe { *base.add(slot_offset) = new_control };
+        self.adjust_group_meta_if_wide(base, old_control, new_control, group_idx);
     }
 
     #[inline]
@@ -209,18 +227,11 @@ impl<T> RawTable<T> {
 
     #[inline]
     pub fn clear_all_controls(&mut self) {
-        if self.padded_capacity > 0 {
-            unsafe {
-                ptr::write_bytes(self.controls_ptr.as_ptr(), CTRL_EMPTY, self.padded_capacity);
-            };
+        if self.group_count == 0 {
+            return;
         }
-        for group_idx in 0..self.group_count {
-            let logical_len = self.group_len(group_idx);
-            self.groups[group_idx] = GroupMeta {
-                live: 0,
-                tombstones: 0,
-                full: logical_len == 0,
-            };
+        unsafe {
+            ptr::write_bytes(self.data_ptr.as_ptr(), 0, self.group_count * STRIDE);
         }
     }
 
@@ -247,20 +258,17 @@ impl<T> RawTable<T> {
     #[inline]
     pub fn group_match_mask(&self, group_idx: usize, target: u8) -> u16 {
         let valid = valid_group_mask(self.group_len(group_idx));
-        u16::try_from(
-            self.group_controls(group_idx)
-                .match_fingerprint_group(target),
-        )
-        .expect("group fingerprint mask fits in u16")
-            & valid
+        let ptr = unsafe { self.data_ptr.as_ptr().add(Self::data_offset(group_idx, 0)) };
+        let mask = unsafe { eq_mask_16(ptr, target) };
+        mask & valid
     }
 
     #[inline]
     pub fn group_free_mask(&self, group_idx: usize) -> u16 {
         let valid = valid_group_mask(self.group_len(group_idx));
-        u16::try_from(self.group_controls(group_idx).match_free_group())
-            .expect("group free mask fits in u16")
-            & valid
+        let ptr = unsafe { self.data_ptr.as_ptr().add(Self::data_offset(group_idx, 0)) };
+        let mask = unsafe { free_mask_16(ptr) };
+        mask & valid
     }
 
     #[inline]
@@ -274,22 +282,67 @@ impl<T> RawTable<T> {
         }
     }
 
-    fn adjust_group_meta(&mut self, group_idx: usize, old_control: u8, new_control: u8) {
-        let logical_len = self.group_len(group_idx);
-        let meta = &mut self.groups[group_idx];
-        if old_control.is_occupied() {
-            meta.live = meta.live.saturating_sub(1);
-        } else if old_control == CTRL_TOMBSTONE {
-            meta.tombstones = meta.tombstones.saturating_sub(1);
+    /// Updates `GroupMeta` bytes embedded in the block — only when `STRIDE >= META_STRIDE`.
+    /// For compact tables (`STRIDE == COMPACT_STRIDE`), this is a no-op that the compiler
+    /// eliminates entirely.
+    #[inline]
+    fn adjust_group_meta_if_wide(
+        &mut self,
+        base: *mut u8,
+        old_control: u8,
+        new_control: u8,
+        group_idx: usize,
+    ) {
+        if STRIDE < META_STRIDE {
+            return;
         }
 
-        if new_control.is_occupied() {
-            meta.live = meta.live.saturating_add(1);
-        } else if new_control == CTRL_TOMBSTONE {
-            meta.tombstones = meta.tombstones.saturating_add(1);
-        }
+        let logical_len = logical_group_len(self.capacity, group_idx);
+        unsafe {
+            let live_ptr = base.add(META_LIVE_OFFSET);
+            let tombstones_ptr = base.add(META_TOMBSTONES_OFFSET);
+            let full_ptr = base.add(META_FULL_OFFSET);
 
-        meta.full = logical_len > 0 && meta.live as usize == logical_len;
+            let mut live = *live_ptr;
+            let mut tombstones = *tombstones_ptr;
+
+            if old_control.is_occupied() {
+                live = live.saturating_sub(1);
+            } else if old_control == CTRL_TOMBSTONE {
+                tombstones = tombstones.saturating_sub(1);
+            }
+
+            if new_control.is_occupied() {
+                live = live.saturating_add(1);
+            } else if new_control == CTRL_TOMBSTONE {
+                tombstones = tombstones.saturating_add(1);
+            }
+
+            *live_ptr = live;
+            *tombstones_ptr = tombstones;
+            *full_ptr = u8::from(logical_len > 0 && usize::from(live) == logical_len);
+        }
+    }
+}
+
+/// Methods only available on wide-stride tables with embedded `GroupMeta`.
+impl<T> RawTable<T, META_STRIDE> {
+    /// Returns the `GroupMeta` for the given group index, reading live/tombstones/full
+    /// from the metadata bytes that immediately follow the control bytes in the same block.
+    #[inline]
+    pub fn group_meta(&self, group_idx: usize) -> GroupMeta {
+        debug_assert!(group_idx < self.group_count);
+        let meta_ptr = unsafe {
+            self.data_ptr
+                .as_ptr()
+                .add(group_idx * META_STRIDE + META_LIVE_OFFSET)
+        };
+        let meta_word = unsafe { meta_ptr.cast::<u32>().read_unaligned() };
+        GroupMeta {
+            live: (meta_word & 0xFF) as u8,
+            tombstones: ((meta_word >> 8) & 0xFF) as u8,
+            full: (meta_word >> 16) & 1 != 0,
+        }
     }
 }
 
