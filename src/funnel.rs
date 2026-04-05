@@ -1072,7 +1072,7 @@ where
                 match_mask &= match_mask - 1;
             }
         } else {
-            let mut match_offset = 0usize;
+            let mut match_offset = 0;
             while let Some(relative_idx) =
                 controls[..searchable_len].find_next(key_fingerprint, match_offset)
             {
@@ -1237,7 +1237,7 @@ where
                 controls.find_first(CTRL_EMPTY).unwrap_or(controls.len())
             };
 
-            let mut match_offset = 0usize;
+            let mut match_offset = 0;
             while let Some(relative_idx) =
                 controls[..searchable_len].find_next(key_fingerprint, match_offset)
             {
@@ -1689,8 +1689,8 @@ fn next_bucket_count_bounds(current_bucket_count: usize) -> (usize, usize) {
 }
 
 fn possible_tail_sum_range(start_bucket_count: usize, levels_after: usize) -> (usize, usize) {
-    let mut min_sum = 0usize;
-    let mut max_sum = 0usize;
+    let mut min_sum = 0;
+    let mut max_sum = 0;
     let mut min_previous = start_bucket_count;
     let mut max_previous = start_bucket_count;
 

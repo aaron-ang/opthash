@@ -124,7 +124,7 @@ impl SpecialPrimaryFixture {
             if self.group_summaries[group_idx] & fingerprint_mask != 0 {
                 let group_range = self.group_range(group_idx);
                 let controls = &self.controls[group_range.clone()];
-                let mut offset = 0usize;
+                let mut offset = 0;
                 while let Some(relative_idx) =
                     ControlOps::find_next_fingerprint_in_controls(controls, fingerprint, offset)
                 {
@@ -241,7 +241,7 @@ impl SpecialFallbackFixture {
 
             let range = self.bucket_range(bucket_idx);
             let controls = &self.controls[range.clone()];
-            let mut offset = 0usize;
+            let mut offset = 0;
             while let Some(relative_idx) =
                 ControlOps::find_next_fingerprint_in_controls(controls, fingerprint, offset)
             {
@@ -262,7 +262,7 @@ fn build_special_primary_fixture() -> (SpecialPrimaryFixture, Vec<u64>) {
         (SPECIAL_LOOKUP_CAPACITY * SPECIAL_LOOKUP_LOAD_NUMERATOR) / SPECIAL_LOOKUP_LOAD_DENOMINATOR;
     let mut fixture = SpecialPrimaryFixture::new(SPECIAL_LOOKUP_CAPACITY);
     let mut inserted_keys = Vec::with_capacity(insert_count);
-    let mut candidate_idx = 0usize;
+    let mut candidate_idx = 0;
 
     while inserted_keys.len() < insert_count {
         let key = key_at(candidate_idx + 1_000_000);
@@ -281,7 +281,7 @@ fn build_special_fallback_fixture() -> (SpecialFallbackFixture, Vec<u64>) {
         (SPECIAL_LOOKUP_CAPACITY * SPECIAL_LOOKUP_LOAD_NUMERATOR) / SPECIAL_LOOKUP_LOAD_DENOMINATOR;
     let mut fixture = SpecialFallbackFixture::new(SPECIAL_LOOKUP_CAPACITY, primary_probe_limit);
     let mut inserted_keys = Vec::with_capacity(insert_count);
-    let mut candidate_idx = 0usize;
+    let mut candidate_idx = 0;
 
     while inserted_keys.len() < insert_count {
         let key = key_at(candidate_idx + 3_000_000);
