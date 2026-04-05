@@ -116,7 +116,7 @@ fn bench_get_hit_throughput(c: &mut Criterion) {
                     black_box(map.get(black_box(key)));
                 }
             },
-            BatchSize::PerIteration,
+            BatchSize::LargeInput,
         );
     });
 
@@ -128,7 +128,7 @@ fn bench_get_hit_throughput(c: &mut Criterion) {
                     black_box(map.get(black_box(key)));
                 }
             },
-            BatchSize::PerIteration,
+            BatchSize::LargeInput,
         );
     });
 
@@ -140,7 +140,7 @@ fn bench_get_hit_throughput(c: &mut Criterion) {
                     black_box(map.get(black_box(key)));
                 }
             },
-            BatchSize::PerIteration,
+            BatchSize::LargeInput,
         );
     });
 
@@ -164,7 +164,7 @@ fn bench_get_miss_throughput(c: &mut Criterion) {
                     black_box(map.get(black_box(key)));
                 }
             },
-            BatchSize::PerIteration,
+            BatchSize::LargeInput,
         );
     });
 
@@ -176,7 +176,7 @@ fn bench_get_miss_throughput(c: &mut Criterion) {
                     black_box(map.get(black_box(key)));
                 }
             },
-            BatchSize::PerIteration,
+            BatchSize::LargeInput,
         );
     });
 
@@ -188,7 +188,7 @@ fn bench_get_miss_throughput(c: &mut Criterion) {
                     black_box(map.get(black_box(key)));
                 }
             },
-            BatchSize::PerIteration,
+            BatchSize::LargeInput,
         );
     });
 
@@ -218,7 +218,7 @@ fn bench_tiny_lookup_throughput(c: &mut Criterion) {
                     black_box(map.get(black_box(key)));
                 }
             },
-            BatchSize::PerIteration,
+            BatchSize::LargeInput,
         );
     });
 
@@ -236,7 +236,7 @@ fn bench_tiny_lookup_throughput(c: &mut Criterion) {
                     black_box(map.get(black_box(key)));
                 }
             },
-            BatchSize::PerIteration,
+            BatchSize::LargeInput,
         );
     });
 
@@ -254,7 +254,7 @@ fn bench_tiny_lookup_throughput(c: &mut Criterion) {
                     black_box(map.get(black_box(key)));
                 }
             },
-            BatchSize::PerIteration,
+            BatchSize::LargeInput,
         );
     });
 
@@ -324,33 +324,42 @@ fn bench_resize_heavy_throughput(c: &mut Criterion) {
     group.throughput(Throughput::Elements(RESIZE_INSERT_COUNT as u64));
 
     group.bench_function("std", |b| {
-        b.iter(|| {
-            let mut map = StdHashMap::new();
-            for &(key, value) in &pairs {
-                black_box(map.insert(black_box(key), black_box(value)));
-            }
-            black_box(map.len())
-        });
+        b.iter_batched(
+            StdHashMap::new,
+            |mut map| {
+                for &(key, value) in &pairs {
+                    black_box(map.insert(black_box(key), black_box(value)));
+                }
+                black_box(map.len())
+            },
+            BatchSize::PerIteration,
+        );
     });
 
     group.bench_function("elastic", |b| {
-        b.iter(|| {
-            let mut map = ElasticHashMap::new();
-            for &(key, value) in &pairs {
-                black_box(map.insert(black_box(key), black_box(value)));
-            }
-            black_box(map.len())
-        });
+        b.iter_batched(
+            ElasticHashMap::new,
+            |mut map| {
+                for &(key, value) in &pairs {
+                    black_box(map.insert(black_box(key), black_box(value)));
+                }
+                black_box(map.len())
+            },
+            BatchSize::PerIteration,
+        );
     });
 
     group.bench_function("funnel", |b| {
-        b.iter(|| {
-            let mut map = FunnelHashMap::new();
-            for &(key, value) in &pairs {
-                black_box(map.insert(black_box(key), black_box(value)));
-            }
-            black_box(map.len())
-        });
+        b.iter_batched(
+            FunnelHashMap::new,
+            |mut map| {
+                for &(key, value) in &pairs {
+                    black_box(map.insert(black_box(key), black_box(value)));
+                }
+                black_box(map.len())
+            },
+            BatchSize::PerIteration,
+        );
     });
 
     group.finish();
@@ -379,7 +388,7 @@ fn bench_mixed_lookup_throughput(c: &mut Criterion) {
                     black_box(map.get(black_box(key)));
                 }
             },
-            BatchSize::PerIteration,
+            BatchSize::LargeInput,
         );
     });
 
@@ -391,7 +400,7 @@ fn bench_mixed_lookup_throughput(c: &mut Criterion) {
                     black_box(map.get(black_box(key)));
                 }
             },
-            BatchSize::PerIteration,
+            BatchSize::LargeInput,
         );
     });
 
@@ -403,7 +412,7 @@ fn bench_mixed_lookup_throughput(c: &mut Criterion) {
                     black_box(map.get(black_box(key)));
                 }
             },
-            BatchSize::PerIteration,
+            BatchSize::LargeInput,
         );
     });
 
