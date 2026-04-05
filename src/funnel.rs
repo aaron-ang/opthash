@@ -518,13 +518,6 @@ where
                     meta.tombstones += 1;
                 }
                 level.update_bucket_search_len(bucket_idx);
-                let mut bucket_summary = 0;
-                Self::rebuild_bucket_summary(
-                    &level.table,
-                    level.bucket_range(bucket_idx),
-                    &mut bucket_summary,
-                );
-                level.bucket_meta_mut(bucket_idx).summary = bucket_summary;
                 if level.bucket_meta(bucket_idx).tombstones > level.bucket_size / 4 {
                     self.rebuild_level_bucket(level_idx, bucket_idx);
                 }
@@ -540,7 +533,6 @@ where
                     primary.group_tombstones[group_idx] += 1;
                     removed
                 };
-                self.rebuild_primary_group_summary(group_idx);
                 if self.special.primary.group_tombstones[group_idx] > GROUP_SIZE / 4 {
                     self.rebuild_special_primary_group(group_idx);
                 }
@@ -554,11 +546,6 @@ where
                 fallback.len -= 1;
                 fallback.bucket_live[bucket_idx] -= 1;
                 fallback.bucket_tombstones[bucket_idx] += 1;
-                Self::rebuild_bucket_summary(
-                    &fallback.table,
-                    fallback.bucket_range(bucket_idx),
-                    &mut fallback.bucket_summaries[bucket_idx],
-                );
                 if fallback.bucket_tombstones[bucket_idx] > fallback.bucket_len(bucket_idx) / 4 {
                     self.rebuild_special_fallback_bucket(bucket_idx);
                 }
@@ -1455,18 +1442,6 @@ where
         }
     }
 
-    fn rebuild_primary_group_summary(&mut self, group_idx: usize) {
-        let primary = &mut self.special.primary;
-        primary.group_summaries[group_idx] = 0;
-        let group_start = group_idx * GROUP_SIZE;
-        for slot_idx in group_start..group_start + GROUP_SIZE {
-            let control = primary.table.control_at(slot_idx);
-            if control.is_occupied() {
-                primary.group_summaries[group_idx] |= fingerprint_bit(control);
-            }
-        }
-    }
-
     fn special_fallback_bucket_of_slot(&self, slot_idx: usize) -> usize {
         slot_idx / self.special.fallback.bucket_size.max(1)
     }
@@ -1477,20 +1452,6 @@ where
         }
         if self.levels.is_empty() || self.levels[0].len == 0 {
             self.max_populated_level = 0;
-        }
-    }
-
-    fn rebuild_bucket_summary(
-        table: &RawTable<Entry<K, V>>,
-        range: std::ops::Range<usize>,
-        summary: &mut u128,
-    ) {
-        *summary = 0;
-        for slot_idx in range {
-            let control = table.control_at(slot_idx);
-            if control.is_occupied() {
-                *summary |= fingerprint_bit(control);
-            }
         }
     }
 }
