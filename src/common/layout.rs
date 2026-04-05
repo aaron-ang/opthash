@@ -108,15 +108,6 @@ impl<T> RawTable<T> {
         self.group_count
     }
 
-    /// Returns the 16 control bytes for group `group_idx`.
-    #[inline]
-    pub fn group_controls(&self, group_idx: usize) -> &[u8] {
-        debug_assert!(group_idx < self.group_count);
-        unsafe {
-            std::slice::from_raw_parts(self.ctrl_ptr().add(group_idx * GROUP_SIZE), GROUP_SIZE)
-        }
-    }
-
     /// Returns a raw pointer to the control bytes of group `group_idx`.
     #[inline]
     pub fn group_data_ptr(&self, group_idx: usize) -> *const u8 {

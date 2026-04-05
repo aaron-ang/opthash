@@ -9,8 +9,28 @@ pub const CONTROL_GROUP_SIZE: usize = 16;
 pub const CTRL_EMPTY: u8 = 0;
 pub const CTRL_TOMBSTONE: u8 = 0x80;
 
+pub trait ControlByte {
+    fn is_occupied(&self) -> bool;
+    fn is_free(&self) -> bool;
+}
+
+impl ControlByte for u8 {
+    #[inline]
+    fn is_occupied(&self) -> bool {
+        *self != CTRL_EMPTY && *self != CTRL_TOMBSTONE
+    }
+
+    #[inline]
+    fn is_free(&self) -> bool {
+        *self == CTRL_EMPTY || *self == CTRL_TOMBSTONE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ControlOps — namespace for control-byte static methods
+// ---------------------------------------------------------------------------
+
 pub struct ControlOps;
-pub struct ProbeOps;
 
 impl ControlOps {
     /// # Panics
@@ -19,8 +39,6 @@ impl ControlOps {
     #[inline]
     #[must_use]
     pub fn control_fingerprint(hash: u64) -> u8 {
-        // Use the top 7 bits (bits 57-63): they carry more entropy after mixing than the low bits,
-        // reducing fingerprint false-positive rates.
         let high = u8::try_from((hash >> 57) & 0x7F).expect("7-bit fingerprint fits in u8");
         high.max(1)
     }
@@ -37,7 +55,7 @@ impl ControlOps {
         if controls.len() < CONTROL_GROUP_SIZE {
             return controls
                 .iter()
-                .position(|&control| control == CTRL_EMPTY || control == CTRL_TOMBSTONE);
+                .position(|&c| c == CTRL_EMPTY || c == CTRL_TOMBSTONE);
         }
 
         let wide = Self::preferred_group_width();
@@ -60,7 +78,7 @@ impl ControlOps {
 
         controls[index..]
             .iter()
-            .position(|&control| control == CTRL_EMPTY || control == CTRL_TOMBSTONE)
+            .position(|&c| c == CTRL_EMPTY || c == CTRL_TOMBSTONE)
             .map(|offset| index + offset)
     }
 
@@ -112,7 +130,7 @@ impl ControlOps {
 
     #[inline]
     #[must_use]
-    pub fn preferred_group_width() -> usize {
+    fn preferred_group_width() -> usize {
         #[cfg(target_arch = "x86_64")]
         {
             static WIDTH: OnceLock<usize> = OnceLock::new();
@@ -136,10 +154,10 @@ impl ControlOps {
     /// Panics if `chunk` is not 16 or 32 bytes long.
     #[inline]
     #[must_use]
-    pub fn control_match_free_group(chunk: &[u8]) -> u32 {
+    pub fn control_match_fingerprint_group(chunk: &[u8], target: u8) -> u32 {
         match chunk.len() {
-            CONTROL_GROUP_SIZE => u32::from(unsafe { free_mask_16(chunk.as_ptr()) }),
-            32 => unsafe { free_mask_32(chunk.as_ptr()) },
+            CONTROL_GROUP_SIZE => u32::from(unsafe { eq_mask_16(chunk.as_ptr(), target) }),
+            32 => unsafe { eq_mask_32(chunk.as_ptr(), target) },
             _ => panic!("group matching requires 16 or 32 byte chunks"),
         }
     }
@@ -149,14 +167,20 @@ impl ControlOps {
     /// Panics if `chunk` is not 16 or 32 bytes long.
     #[inline]
     #[must_use]
-    pub fn control_match_fingerprint_group(chunk: &[u8], target: u8) -> u32 {
+    pub fn control_match_free_group(chunk: &[u8]) -> u32 {
         match chunk.len() {
-            CONTROL_GROUP_SIZE => u32::from(unsafe { eq_mask_16(chunk.as_ptr(), target) }),
-            32 => unsafe { eq_mask_32(chunk.as_ptr(), target) },
+            CONTROL_GROUP_SIZE => u32::from(unsafe { free_mask_16(chunk.as_ptr()) }),
+            32 => unsafe { free_mask_32(chunk.as_ptr()) },
             _ => panic!("group matching requires 16 or 32 byte chunks"),
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Probe helpers (ProbeOps)
+// ---------------------------------------------------------------------------
+
+pub struct ProbeOps;
 
 impl ProbeOps {
     #[allow(
@@ -192,6 +216,8 @@ impl ProbeOps {
     #[inline]
     #[must_use]
     pub fn advance_wrapping_index(index: usize, step: usize, len: usize) -> usize {
+        // step < len is guaranteed by build_group_steps, so index + step < 2*len.
+        // A conditional subtract avoids the expensive division that modulo requires.
         if len == 0 {
             return 0;
         }
@@ -217,6 +243,10 @@ impl ProbeOps {
         steps.into_boxed_slice()
     }
 }
+
+// ---------------------------------------------------------------------------
+// SIMD mask functions
+// ---------------------------------------------------------------------------
 
 /// # Safety
 ///
@@ -279,6 +309,30 @@ pub unsafe fn free_mask_32(ptr: *const u8) -> u32 {
     let hi = u32::from(unsafe { free_mask_16(ptr.add(CONTROL_GROUP_SIZE)) });
     lo | (hi << CONTROL_GROUP_SIZE)
 }
+
+// ---------------------------------------------------------------------------
+// Prefetch
+// ---------------------------------------------------------------------------
+
+/// # Safety
+///
+/// `ptr` must be a valid, aligned pointer to readable memory (or null, in which
+/// case the prefetch is silently ignored by the hardware).
+#[inline]
+pub unsafe fn prefetch_read(ptr: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("prfm pldl1keep, [{}]", in(reg) ptr, options(nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Platform-specific SIMD implementations
+// ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "aarch64")]
 static NEON_BIT_POWERS: [u8; CONTROL_GROUP_SIZE] =
@@ -378,21 +432,5 @@ unsafe fn free_mask_32_avx2(ptr: *const u8) -> u32 {
         {
             _mm256_movemask_epi8(free) as u32
         }
-    }
-}
-
-/// # Safety
-///
-/// `ptr` must be a valid, aligned pointer to readable memory (or null, in which
-/// case the prefetch is silently ignored by the hardware).
-#[inline]
-pub unsafe fn prefetch_read(ptr: *const u8) {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!("prfm pldl1keep, [{}]", in(reg) ptr, options(nostack, preserves_flags));
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
     }
 }
