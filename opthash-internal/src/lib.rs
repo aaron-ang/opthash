@@ -222,49 +222,28 @@ impl ProbeOps {
 ///
 /// `ptr` must be valid to read `CONTROL_GROUP_SIZE` bytes.
 #[must_use]
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> u16 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { return eq_mask_16_neon(ptr, target) };
-    }
+    unsafe { eq_mask_16_neon(ptr, target) }
+}
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        unsafe { return eq_mask_16_sse2(ptr, target) };
-    }
-
-    #[allow(unreachable_code)]
-    {
-        let slice = unsafe { std::slice::from_raw_parts(ptr, CONTROL_GROUP_SIZE) };
-        let mut mask = 0u16;
-        for (idx, &value) in slice.iter().enumerate() {
-            if value == target {
-                mask |= 1 << idx;
-            }
-        }
-        mask
-    }
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> u16 {
+    unsafe { eq_mask_16_sse2(ptr, target) }
 }
 
 /// # Safety
 ///
 /// `ptr` must be valid to read `CONTROL_GROUP_SIZE` bytes.
 #[must_use]
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn free_mask_16(ptr: *const u8) -> u16 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { return free_mask_16_neon(ptr) };
-    }
+    unsafe { free_mask_16_neon(ptr) }
+}
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        unsafe { return free_mask_16_sse2(ptr) };
-    }
-
-    #[allow(unreachable_code)]
-    {
-        unsafe { eq_mask_16(ptr, CTRL_EMPTY) | eq_mask_16(ptr, CTRL_TOMBSTONE) }
-    }
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn free_mask_16(ptr: *const u8) -> u16 {
+    unsafe { free_mask_16_sse2(ptr) }
 }
 
 /// # Safety
