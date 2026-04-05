@@ -6,7 +6,7 @@ use opthash_internal::ProbeOps;
 
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
-    control::{ControlByte, control_fingerprint},
+    control::{ControlByte, ControlOps},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
         advance_wrapping_index, ceil_three_quarters, ceil_to_usize, floor_half_reserve_slots,
@@ -205,7 +205,7 @@ where
     /// Panics if a resize succeeds but no free slot can be found for the new key.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let key_hash = self.hash_key(&key);
-        let key_fingerprint = control_fingerprint(key_hash);
+        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
 
         if let Some((level_idx, slot_idx)) =
             self.find_slot_indices_with_hash(&key, key_hash, key_fingerprint)
@@ -250,7 +250,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let key_hash = self.hash_key(key);
-        let key_fingerprint = control_fingerprint(key_hash);
+        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
         Some(unsafe { &self.levels[level_idx].table.get_ref(slot_idx).value })
@@ -262,7 +262,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let key_hash = self.hash_key(key);
-        let key_fingerprint = control_fingerprint(key_hash);
+        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
         Some(unsafe { &mut self.levels[level_idx].table.get_mut(slot_idx).value })
@@ -274,7 +274,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let key_hash = self.hash_key(key);
-        let key_fingerprint = control_fingerprint(key_hash);
+        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
         self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)
             .is_some()
     }
@@ -285,7 +285,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let key_hash = self.hash_key(key);
-        let key_fingerprint = control_fingerprint(key_hash);
+        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
 
@@ -580,7 +580,7 @@ where
 
         for (key, value) in entries {
             let key_hash = self.hash_key(&key);
-            let key_fingerprint = control_fingerprint(key_hash);
+            let key_fingerprint = ControlOps::control_fingerprint(key_hash);
             let slot_idx = self
                 .first_free_uniform(key_hash, level_idx)
                 .expect("rebuilt level should have free space");
@@ -832,5 +832,57 @@ mod tests {
             probe_scale: 8.0,
         });
         assert_eq!(map.capacity(), 96);
+    }
+
+    #[test]
+    fn delete_heavy_preserves_correctness() {
+        let mut map = ElasticHashMap::with_capacity(200);
+        for i in 0..100 {
+            map.insert(i, i * 10);
+        }
+        // Delete most entries, then verify the rest are still findable.
+        for i in 0..80 {
+            assert_eq!(map.remove(&i), Some(i * 10));
+        }
+        for i in 80..100 {
+            assert_eq!(
+                map.get(&i),
+                Some(&(i * 10)),
+                "key {i} missing after deletes"
+            );
+        }
+        assert_eq!(map.len(), 20);
+        // Re-insert into tombstone-heavy map.
+        for i in 200..250 {
+            assert_eq!(map.insert(i, i), None);
+        }
+        for i in 200..250 {
+            assert_eq!(map.get(&i), Some(&i), "key {i} missing after re-insert");
+        }
+    }
+
+    #[test]
+    fn large_map_correctness() {
+        let n = 10_000;
+        let mut map = ElasticHashMap::with_capacity(n * 2);
+        for i in 0..n {
+            assert_eq!(map.insert(i, i), None);
+        }
+        for i in 0..n {
+            assert_eq!(map.get(&i), Some(&i), "key {i} missing");
+        }
+        assert_eq!(map.len(), n);
+    }
+
+    #[test]
+    fn partial_group_capacity_works() {
+        // Capacity 18 creates a partial last group (2 valid slots out of 16).
+        let mut map = ElasticHashMap::with_capacity(18);
+        for i in 0..15 {
+            assert_eq!(map.insert(i, i), None);
+        }
+        for i in 0..15 {
+            assert_eq!(map.get(&i), Some(&i));
+        }
     }
 }
