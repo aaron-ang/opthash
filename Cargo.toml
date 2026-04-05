@@ -32,7 +32,3 @@ criterion = { version = "0.8", features = ["html_reports"] }
 [[bench]]
 name = "benchmarks"
 harness = false
-
-[[bench]]
-name = "internal_paths"
-harness = false

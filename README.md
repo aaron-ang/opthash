@@ -105,13 +105,9 @@ All benchmarks on Apple M1 (aarch64, NEON SIMD) via Criterion. `std::HashMap` us
 
 ### Throughput
 
-Speedup relative to `std::HashMap` (1.0x baseline). Higher is better:
-
 ![Throughput speedup chart](assets/benchmark-speedup.svg)
 
 ### Latency
-
-Per-lookup latency for a single `get()` call at different map sizes (100 to 10M entries). As the working set exceeds L2 cache, elastic hashing's random probing converges toward hashbrown's linear probing — at 10M entries elastic is only 1.15x slower:
 
 ![Latency chart](assets/benchmark-latency.svg)
 
