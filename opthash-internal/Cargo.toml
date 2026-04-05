@@ -1,7 +1,10 @@
 [package]
 name = "opthash-internal"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+description = "SIMD control-byte scanning and probe helpers for opthash"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aaron-ang/opthash"
 
 [lib]
 path = "src/lib.rs"
