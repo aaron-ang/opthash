@@ -7,7 +7,7 @@ use opthash_internal::ProbeOps;
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
     control::{ControlByte, control_fingerprint},
-    layout::{Entry, GROUP_SIZE, META_STRIDE, RawTable},
+    layout::{Entry, GROUP_SIZE, RawTable},
     math::{
         advance_wrapping_index, ceil_three_quarters, ceil_to_usize, floor_half_reserve_slots,
         max_insertions, sanitize_reserve_fraction, usize_to_f64,
@@ -45,7 +45,7 @@ impl ElasticOptions {
 
 #[derive(Debug)]
 struct Level<K, V> {
-    table: RawTable<Entry<K, V>, META_STRIDE>,
+    table: RawTable<Entry<K, V>>,
     len: usize,
     tombstones: usize,
     half_reserve_slot_threshold: usize,
@@ -482,22 +482,18 @@ where
         };
 
         for _ in 0..probe_limit {
-            let group_meta = level.table.group_meta(group_idx);
-            if group_meta.live > 0 {
-                let mut match_mask = level.table.group_match_mask(group_idx, key_fingerprint);
-                while match_mask != 0 {
-                    let relative_idx = match_mask.trailing_zeros() as usize;
-                    let slot_idx =
-                        RawTable::<Entry<K, V>, META_STRIDE>::group_start(group_idx) + relative_idx;
-                    let entry = unsafe { level.table.get_ref(slot_idx) };
-                    if entry.key.borrow() == key {
-                        return Some(slot_idx);
-                    }
-                    match_mask &= match_mask - 1;
+            let mut match_mask = level.table.group_match_mask(group_idx, key_fingerprint);
+            while match_mask != 0 {
+                let relative_idx = match_mask.trailing_zeros() as usize;
+                let slot_idx = group_idx * GROUP_SIZE + relative_idx;
+                let entry = unsafe { level.table.get_ref(slot_idx) };
+                if entry.key.borrow() == key {
+                    return Some(slot_idx);
                 }
+                match_mask &= match_mask - 1;
             }
 
-            if level.tombstones == 0 && !group_meta.full {
+            if level.tombstones == 0 && level.table.first_free_in_group(group_idx).is_some() {
                 return None;
             }
 
@@ -524,9 +520,7 @@ where
         let max_groups = max_groups.min(group_count.max(1));
 
         for _ in 0..max_groups {
-            if !level.table.group_meta(group_idx).full
-                && let Some(slot_idx) = level.table.first_free_in_group(group_idx, 0)
-            {
+            if let Some(slot_idx) = level.table.first_free_in_group(group_idx) {
                 return Some(slot_idx);
             }
             group_idx = advance_wrapping_index(group_idx, group_step, group_count);
@@ -546,9 +540,7 @@ where
         let mut group_idx = group_start;
 
         for _ in 0..group_count {
-            if !level.table.group_meta(group_idx).full
-                && let Some(slot_idx) = level.table.first_free_in_group(group_idx, 0)
-            {
+            if let Some(slot_idx) = level.table.first_free_in_group(group_idx) {
                 return Some(slot_idx);
             }
             group_idx = advance_wrapping_index(group_idx, group_step, group_count);

@@ -1,4 +1,3 @@
-use super::layout::GROUP_SIZE;
 use opthash_internal::{ControlOps, eq_mask_16, eq_mask_32};
 
 pub(crate) use opthash_internal::{CTRL_EMPTY, CTRL_TOMBSTONE};
@@ -30,17 +29,6 @@ pub(crate) fn fingerprint_bit(fingerprint: u8) -> u128 {
     ControlOps::fingerprint_bit(fingerprint)
 }
 
-#[inline]
-pub(crate) fn valid_group_mask(len: usize) -> u16 {
-    if len >= GROUP_SIZE {
-        u16::MAX
-    } else if len == 0 {
-        0
-    } else {
-        (1u16 << len) - 1
-    }
-}
-
 pub(crate) trait Controls {
     fn find_first_free(&self) -> Option<usize>;
     fn find_first(&self, target: u8) -> Option<usize>;
@@ -67,7 +55,7 @@ impl Controls for [u8] {
     #[inline]
     fn match_fingerprint_group(&self, target: u8) -> u32 {
         match self.len() {
-            GROUP_SIZE => u32::from(unsafe { eq_mask_16(self.as_ptr(), target) }),
+            16 => u32::from(unsafe { eq_mask_16(self.as_ptr(), target) }),
             32 => unsafe { eq_mask_32(self.as_ptr(), target) },
             _ => panic!("group matching requires 16 or 32 byte chunks"),
         }

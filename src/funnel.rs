@@ -7,7 +7,7 @@ use opthash_internal::{ProbeOps, prefetch_read};
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
     control::{CTRL_EMPTY, ControlByte, Controls, control_fingerprint, fingerprint_bit},
-    layout::{COMPACT_STRIDE, Entry, GROUP_SIZE, META_STRIDE, RawTable},
+    layout::{Entry, GROUP_SIZE, RawTable},
     math::{
         advance_wrapping_index, ceil_to_usize, floor_to_usize, max_insertions, round_to_usize,
         round_up_to_group, sanitize_reserve_fraction, usize_to_f64,
@@ -61,7 +61,7 @@ impl BucketMeta {
 
 #[derive(Debug)]
 struct BucketLevel<K, V> {
-    table: RawTable<Entry<K, V>, COMPACT_STRIDE>,
+    table: RawTable<Entry<K, V>>,
     len: usize,
     bucket_size: usize,
     bucket_count: usize,
@@ -128,7 +128,7 @@ impl<K, V> Drop for BucketLevel<K, V> {
 
 #[derive(Debug)]
 struct SpecialPrimary<K, V> {
-    table: RawTable<Entry<K, V>, META_STRIDE>,
+    table: RawTable<Entry<K, V>>,
     len: usize,
     group_summaries: Box<[u128]>,
     group_tombstones: Box<[usize]>,
@@ -161,7 +161,7 @@ impl<K, V> Drop for SpecialPrimary<K, V> {
 
 #[derive(Debug)]
 struct SpecialFallback<K, V> {
-    table: RawTable<Entry<K, V>, COMPACT_STRIDE>,
+    table: RawTable<Entry<K, V>>,
     len: usize,
     bucket_size: usize,
     bucket_count: usize,
@@ -541,9 +541,7 @@ where
                     removed
                 };
                 self.rebuild_primary_group_summary(group_idx);
-                if self.special.primary.group_tombstones[group_idx]
-                    > self.special.primary.table.group_len(group_idx) / 4
-                {
+                if self.special.primary.group_tombstones[group_idx] > GROUP_SIZE / 4 {
                     self.rebuild_special_primary_group(group_idx);
                 }
                 removed
@@ -964,19 +962,7 @@ where
         primary: &SpecialPrimary<K, V>,
         group_idx: usize,
     ) -> Option<usize> {
-        let group_meta = primary.table.group_meta(group_idx);
-        if group_meta.full {
-            return None;
-        }
-
-        if primary.group_tombstones[group_idx] == 0 {
-            return Some(
-                RawTable::<Entry<K, V>, META_STRIDE>::group_start(group_idx)
-                    + usize::from(group_meta.live),
-            );
-        }
-
-        primary.table.first_free_in_group(group_idx, 0)
+        primary.table.first_free_in_group(group_idx)
     }
 
     fn find_in_level_bucket<Q>(
@@ -1116,8 +1102,7 @@ where
                 let mut match_mask = primary.table.group_match_mask(group_idx, key_fingerprint);
                 while match_mask != 0 {
                     let relative_idx = match_mask.trailing_zeros() as usize;
-                    let slot_idx =
-                        RawTable::<Entry<K, V>, META_STRIDE>::group_start(group_idx) + relative_idx;
+                    let slot_idx = group_idx * GROUP_SIZE + relative_idx;
                     let entry = unsafe { primary.table.get_ref(slot_idx) };
                     if entry.key.borrow() == key {
                         return LookupStep::Found(slot_idx);
@@ -1126,7 +1111,8 @@ where
                 }
             }
 
-            if primary.group_tombstones[group_idx] == 0 && !primary.table.group_meta(group_idx).full
+            if primary.group_tombstones[group_idx] == 0
+                && primary.table.first_free_in_group(group_idx).is_some()
             {
                 return LookupStep::StopSearch;
             }
@@ -1168,16 +1154,15 @@ where
         let mut candidate = None;
 
         for _ in 0..group_limit {
-            if candidate.is_none() && !primary.table.group_meta(group_idx).full {
-                candidate = primary.table.first_free_in_group(group_idx, 0);
+            if candidate.is_none() && primary.table.first_free_in_group(group_idx).is_some() {
+                candidate = primary.table.first_free_in_group(group_idx);
             }
 
             if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
                 let mut match_mask = primary.table.group_match_mask(group_idx, key_fingerprint);
                 while match_mask != 0 {
                     let relative_idx = match_mask.trailing_zeros() as usize;
-                    let slot_idx =
-                        RawTable::<Entry<K, V>, META_STRIDE>::group_start(group_idx) + relative_idx;
+                    let slot_idx = group_idx * GROUP_SIZE + relative_idx;
                     let entry = unsafe { primary.table.get_ref(slot_idx) };
                     if entry.key.borrow() == key {
                         return (LookupStep::Found(slot_idx), candidate);
@@ -1186,7 +1171,8 @@ where
                 }
             }
 
-            if primary.group_tombstones[group_idx] == 0 && !primary.table.group_meta(group_idx).full
+            if primary.group_tombstones[group_idx] == 0
+                && primary.table.first_free_in_group(group_idx).is_some()
             {
                 return (LookupStep::StopSearch, candidate);
             }
@@ -1229,7 +1215,12 @@ where
                 continue;
             }
             let range = fallback.bucket_range(bucket_idx);
-            let controls = fallback.table.bucket_controls(range.start, range.len());
+            let controls = unsafe {
+                std::slice::from_raw_parts(
+                    fallback.table.group_data_ptr(0).add(range.start),
+                    range.len(),
+                )
+            };
             let bucket_tombstones = fallback.bucket_tombstones[bucket_idx];
             let searchable_len = if bucket_tombstones > 0 {
                 controls.len()
@@ -1369,9 +1360,16 @@ where
             let key_hash = self.hash_key(&key);
             let key_fingerprint = control_fingerprint(key_hash);
             let range = self.levels[level_idx].bucket_range(bucket_idx);
-            let offset = self.levels[level_idx]
-                .table
-                .bucket_controls(range.start, range.len())
+            let controls = unsafe {
+                std::slice::from_raw_parts(
+                    self.levels[level_idx]
+                        .table
+                        .group_data_ptr(0)
+                        .add(range.start),
+                    range.len(),
+                )
+            };
+            let offset = controls
                 .find_first_free()
                 .expect("rebuilt bucket should have free space");
             let slot_idx = range.start + offset;
@@ -1392,9 +1390,8 @@ where
         let mut entries = Vec::new();
         {
             let primary = &mut self.special.primary;
-            let group_start = RawTable::<Entry<K, V>, META_STRIDE>::group_start(group_idx);
-            let group_len = primary.table.group_len(group_idx);
-            for slot_idx in group_start..group_start + group_len {
+            let group_start = group_idx * GROUP_SIZE;
+            for slot_idx in group_start..group_start + GROUP_SIZE {
                 if primary.table.control_at(slot_idx).is_occupied() {
                     let entry = unsafe { primary.table.take(slot_idx) };
                     entries.push((entry.key, entry.value));
@@ -1410,7 +1407,7 @@ where
             let primary = &mut self.special.primary;
             let slot_idx = primary
                 .table
-                .first_free_in_group(group_idx, 0)
+                .first_free_in_group(group_idx)
                 .expect("rebuilt primary group should have free space");
             primary
                 .table
@@ -1440,9 +1437,13 @@ where
             let key_fingerprint = control_fingerprint(self.hash_key(&key));
             let fallback = &mut self.special.fallback;
             let range = fallback.bucket_range(bucket_idx);
-            let offset = fallback
-                .table
-                .bucket_controls(range.start, range.len())
+            let controls = unsafe {
+                std::slice::from_raw_parts(
+                    fallback.table.group_data_ptr(0).add(range.start),
+                    range.len(),
+                )
+            };
+            let offset = controls
                 .find_first_free()
                 .expect("rebuilt fallback bucket should have free space");
             let slot_idx = range.start + offset;
@@ -1457,9 +1458,8 @@ where
     fn rebuild_primary_group_summary(&mut self, group_idx: usize) {
         let primary = &mut self.special.primary;
         primary.group_summaries[group_idx] = 0;
-        let group_start = RawTable::<Entry<K, V>, META_STRIDE>::group_start(group_idx);
-        let group_len = primary.table.group_len(group_idx);
-        for slot_idx in group_start..group_start + group_len {
+        let group_start = group_idx * GROUP_SIZE;
+        for slot_idx in group_start..group_start + GROUP_SIZE {
             let control = primary.table.control_at(slot_idx);
             if control.is_occupied() {
                 primary.group_summaries[group_idx] |= fingerprint_bit(control);
@@ -1480,8 +1480,8 @@ where
         }
     }
 
-    fn rebuild_bucket_summary<const S: usize>(
-        table: &RawTable<Entry<K, V>, S>,
+    fn rebuild_bucket_summary(
+        table: &RawTable<Entry<K, V>>,
         range: std::ops::Range<usize>,
         summary: &mut u128,
     ) {
