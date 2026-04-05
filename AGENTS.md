@@ -15,8 +15,10 @@ cargo bench                                 # Run all benchmarks
 
 Two Criterion benchmark suites compare `ElasticHashMap`, `FunnelHashMap`, and `std::HashMap`:
 
-- **`cargo bench --bench throughput`** — end-to-end operations: insert, get (hit/miss/mixed/tiny), delete-heavy, resize-heavy
+- **`cargo bench --bench benchmarks`** — throughput (insert, get hit/miss/mixed/tiny, delete-heavy, resize-heavy) and per-lookup latency at varying map sizes
 - **`cargo bench --bench internal_paths`** — hot-path internals: control-byte scanning, miss-path rejection, bucket lookup with tombstones, delete churn, resize cost
+
+To run only a subset: `cargo bench --bench benchmarks -- "get_hit_latency"` (Criterion name filter).
 
 Criterion auto-compares against the previous run. **Always read results from the JSON files** — terminal output gets truncated and mixes runs. Parse `target/criterion/` after a single `cargo bench` invocation:
 

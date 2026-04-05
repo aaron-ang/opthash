@@ -1,13 +1,13 @@
 # opthash
 
-Rust implementations of **Elastic Hashing** and **Funnel Hashing** from [_Optimal Bounds for Open Addressing Without Reordering_](https://arxiv.org/abs/2501.02305) (Farach-Colton, Krapivin, Kuszmaul, 2025).
+Rust implementations of **Elastic Hashing** and **Funnel Hashing** from [*Optimal Bounds for Open Addressing Without Reordering*](https://arxiv.org/abs/2501.02305) (Farach-Colton, Krapivin, Kuszmaul, 2025).
 
 Both are open-addressing hash maps that achieve optimal expected probe complexity without reordering elements after insertion.
 
 ## Data Structures
 
-- **`ElasticHashMap<K, V>`** — Multi-level table with geometrically halving levels. Each level is a `RawTable` plus probe budgets, group steps, and tombstone accounting.
-- **`FunnelHashMap<K, V>`** — Multi-level bucketed table with per-bucket metadata and a split special array: `primary` (group-probed) plus `fallback` (two-choice buckets).
+* **`ElasticHashMap<K, V>`** — Multi-level table with geometrically halving levels. Each level is a `RawTable` plus probe budgets, group steps, and tombstone accounting.
+* **`FunnelHashMap<K, V>`** — Multi-level bucketed table with per-bucket metadata and a split special array: `primary` (group-probed) plus `fallback` (two-choice buckets).
 
 Both support `insert`, `get`, `get_mut`, `contains_key`, `remove`, and `clear`. Maps start with zero allocation (`new()`) and grow dynamically on demand. Advanced tuning is available through `ElasticOptions`, `FunnelOptions`, and `with_options(...)`.
 
@@ -40,127 +40,95 @@ assert_eq!(tuned.len(), 0);
 ```text
 ElasticHashMap
 ==============
+RawTable stride = META_STRIDE (32)
 
 levels: Vec<Level>
 
-Level 0
-  controls [fp][  ][fp][xx][  ][fp][  ][  ] ...
-  slots    [kv][  ][kv][kv][  ][kv][  ][  ] ...
-  meta     len
-           tombstones
-           half_reserve_slot_threshold
-           limited_probe_budgets
-           group_steps
-           salt
+  fp = fingerprint (7-bit control byte), kv = key-value entry,
+  __ = empty slot, xx = tombstone, L/T/F = live count / tombstone count / full flag
 
-Level 1
-  controls [  ][fp][  ][  ][fp] ...
-  slots    [  ][kv][  ][  ][kv] ...
-  meta     len
-           tombstones
-           half_reserve_slot_threshold
-           limited_probe_budgets
-           group_steps
-           salt
+  Each group is a 32-byte block: 16 control bytes + 3 metadata bytes + padding.
+  Controls and GroupMeta share one cache line, halving misses per probe.
 
-Level 2
-  controls [fp][  ][  ] ...
-  slots    [kv][  ][  ] ...
-  meta     len
-           tombstones
-           half_reserve_slot_threshold
-           limited_probe_budgets
-           group_steps
-           salt
+  Level 0
+    data_ptr ─┬─ group 0 ─────────────────────────────────────────┐
+              │  [fp][fp][__][xx][__][fp][__][__]...[__][fp] [L][T][F] ...pad
+              │   └── 16 control bytes (SIMD scan) ──┘       │   │  │
+              │                                         live ┘   │  └ full
+              ├─ group 1                            tombstones ──┘
+              │  [fp][__][__][__][fp][__][fp][__]...[fp][__] [L][T][F] ...pad
+              └─ ...
+    slots_ptr   [kv][kv][  ][kv][  ][kv][  ][  ] ...
 
-table-wide
-  len
-  capacity
-  max_insertions
-  reserve_fraction
-  probe_scale
-  batch_plan
-  current_batch_index
-  batch_remaining
-  max_populated_level
-  hash_builder
+    per-level   len, tombstones, half_reserve_slot_threshold
+                limited_probe_budgets, group_steps, salt
+
+  Level 1  (same block layout, geometrically halved capacity)
+  Level 2  ...
+
+  table-wide
+    len, capacity, max_insertions, reserve_fraction, probe_scale
+    batch_plan, current_batch_index, batch_remaining
+    max_populated_level, hash_builder
 
 
 FunnelHashMap
 =============
 
 levels: Vec<BucketLevel>
+  RawTable stride = COMPACT_STRIDE (16) — flat control bytes, no embedded meta.
 
-Level 0
-  bucket 0  controls [fp][fp][  ][  ]
-            slots    [kv][kv][  ][  ]
-            meta     BucketMeta {
-                       summary,
-                       live_mask,
-                       search_len,
-                       live,
-                       tombstones,
-                     }
-  bucket 1  controls [fp][  ][  ][  ]
-            slots    [kv][  ][  ][  ]
-            meta     BucketMeta { ... }
+  Level 0
+    data_ptr    [fp][fp][__][__] [fp][__][__][__] ...
+                 └── bucket 0 ──┘ └── bucket 1 ──┘
+    slots_ptr   [kv][kv][  ][  ] [kv][  ][  ][  ] ...
+    bucket_meta BucketMeta { summary, live_mask, search_len, live, tombstones }
 
-Level 1
-  bucket 0  controls [fp][  ][  ][  ]
-            slots    [kv][  ][  ][  ]
-            meta     BucketMeta { ... }
+  Level 1  (same layout, smaller buckets)
   ...
 
 special: SpecialArray
-  primary  (paper B)
-    controls [fp][  ][fp][  ] ...
-    slots    [kv][  ][kv][  ] ...
-    meta     len
-             group_summaries
-             group_tombstones
-             group_steps
+
+  primary (paper B)
+    RawTable stride = META_STRIDE (32) — same block layout as elastic.
+    data_ptr ── group 0: [fp][__][fp][__]...[__][fp] [L][T][F] ...pad
+    slots_ptr   [kv][  ][kv][  ] ...
+    per-primary len, group_summaries, group_tombstones, group_steps
 
   fallback (paper C)
-    bucket 0 controls [fp][  ]
-             slots    [kv][  ]
-    bucket 1 controls [  ][fp]
-             slots    [  ][kv]
-    meta      len
-              bucket_size
-              bucket_count
-              bucket_summaries
-              bucket_live
-              bucket_tombstones
+    RawTable stride = COMPACT_STRIDE (16) — flat control bytes.
+    data_ptr    [fp][__] [__][fp] ...
+                 └─ b0 ─┘ └─ b1 ─┘
+    slots_ptr   [kv][  ] [  ][kv] ...
+    per-fallback len, bucket_size, bucket_count
+                 bucket_summaries, bucket_live, bucket_tombstones
 
-table-wide
-  len
-  capacity
-  max_insertions
-  reserve_fraction
-  primary_probe_limit
-  max_populated_level
-  hash_builder
+  table-wide
+    len, capacity, max_insertions, reserve_fraction
+    primary_probe_limit, max_populated_level, hash_builder
 ```
 
 ## Benchmarks
 
-Current Criterion throughput results on Apple M1 (aarch64, NEON SIMD), normalized so `std::HashMap` is the `1.0x` baseline:
+All benchmarks on Apple M1 (aarch64, NEON SIMD) via Criterion. `std::HashMap` uses the same `RandomState` (SipHash) hasher as both custom maps.
 
-Core workloads:
+### Throughput
 
-![Core benchmark speedup chart](assets/benchmark-speedup-core.svg)
+Speedup relative to `std::HashMap` (1.0x baseline). Higher is better:
 
-Secondary workloads:
+![Throughput speedup chart](assets/benchmark-speedup.svg)
 
-![Secondary benchmark speedup chart](assets/benchmark-speedup-secondary.svg)
+### Latency
 
-Regenerate the benchmark chart:
+Per-lookup latency for a single `get()` call at different map sizes (100 to 10M entries). As the working set exceeds L2 cache, elastic hashing's random probing converges toward hashbrown's linear probing — at 10M entries elastic is only 1.15x slower:
+
+![Latency chart](assets/benchmark-latency.svg)
+
+### Running benchmarks
 
 ```bash
-cargo bench --bench throughput
-uv venv
-uv pip install -r requirements.txt
-uv run scripts/generate_speedup_chart.py
+cargo bench --bench benchmarks          # run all throughput + latency benchmarks
+uv run scripts/generate_speedup_chart.py  # regenerate charts from Criterion JSON
 ```
 
 Criterion also generates an interactive HTML report at `target/criterion/report/index.html`.
