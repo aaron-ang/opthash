@@ -1,13 +1,13 @@
 # opthash
 
-Rust implementations of **Elastic Hashing** and **Funnel Hashing** from [_Optimal Bounds for Open Addressing Without Reordering_](https://arxiv.org/abs/2501.02305) (Farach-Colton, Krapivin, Kuszmaul, 2025).
+Rust implementations of **Elastic Hashing** and **Funnel Hashing** from [*Optimal Bounds for Open Addressing Without Reordering*](https://arxiv.org/abs/2501.02305) (Farach-Colton, Krapivin, Kuszmaul, 2025).
 
 Both are open-addressing hash maps that achieve optimal expected probe complexity without reordering elements after insertion.
 
 ## Data Structures
 
-- **`ElasticHashMap<K, V>`** — Multi-level table with geometrically halving levels. Each level is a `RawTable` plus probe budgets, group steps, and tombstone accounting.
-- **`FunnelHashMap<K, V>`** — Multi-level bucketed table with per-bucket metadata and a split special array: `primary` (group-probed) plus `fallback` (two-choice buckets).
+* **`ElasticHashMap<K, V>`** — Multi-level table with geometrically halving levels. Each level is a `RawTable` plus probe budgets, group steps, and tombstone accounting.
+* **`FunnelHashMap<K, V>`** — Multi-level bucketed table with per-bucket metadata and a split special array: `primary` (group-probed) plus `fallback` (two-choice buckets).
 
 Both support `insert`, `get`, `get_mut`, `contains_key`, `remove`, and `clear`. Maps start with zero allocation (`new()`) and grow dynamically on demand. Advanced tuning is available through `ElasticOptions`, `FunnelOptions`, and `with_options(...)`.
 
@@ -38,129 +38,88 @@ assert_eq!(tuned.len(), 0);
 ### Layout Sketch
 
 ```text
+RawTable (shared by both maps)
+==============================
+
+  Single allocation per table, slots first:
+
+    data_ptr ─► [kv][kv][  ][kv][  ][kv]... [pad] [fp][fp][__][xx][__][fp]...
+                 └─── slots (T-aligned) ───┘        └── controls (16-aligned) ──┘
+                                                         ▲ ctrl_offset
+
+  fp = fingerprint (7-bit control byte), kv = key-value entry
+  __ = empty slot, xx = tombstone
+
+  No per-group metadata — occupancy is derived from SIMD scans of the
+  control bytes (eq_mask_16 for fingerprints, free_mask_16 for free slots).
+
+
 ElasticHashMap
 ==============
 
-levels: Vec<Level>
+  levels: Vec<Level>
 
-Level 0
-  controls [fp][  ][fp][xx][  ][fp][  ][  ] ...
-  slots    [kv][  ][kv][kv][  ][kv][  ][  ] ...
-  meta     len
-           tombstones
-           half_reserve_slot_threshold
-           limited_probe_budgets
-           group_steps
-           salt
+    Level 0   RawTable (largest, ~half of total capacity)
+    Level 1   RawTable (geometrically halved)
+    Level 2   ...
 
-Level 1
-  controls [  ][fp][  ][  ][fp] ...
-  slots    [  ][kv][  ][  ][kv] ...
-  meta     len
-           tombstones
-           half_reserve_slot_threshold
-           limited_probe_budgets
-           group_steps
-           salt
+    per-level   len, tombstones, half_reserve_slot_threshold
+                limited_probe_budgets, group_steps, salt
 
-Level 2
-  controls [fp][  ][  ] ...
-  slots    [kv][  ][  ] ...
-  meta     len
-           tombstones
-           half_reserve_slot_threshold
-           limited_probe_budgets
-           group_steps
-           salt
-
-table-wide
-  len
-  capacity
-  max_insertions
-  reserve_fraction
-  probe_scale
-  batch_plan
-  current_batch_index
-  batch_remaining
-  max_populated_level
-  hash_builder
+    table-wide  len, capacity, max_insertions, reserve_fraction, probe_scale
+                batch_plan, current_batch_index, batch_remaining
+                max_populated_level, hash_builder
 
 
 FunnelHashMap
 =============
 
-levels: Vec<BucketLevel>
+  levels: Vec<BucketLevel>
 
-Level 0
-  bucket 0  controls [fp][fp][  ][  ]
-            slots    [kv][kv][  ][  ]
-            meta     BucketMeta {
-                       summary,
-                       live_mask,
-                       search_len,
-                       live,
-                       tombstones,
-                     }
-  bucket 1  controls [fp][  ][  ][  ]
-            slots    [kv][  ][  ][  ]
-            meta     BucketMeta { ... }
+    Level 0
+      RawTable   [kv kv __ __ | kv __ __ __]... [fp fp __ __ | fp __ __ __]...
+                   └─ bucket 0 ─┘ └─ bucket 1 ─┘
+      bucket_meta  BucketMeta { summary, live_mask, search_len, live, tombstones }
 
-Level 1
-  bucket 0  controls [fp][  ][  ][  ]
-            slots    [kv][  ][  ][  ]
-            meta     BucketMeta { ... }
-  ...
+    Level 1  (same layout, smaller buckets)
+    ...
 
-special: SpecialArray
-  primary  (paper B)
-    controls [fp][  ][fp][  ] ...
-    slots    [kv][  ][kv][  ] ...
-    meta     len
-             group_summaries
-             group_tombstones
-             group_steps
+  special: SpecialArray
 
-  fallback (paper C)
-    bucket 0 controls [fp][  ]
-             slots    [kv][  ]
-    bucket 1 controls [  ][fp]
-             slots    [  ][kv]
-    meta      len
-              bucket_size
-              bucket_count
-              bucket_summaries
-              bucket_live
-              bucket_tombstones
+    primary (paper B)
+      RawTable     group-probed like elastic
+      per-primary  len, group_summaries, group_tombstones, group_steps
 
-table-wide
-  len
-  capacity
-  max_insertions
-  reserve_fraction
-  primary_probe_limit
-  max_populated_level
-  hash_builder
+    fallback (paper C)
+      RawTable     two-choice bucketed
+      per-fallback len, bucket_size, bucket_count
+                   bucket_summaries, bucket_live, bucket_tombstones
+
+    table-wide  len, capacity, max_insertions, reserve_fraction
+                primary_probe_limit, max_populated_level, hash_builder
 ```
 
 ## Benchmarks
 
-Current Criterion throughput results on Apple M1 (aarch64, NEON SIMD), normalized so `std::HashMap` is the `1.0x` baseline:
+All benchmarks on Apple M1 (aarch64, NEON SIMD) via Criterion. `std::HashMap` uses the same `RandomState` (SipHash) hasher as both custom maps.
 
-Core workloads:
+### Throughput
 
-![Core benchmark speedup chart](assets/benchmark-speedup-core.svg)
+Speedup relative to `std::HashMap` (1.0x baseline). Higher is better:
 
-Secondary workloads:
+![Throughput speedup chart](assets/benchmark-speedup.svg)
 
-![Secondary benchmark speedup chart](assets/benchmark-speedup-secondary.svg)
+### Latency
 
-Regenerate the benchmark chart:
+Per-lookup latency for a single `get()` call at different map sizes (100 to 10M entries). As the working set exceeds L2 cache, elastic hashing's random probing converges toward hashbrown's linear probing — at 10M entries elastic is only 1.15x slower:
+
+![Latency chart](assets/benchmark-latency.svg)
+
+### Running benchmarks
 
 ```bash
-cargo bench --bench throughput
-uv venv
-uv pip install -r requirements.txt
-uv run scripts/generate_speedup_chart.py
+cargo bench --bench benchmarks            # run all throughput + latency benchmarks
+uv run scripts/generate_speedup_chart.py  # regenerate charts from Criterion JSON
 ```
 
 Criterion also generates an interactive HTML report at `target/criterion/report/index.html`.
