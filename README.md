@@ -16,23 +16,25 @@ Both support `insert`, `get`, `get_mut`, `contains_key`, `remove`, and `clear`. 
 ```rust
 use opthash::{ElasticHashMap, ElasticOptions, FunnelHashMap, FunnelOptions};
 
-let mut map = FunnelHashMap::new();
+let mut map = ElasticHashMap::new();
 map.insert("key", 42);
 assert_eq!(map.get("key"), Some(&42));
 
-let tuned_funnel = FunnelHashMap::<u64, u64>::with_options(FunnelOptions {
-    capacity: 1024,
-    reserve_fraction: 0.10,
-    primary_probe_limit: Some(8),
-});
-assert_eq!(tuned_funnel.len(), 0);
-
-let tuned = ElasticHashMap::<u64, u64>::with_options(ElasticOptions {
+let mut map = ElasticHashMap::with_options(ElasticOptions {
     capacity: 1024,
     reserve_fraction: 0.10,
     probe_scale: 12.0,
 });
-assert_eq!(tuned.len(), 0);
+map.insert("key", 42);
+assert_eq!(map.get("key"), Some(&42));
+
+let mut map = FunnelHashMap::with_options(FunnelOptions {
+    capacity: 1024,
+    reserve_fraction: 0.10,
+    primary_probe_limit: Some(8),
+});
+map.insert("key", 42);
+assert_eq!(map.get("key"), Some(&42));
 ```
 
 ### Layout Sketch
@@ -41,17 +43,17 @@ assert_eq!(tuned.len(), 0);
 RawTable (shared by both maps)
 ==============================
 
-  Single allocation per table, slots first:
+  fp = fingerprint (7-bit control byte)
+  kv = key-value entry, __ = empty, xx = tombstone
 
-    data_ptr ─► [kv][kv][  ][kv][  ][kv]... [pad] [fp][fp][__][xx][__][fp]...
-                 └─── slots (T-aligned) ───┘        └── controls (16-aligned) ──┘
-                                                         ▲ ctrl_offset
+  Single allocation, slots first, controls at the end:
 
-  fp = fingerprint (7-bit control byte), kv = key-value entry
-  __ = empty slot, xx = tombstone
+  data_ptr ► [kv][kv][  ][kv][  ][kv]... [pad] [fp][fp][__][xx][__][fp]...
+             └──── slots (T-aligned) ────┘     └─ controls (16-aligned) ──┘
+                                               ▲ ctrl_offset
 
-  No per-group metadata — occupancy is derived from SIMD scans of the
-  control bytes (eq_mask_16 for fingerprints, free_mask_16 for free slots).
+  No per-group metadata. Occupancy is derived from SIMD scans of the control bytes
+  (eq_mask_16 for fingerprints, free_mask_16 for free slots).
 
 
 ElasticHashMap
@@ -59,16 +61,16 @@ ElasticHashMap
 
   levels: Vec<Level>
 
-    Level 0   RawTable (largest, ~half of total capacity)
-    Level 1   RawTable (geometrically halved)
-    Level 2   ...
+    Level 0    RawTable  (largest, ~half of total capacity)
+    Level 1    RawTable  (geometrically halved)
+    Level 2    ...
 
-    per-level   len, tombstones, half_reserve_slot_threshold
-                limited_probe_budgets, group_steps, salt
+    per-level  len, tombstones, half_reserve_slot_threshold,
+               limited_probe_budgets, group_steps, salt
 
-    table-wide  len, capacity, max_insertions, reserve_fraction, probe_scale
-                batch_plan, current_batch_index, batch_remaining
-                max_populated_level, hash_builder
+  table-wide   len, capacity, max_insertions, reserve_fraction,
+               probe_scale, batch_plan, current_batch_index,
+               batch_remaining, max_populated_level, hash_builder
 
 
 FunnelHashMap
@@ -77,26 +79,25 @@ FunnelHashMap
   levels: Vec<BucketLevel>
 
     Level 0
-      RawTable   [kv kv __ __ | kv __ __ __]... [fp fp __ __ | fp __ __ __]...
-                   └─ bucket 0 ─┘ └─ bucket 1 ─┘
-      bucket_meta  BucketMeta { summary, live_mask, search_len, live, tombstones }
+      slots:     kv kv __ __ ... kv kv __ __ ... kv ...
+      controls:  fp fp __ __ ... fp fp __ __ ... fp ...
+                 └── bucket 0 ──┘└── bucket 1 ──┘
 
-    Level 1  (same layout, smaller buckets)
+    Level 1    (same layout, smaller buckets)
     ...
+
+    per-level  len, tombstones, bucket_size, bucket_count
 
   special: SpecialArray
 
-    primary (paper B)
-      RawTable     group-probed like elastic
-      per-primary  len, group_summaries, group_tombstones, group_steps
+    primary    RawTable, group-probed (like elastic)
+    (paper B)  len, group_summaries, group_tombstones, group_steps
 
-    fallback (paper C)
-      RawTable     two-choice bucketed
-      per-fallback len, bucket_size, bucket_count
-                   bucket_summaries, bucket_live, bucket_tombstones
+    fallback   RawTable, two-choice bucketed
+    (paper C)  len, tombstones, bucket_size, bucket_count
 
-    table-wide  len, capacity, max_insertions, reserve_fraction
-                primary_probe_limit, max_populated_level, hash_builder
+  table-wide   len, capacity, max_insertions, reserve_fraction,
+               primary_probe_limit, max_populated_level, hash_builder
 ```
 
 ## Benchmarks
