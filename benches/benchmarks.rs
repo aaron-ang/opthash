@@ -410,6 +410,57 @@ fn bench_mixed_lookup_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+const LATENCY_SIZES: &[usize] = &[100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
+
+fn bench_get_hit_latency(c: &mut Criterion) {
+    for &size in LATENCY_SIZES {
+        let pairs = make_pairs(size);
+        let query_keys: Vec<u64> = (0..size).map(|idx| pairs[idx].0).collect();
+
+        let label = if size >= 1_000_000 {
+            format!("{}M", size / 1_000_000)
+        } else if size >= 1_000 {
+            format!("{}K", size / 1_000)
+        } else {
+            format!("{size}")
+        };
+
+        let mut group = c.benchmark_group(format!("get_hit_latency_{label}"));
+
+        group.bench_function("std", |b| {
+            let map = build_std_map(&pairs);
+            let mut i = 0;
+            b.iter(|| {
+                let key = &query_keys[i % size];
+                i = i.wrapping_add(1);
+                black_box(map.get(black_box(key)))
+            });
+        });
+
+        group.bench_function("elastic", |b| {
+            let map = build_elastic_map(&pairs);
+            let mut i = 0;
+            b.iter(|| {
+                let key = &query_keys[i % size];
+                i = i.wrapping_add(1);
+                black_box(map.get(black_box(key)))
+            });
+        });
+
+        group.bench_function("funnel", |b| {
+            let map = build_funnel_map(&pairs);
+            let mut i = 0;
+            b.iter(|| {
+                let key = &query_keys[i % size];
+                i = i.wrapping_add(1);
+                black_box(map.get(black_box(key)))
+            });
+        });
+
+        group.finish();
+    }
+}
+
 criterion_group!(
     name = benches;
     config = Criterion::default();
@@ -420,6 +471,7 @@ criterion_group!(
         bench_tiny_lookup_throughput,
         bench_delete_heavy_throughput,
         bench_resize_heavy_throughput,
-        bench_mixed_lookup_throughput
+        bench_mixed_lookup_throughput,
+        bench_get_hit_latency
 );
 criterion_main!(benches);
