@@ -5,11 +5,11 @@ use core::arch::aarch64::{
 #[cfg(target_arch = "x86_64")]
 use std::sync::OnceLock;
 
-pub const CONTROL_GROUP_SIZE: usize = 16;
-pub const CTRL_EMPTY: u8 = 0;
-pub const CTRL_TOMBSTONE: u8 = 0x80;
+pub(crate) const CONTROL_GROUP_SIZE: usize = 16;
+pub(crate) const CTRL_EMPTY: u8 = 0;
+pub(crate) const CTRL_TOMBSTONE: u8 = 0x80;
 
-pub trait ControlByte {
+pub(crate) trait ControlByte {
     fn is_occupied(&self) -> bool;
     fn is_free(&self) -> bool;
 }
@@ -30,7 +30,7 @@ impl ControlByte for u8 {
 // ControlOps — namespace for control-byte static methods
 // ---------------------------------------------------------------------------
 
-pub struct ControlOps;
+pub(crate) struct ControlOps;
 
 impl ControlOps {
     /// # Panics
@@ -38,53 +38,20 @@ impl ControlOps {
     /// Panics if the masked 7-bit fingerprint cannot be represented as `u8`.
     #[inline]
     #[must_use]
-    pub fn control_fingerprint(hash: u64) -> u8 {
+    pub(crate) fn control_fingerprint(hash: u64) -> u8 {
         let high = u8::try_from((hash >> 57) & 0x7F).expect("7-bit fingerprint fits in u8");
         high.max(1)
     }
 
     #[inline]
     #[must_use]
-    pub fn fingerprint_bit(fingerprint: u8) -> u128 {
+    pub(crate) fn fingerprint_bit(fingerprint: u8) -> u128 {
         1u128 << u32::from(fingerprint.saturating_sub(1))
     }
 
     #[inline]
     #[must_use]
-    pub fn find_first_free_in_controls(controls: &[u8]) -> Option<usize> {
-        if controls.len() < CONTROL_GROUP_SIZE {
-            return controls
-                .iter()
-                .position(|&c| c == CTRL_EMPTY || c == CTRL_TOMBSTONE);
-        }
-
-        let wide = Self::preferred_group_width();
-        let mut index = 0;
-        while wide > CONTROL_GROUP_SIZE && index + wide <= controls.len() {
-            let mask = Self::control_match_free_group(&controls[index..index + wide]);
-            if mask != 0 {
-                return Some(index + mask.trailing_zeros() as usize);
-            }
-            index += wide;
-        }
-
-        while index + CONTROL_GROUP_SIZE <= controls.len() {
-            let mask = Self::control_match_free_group(&controls[index..index + CONTROL_GROUP_SIZE]);
-            if mask != 0 {
-                return Some(index + mask.trailing_zeros() as usize);
-            }
-            index += CONTROL_GROUP_SIZE;
-        }
-
-        controls[index..]
-            .iter()
-            .position(|&c| c == CTRL_EMPTY || c == CTRL_TOMBSTONE)
-            .map(|offset| index + offset)
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn find_next_fingerprint_in_controls(
+    pub(crate) fn find_next_fingerprint_in_controls(
         controls: &[u8],
         fingerprint: u8,
         start: usize,
@@ -154,23 +121,10 @@ impl ControlOps {
     /// Panics if `chunk` is not 16 or 32 bytes long.
     #[inline]
     #[must_use]
-    pub fn control_match_fingerprint_group(chunk: &[u8], target: u8) -> u32 {
+    pub(crate) fn control_match_fingerprint_group(chunk: &[u8], target: u8) -> u32 {
         match chunk.len() {
             CONTROL_GROUP_SIZE => u32::from(unsafe { eq_mask_16(chunk.as_ptr(), target) }),
             32 => unsafe { eq_mask_32(chunk.as_ptr(), target) },
-            _ => panic!("group matching requires 16 or 32 byte chunks"),
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics if `chunk` is not 16 or 32 bytes long.
-    #[inline]
-    #[must_use]
-    pub fn control_match_free_group(chunk: &[u8]) -> u32 {
-        match chunk.len() {
-            CONTROL_GROUP_SIZE => u32::from(unsafe { free_mask_16(chunk.as_ptr()) }),
-            32 => unsafe { free_mask_32(chunk.as_ptr()) },
             _ => panic!("group matching requires 16 or 32 byte chunks"),
         }
     }
@@ -180,7 +134,7 @@ impl ControlOps {
 // Probe helpers (ProbeOps)
 // ---------------------------------------------------------------------------
 
-pub struct ProbeOps;
+pub(crate) struct ProbeOps;
 
 impl ProbeOps {
     #[allow(
@@ -190,7 +144,7 @@ impl ProbeOps {
     )]
     #[inline]
     #[must_use]
-    pub fn log_log_probe_limit(capacity: usize) -> usize {
+    pub(crate) fn log_log_probe_limit(capacity: usize) -> usize {
         let n = capacity.max(4) as f64;
         n.log2().max(2.0).log2().ceil().max(1.0) as usize
     }
@@ -198,13 +152,13 @@ impl ProbeOps {
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
     #[must_use]
-    pub fn hash_to_usize(hash: u64) -> usize {
+    pub(crate) fn hash_to_usize(hash: u64) -> usize {
         hash as usize
     }
 
     #[inline]
     #[must_use]
-    pub fn greatest_common_divisor(mut a: usize, mut b: usize) -> usize {
+    pub(crate) fn greatest_common_divisor(mut a: usize, mut b: usize) -> usize {
         while b != 0 {
             let next = a % b;
             a = b;
@@ -215,7 +169,7 @@ impl ProbeOps {
 
     #[inline]
     #[must_use]
-    pub fn advance_wrapping_index(index: usize, step: usize, len: usize) -> usize {
+    pub(crate) fn advance_wrapping_index(index: usize, step: usize, len: usize) -> usize {
         // step < len is guaranteed by build_group_steps, so index + step < 2*len.
         // A conditional subtract avoids the expensive division that modulo requires.
         if len == 0 {
@@ -226,7 +180,7 @@ impl ProbeOps {
     }
 
     #[must_use]
-    pub fn build_group_steps(group_count: usize) -> Box<[usize]> {
+    pub(crate) fn build_group_steps(group_count: usize) -> Box<[usize]> {
         if group_count <= 1 {
             return Box::new([1]);
         }
@@ -253,12 +207,12 @@ impl ProbeOps {
 /// `ptr` must be valid to read `CONTROL_GROUP_SIZE` bytes.
 #[must_use]
 #[cfg(target_arch = "aarch64")]
-pub unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> u16 {
+pub(crate) unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> u16 {
     unsafe { eq_mask_16_neon(ptr, target) }
 }
 
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> u16 {
+pub(crate) unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> u16 {
     unsafe { eq_mask_16_sse2(ptr, target) }
 }
 
@@ -267,12 +221,12 @@ pub unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> u16 {
 /// `ptr` must be valid to read `CONTROL_GROUP_SIZE` bytes.
 #[must_use]
 #[cfg(target_arch = "aarch64")]
-pub unsafe fn free_mask_16(ptr: *const u8) -> u16 {
+pub(crate) unsafe fn free_mask_16(ptr: *const u8) -> u16 {
     unsafe { free_mask_16_neon(ptr) }
 }
 
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn free_mask_16(ptr: *const u8) -> u16 {
+pub(crate) unsafe fn free_mask_16(ptr: *const u8) -> u16 {
     unsafe { free_mask_16_sse2(ptr) }
 }
 
@@ -280,7 +234,7 @@ pub unsafe fn free_mask_16(ptr: *const u8) -> u16 {
 ///
 /// `ptr` must be valid to read 32 bytes.
 #[must_use]
-pub unsafe fn eq_mask_32(ptr: *const u8, target: u8) -> u32 {
+pub(crate) unsafe fn eq_mask_32(ptr: *const u8, target: u8) -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") {
@@ -293,23 +247,6 @@ pub unsafe fn eq_mask_32(ptr: *const u8, target: u8) -> u32 {
     lo | (hi << CONTROL_GROUP_SIZE)
 }
 
-/// # Safety
-///
-/// `ptr` must be valid to read 32 bytes.
-#[must_use]
-pub unsafe fn free_mask_32(ptr: *const u8) -> u32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            unsafe { return free_mask_32_avx2(ptr) };
-        }
-    }
-
-    let lo = u32::from(unsafe { free_mask_16(ptr) });
-    let hi = u32::from(unsafe { free_mask_16(ptr.add(CONTROL_GROUP_SIZE)) });
-    lo | (hi << CONTROL_GROUP_SIZE)
-}
-
 // ---------------------------------------------------------------------------
 // Prefetch
 // ---------------------------------------------------------------------------
@@ -319,7 +256,7 @@ pub unsafe fn free_mask_32(ptr: *const u8) -> u32 {
 /// `ptr` must be a valid, aligned pointer to readable memory (or null, in which
 /// case the prefetch is silently ignored by the hardware).
 #[inline]
-pub unsafe fn prefetch_read(ptr: *const u8) {
+pub(crate) unsafe fn prefetch_read(ptr: *const u8) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!("prfm pldl1keep, [{}]", in(reg) ptr, options(nostack, preserves_flags));
@@ -415,22 +352,6 @@ unsafe fn eq_mask_32_avx2(ptr: *const u8, target: u8) -> u32 {
         #[allow(clippy::cast_sign_loss)]
         {
             _mm256_movemask_epi8(cmp) as u32
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn free_mask_32_avx2(ptr: *const u8) -> u32 {
-    use std::arch::x86_64::*;
-    unsafe {
-        let data = _mm256_loadu_si256(ptr.cast::<__m256i>());
-        let empty = _mm256_cmpeq_epi8(data, _mm256_setzero_si256());
-        let tombstone = _mm256_cmpeq_epi8(data, _mm256_set1_epi8(CTRL_TOMBSTONE as i8));
-        let free = _mm256_or_si256(empty, tombstone);
-        #[allow(clippy::cast_sign_loss)]
-        {
-            _mm256_movemask_epi8(free) as u32
         }
     }
 }

@@ -270,12 +270,7 @@ name = "opthash"
 version = "0.2.0"
 dependencies = [
  "criterion",
- "opthash-internal",
 ]
-
-[[package]]
-name = "opthash-internal"
-version = "0.2.0"
 
 [[package]]
 name = "page_size"

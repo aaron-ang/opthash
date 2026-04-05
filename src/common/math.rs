@@ -1,7 +1,7 @@
 use super::config::{DEFAULT_RESERVE_FRACTION, MAX_RESERVE_FRACTION, MIN_RESERVE_FRACTION};
 use super::layout::GROUP_SIZE;
 
-pub(crate) use opthash_internal::ProbeOps;
+pub(crate) use super::simd::ProbeOps;
 
 #[allow(clippy::cast_precision_loss)]
 #[inline]

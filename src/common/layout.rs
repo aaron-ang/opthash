@@ -2,7 +2,7 @@ use std::alloc::{self, Layout};
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 
-use opthash_internal::{eq_mask_16, free_mask_16};
+use super::simd::{eq_mask_16, free_mask_16};
 
 use super::control::CTRL_EMPTY;
 use super::math::round_up_to_group;

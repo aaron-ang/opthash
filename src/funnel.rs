@@ -2,7 +2,7 @@ use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
-use opthash_internal::{ProbeOps, prefetch_read};
+use crate::common::simd::{ProbeOps, prefetch_read};
 
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
