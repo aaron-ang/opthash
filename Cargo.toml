@@ -30,7 +30,7 @@ opthash-internal = { path = "opthash-internal", version = "0.1.0" }
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
-name = "throughput"
+name = "benchmarks"
 harness = false
 
 [[bench]]
