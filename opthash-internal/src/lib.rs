@@ -41,7 +41,7 @@ impl ControlOps {
         }
 
         let wide = Self::preferred_group_width();
-        let mut index = 0usize;
+        let mut index = 0;
         while wide > CONTROL_GROUP_SIZE && index + wide <= controls.len() {
             let mask = Self::control_match_free_group(&controls[index..index + wide]);
             if mask != 0 {
