@@ -1,14 +1,10 @@
 # Benchmarking
 
-This project uses Criterion to compare:
+Two bench targets compare `std::collections::HashMap`, `opthash::ElasticHashMap`, `opthash::FunnelHashMap`. Shared fixtures live in `benches/common.rs`.
 
-- `std::collections::HashMap`
-- `opthash::ElasticHashMap`
-- `opthash::FunnelHashMap`
+## `benches/speedup.rs` — throughput + mean latency (Criterion)
 
-## Throughput workloads
-
-`benches/throughput.rs` measures:
+Throughput workloads:
 
 1. `insert_throughput`
 2. `get_hit_throughput`
@@ -18,34 +14,40 @@ This project uses Criterion to compare:
 6. `resize_heavy_throughput`
 7. `mixed_lookup_throughput`
 
-The small-map workload is meant to exercise the internal tiny-table engine. The delete-heavy and resize-heavy workloads are there to expose tombstone handling and growth costs instead of only steady-state inserts.
+The tiny-map workload exercises the internal tiny-table engine. Delete-heavy and resize-heavy expose tombstone handling and growth costs instead of only steady-state inserts.
 
-## Internal-path workloads
+Latency workload: `get_hit_latency_<size>` for sizes 100, 1K, 10K, 100K, 1M, 10M — Criterion-mean per-lookup time.
 
-`benches/internal_paths.rs` measures narrower hot paths:
-
-1. `internal_control_group_scan`
-2. `internal_elastic_miss_path`
-3. `internal_funnel_miss_path`
-4. `internal_resize_cost`
-
-`internal_control_group_scan` focuses on the packed control-byte scanning layer directly. The two miss-path benchmarks isolate lookup rejection behavior in the elastic and funnel layouts. `internal_resize_cost` measures repeated growth from a deliberately small initial capacity.
-
-## Run
+Run:
 
 ```bash
-cargo bench --bench throughput
-cargo bench --bench internal_paths
+cargo bench --bench speedup
+cargo bench --bench speedup -- "get_hit"          # Criterion name filter
 ```
 
-## Visual reports
+## `benches/latency.rs` — tail-latency histograms (hdrhistogram)
 
-Criterion writes HTML reports under:
+Captures per-operation latency distributions (p50/p90/p99/p999/p9999/max) and dumps them to JSON for plotting. Custom `harness = false` main, not Criterion.
 
-- `target/criterion/report/index.html`
+Defaults: sizes 10K/100K/1M × ops get-hit/get-miss/insert × all three maps × 1M samples × 10K warmup.
 
-Per-workload pages are nested below their benchmark group names, for example:
+```bash
+cargo bench --bench latency
+cargo bench --bench latency -- --size 100000 --op get-hit --map elastic --samples 500000
+```
 
-- `target/criterion/insert_throughput/report/index.html`
-- `target/criterion/tiny_lookup_throughput/report/index.html`
-- `target/criterion/internal_control_group_scan/report/index.html`
+Multi-value: comma-separate (`--size 10000,100000`). Output: `target/latency/<map>/<size>/<op>.json`.
+
+## Reports
+
+- Criterion HTML: `target/criterion/report/index.html`, per-workload pages below (e.g. `target/criterion/insert_throughput/report/index.html`)
+- Charts: `uv run scripts/generate_all_charts.py` writes every SVG to `assets/` (speedup bars, mean-latency line, tail CDFs per config)
+
+## Profiling / flamegraphs
+
+`benches/speedup.rs` integrates a `pprof` profiler. Pass `--profile-time N` and Criterion captures CPU samples instead of timing, writing `target/criterion/<workload>/<impl>/profile/flamegraph.svg`.
+
+```bash
+cargo bench --bench speedup -- --profile-time 5
+cargo bench --bench speedup -- --profile-time 5 "get_hit"
+```

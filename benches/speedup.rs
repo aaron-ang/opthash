@@ -1,8 +1,14 @@
+mod common;
+
 use std::collections::HashMap as StdHashMap;
 use std::hint::black_box;
 
 use std::path::Path;
 
+use common::{
+    LATENCY_SIZES, build_elastic_map, build_funnel_map, build_std_map, key_at, make_pairs,
+    size_label,
+};
 use criterion::{
     BatchSize, Criterion, Throughput, criterion_group, criterion_main, profiler::Profiler,
 };
@@ -51,43 +57,6 @@ const DELETE_MAP_SIZE: usize = 12_000;
 const DELETE_OP_COUNT: usize = 6_000;
 const RESIZE_INSERT_COUNT: usize = 8_000;
 const MIXED_LOOKUP_COUNT: usize = 100_000;
-
-fn key_at(index: usize) -> u64 {
-    (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-}
-
-fn make_pairs(count: usize) -> Vec<(u64, u64)> {
-    (0..count)
-        .map(|idx| {
-            let key = key_at(idx);
-            (key, key ^ 0xA5A5_A5A5_A5A5_A5A5)
-        })
-        .collect()
-}
-
-fn build_std_map(pairs: &[(u64, u64)]) -> StdHashMap<u64, u64> {
-    let mut map = StdHashMap::with_capacity(pairs.len() * 2);
-    for &(key, value) in pairs {
-        map.insert(key, value);
-    }
-    map
-}
-
-fn build_elastic_map(pairs: &[(u64, u64)]) -> ElasticHashMap<u64, u64> {
-    let mut map = ElasticHashMap::with_capacity(pairs.len() * 2);
-    for &(key, value) in pairs {
-        map.insert(key, value);
-    }
-    map
-}
-
-fn build_funnel_map(pairs: &[(u64, u64)]) -> FunnelHashMap<u64, u64> {
-    let mut map = FunnelHashMap::with_capacity(pairs.len() * 2);
-    for &(key, value) in pairs {
-        map.insert(key, value);
-    }
-    map
-}
 
 fn bench_insert_throughput(c: &mut Criterion) {
     let pairs = make_pairs(INSERT_COUNT);
@@ -456,21 +425,12 @@ fn bench_mixed_lookup_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-const LATENCY_SIZES: &[usize] = &[100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
-
 fn bench_get_hit_latency(c: &mut Criterion) {
     for &size in LATENCY_SIZES {
         let pairs = make_pairs(size);
         let query_keys: Vec<u64> = (0..size).map(|idx| pairs[idx].0).collect();
 
-        let label = if size >= 1_000_000 {
-            format!("{}M", size / 1_000_000)
-        } else if size >= 1_000 {
-            format!("{}K", size / 1_000)
-        } else {
-            format!("{size}")
-        };
-
+        let label = size_label(size);
         let mut group = c.benchmark_group(format!("get_hit_latency_{label}"));
 
         group.bench_function("std", |b| {

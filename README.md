@@ -112,28 +112,12 @@ All benchmarks on ARM Cortex-X925 (Armv9.2-A, aarch64, NEON, 3.9 GHz) running Li
 
 ![Latency chart](assets/benchmark-latency.svg)
 
-### Running benchmarks
+#### Tail latency distributions
 
-```bash
-cargo bench --bench benchmarks            # run all throughput + latency benchmarks
-uv run scripts/generate_speedup_chart.py  # regenerate charts from Criterion JSON
-```
+![Tail latency — get-hit @ 10K](assets/latency-tail-10000-get-hit.svg)
 
-Criterion also generates an interactive HTML report at `target/criterion/report/index.html`.
+![Tail latency — get-miss @ 10K](assets/latency-tail-10000-get-miss.svg)
 
-### Profiling / flamegraphs
+![Tail latency — insert @ 10K](assets/latency-tail-10000-insert.svg)
 
-The benchmark harness integrates a custom Criterion `Profiler` backed by [`pprof`](https://crates.io/crates/pprof). Pass `--profile-time N` and Criterion captures CPU samples for `N` seconds per benchmark instead of timing, writing a flamegraph SVG per `(workload, impl)` pair.
-
-```bash
-cargo bench --bench benchmarks -- --profile-time 5                  # all workloads
-cargo bench --bench benchmarks -- --profile-time 5 "get_hit"        # filter by name
-```
-
-Output: `target/criterion/<workload>/<impl>/profile/flamegraph.svg`. Open in a browser — frames are searchable, hover for percentages. Inferno's `deterministic = true` flag gives the same colour to the same function across every flamegraph, so callers can be compared side by side.
-
-On Linux, profiling needs `perf_event_open` access. If it errors out, lower the paranoid level:
-
-```bash
-sudo sysctl kernel.perf_event_paranoid=1
-```
+See [benches/README.md](benches/README.md) for bench target layout, CLI flags, chart regeneration, and flamegraph profiling.

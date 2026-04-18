@@ -15,8 +15,8 @@ cargo bench                                 # Run all benchmarks
 
 Criterion benchmark suite comparing `ElasticHashMap`, `FunnelHashMap`, and `std::HashMap`:
 
-- **`cargo bench --bench benchmarks`** — throughput (insert, get hit/miss/mixed/tiny, delete-heavy, resize-heavy) and per-lookup latency at varying map sizes
-- Run a subset: `cargo bench --bench benchmarks -- "get_hit_latency"` (Criterion name filter)
+- **`cargo bench --bench speedup`** — throughput (insert, get hit/miss/mixed/tiny, delete-heavy, resize-heavy) and Criterion-mean per-lookup latency at varying map sizes
+- Run a subset: `cargo bench --bench speedup -- "get_hit_latency"` (Criterion name filter)
 
 Criterion auto-compares against the previous run. **Always read results from the JSON files** — terminal output gets truncated and mixes runs. Parse `target/criterion/` after a single `cargo bench` invocation:
 
@@ -25,7 +25,19 @@ Criterion auto-compares against the previous run. **Always read results from the
 
 Example path: `target/criterion/get_hit_throughput/elastic/change/estimates.json`
 
-To generate speedup charts against `std::HashMap`, run `uv run scripts/generate_speedup_chart.py`. Charts are saved in `assets/`.
+### Tail-latency harness
+
+- **`cargo bench --bench latency`** — per-operation latency distributions (p50/p90/p99/p999/p9999/max) via `hdrhistogram`. Defaults sweep sizes 10K/100K/1M × ops get-hit/get-miss/insert × all three maps.
+- CLI filters: `cargo bench --bench latency -- --size 100000 --op get-hit --map elastic --samples 500000 --warmup 10000` (comma-separate to pass multiple).
+- Output: `target/latency/<map>/<size>/<op>.json` — percentiles + histogram buckets.
+
+### Charts
+
+- `uv run scripts/generate_speedup_chart.py` — throughput speedup bar chart
+- `uv run scripts/generate_latency_chart.py [--size N --op OP] [--mean-only]` — Criterion-mean latency line + per-config tail CDFs + percentile bars
+- `uv run scripts/generate_all_charts.py` — regenerate everything
+
+Charts are saved in `assets/`. Shared plotting helpers live in `scripts/plot_common.py`.
 
 ## Project structure
 

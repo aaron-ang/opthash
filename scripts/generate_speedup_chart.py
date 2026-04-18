@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.ticker import FuncFormatter
 
+from plot_common import (
+    ASSETS_DIR,
+    IMPLEMENTATIONS,
+    apply_axis_style,
+    load_criterion_mean_ns,
+    save_svg,
+)
 
-ROOT = Path(__file__).resolve().parents[1]
-CRITERION_DIR = ROOT / "target" / "criterion"
-ASSETS_DIR = ROOT / "assets"
-
-IMPLEMENTATIONS = ("std", "elastic", "funnel")
 
 THROUGHPUT_WORKLOADS = (
     ("insert_throughput", "Insert"),
@@ -24,30 +24,16 @@ THROUGHPUT_WORKLOADS = (
     ("resize_heavy_throughput", "Resize"),
 )
 
-LATENCY_SIZES = ("100", "1K", "10K", "100K", "1M", "10M")
 
-
-def load_mean_ns(workload: str, implementation: str) -> float:
-    path = CRITERION_DIR / workload / implementation / "new" / "estimates.json"
-    if not path.exists():
-        raise FileNotFoundError(f"missing Criterion estimates: {path}")
-    data = json.loads(path.read_text())
-    if "mean" in data and "point_estimate" in data["mean"]:
-        return float(data["mean"]["point_estimate"])
-    raise RuntimeError(f"no usable mean point estimate in {path}")
-
-
-def plot_throughput_speedup(output_path: Path):
+def plot_throughput_speedup(output_path: Path) -> None:
     """Single bar chart: all throughput workloads, speedup vs std."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
     labels = []
     elastic_speedups = []
     funnel_speedups = []
 
     for workload, label in THROUGHPUT_WORKLOADS:
         try:
-            times = {impl: load_mean_ns(workload, impl) for impl in IMPLEMENTATIONS}
+            times = {impl: load_criterion_mean_ns(workload, impl) for impl in IMPLEMENTATIONS}
         except FileNotFoundError:
             continue
         labels.append(label)
@@ -72,27 +58,13 @@ def plot_throughput_speedup(output_path: Path):
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=12)
-    ax.tick_params(axis="y", labelsize=11, length=0)
-    ax.tick_params(axis="x", length=0)
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.1f}"))
-    ax.set_ylabel("Speedup (higher is better)", fontsize=14)
-    ax.set_xlabel("Workload", fontsize=14, labelpad=14)
-
-    ax.set_title(
-        "Throughput Speedup over std::HashMap",
-        fontsize=22,
-        pad=28,
-        color="#2B2F36",
-    )
-    ax.text(
-        0.5,
-        1.02,
-        "Criterion throughput benchmarks \u2014 std::HashMap is the 1.0\u00d7 baseline",
-        transform=ax.transAxes,
-        ha="center",
-        va="bottom",
-        fontsize=13,
-        color="0.35",
+    apply_axis_style(
+        ax,
+        title="Throughput Speedup over std::HashMap",
+        subtitle="Criterion throughput benchmarks \u2014 std::HashMap is the 1.0\u00d7 baseline",
+        xlabel="Workload",
+        ylabel="Speedup (higher is better)",
+        y_formatter=lambda v, _: f"{v:.1f}",
     )
 
     ax.legend(loc="upper left", bbox_to_anchor=(0.0, 1.0), ncol=2, fontsize=12)
@@ -110,88 +82,11 @@ def plot_throughput_speedup(output_path: Path):
                 color="black",
             )
 
-    fig.savefig(output_path, format="svg", bbox_inches="tight")
-    plt.close(fig)
-    print(f"wrote {output_path.relative_to(ROOT)}")
+    save_svg(fig, output_path)
 
 
-def plot_latency(output_path: Path):
-    """Line chart: per-lookup latency (ns) vs map size."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    sizes_found: list[str] = []
-    data: dict[str, list[float]] = {impl: [] for impl in IMPLEMENTATIONS}
-
-    for size_label in LATENCY_SIZES:
-        group = f"get_hit_latency_{size_label}"
-        try:
-            times = {impl: load_mean_ns(group, impl) for impl in IMPLEMENTATIONS}
-        except FileNotFoundError:
-            continue
-        sizes_found.append(size_label)
-        for impl in IMPLEMENTATIONS:
-            data[impl].append(times[impl])
-
-    if not sizes_found:
-        print("no latency data found, skipping")
-        return
-
-    fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
-
-    x = np.arange(len(sizes_found))
-    markers = {"std": "o", "elastic": "s", "funnel": "D"}
-    labels = {
-        "std": "std::HashMap",
-        "elastic": "ElasticHashMap",
-        "funnel": "FunnelHashMap",
-    }
-
-    for impl in IMPLEMENTATIONS:
-        ax.plot(
-            x,
-            data[impl],
-            marker=markers[impl],
-            linewidth=2,
-            markersize=7,
-            label=labels[impl],
-        )
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(sizes_found, fontsize=12)
-    ax.tick_params(axis="y", labelsize=11, length=0)
-    ax.tick_params(axis="x", length=0)
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}"))
-    ax.set_ylabel("Latency per lookup (ns)", fontsize=14)
-    ax.set_xlabel("Map size (entries)", fontsize=14, labelpad=14)
-
-    ax.set_title(
-        "Get-Hit Latency vs Map Size",
-        fontsize=22,
-        pad=28,
-        color="#2B2F36",
-    )
-    ax.text(
-        0.5,
-        1.02,
-        "Single get() call \u2014 lower is better",
-        transform=ax.transAxes,
-        ha="center",
-        va="bottom",
-        fontsize=13,
-        color="0.35",
-    )
-
-    ax.legend(fontsize=12)
-    ax.grid(axis="y", alpha=0.3)
-
-    fig.savefig(output_path, format="svg", bbox_inches="tight")
-    plt.close(fig)
-    print(f"wrote {output_path.relative_to(ROOT)}")
-
-
-def main():
+def main() -> None:
     plot_throughput_speedup(ASSETS_DIR / "benchmark-speedup.svg")
-    plot_latency(ASSETS_DIR / "benchmark-latency.svg")
 
 
 if __name__ == "__main__":
