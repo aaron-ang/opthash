@@ -466,7 +466,7 @@ where
         let key_fingerprint = ControlOps::control_fingerprint(key_hash);
         let location = self.find_slot_location_with_hash(key, key_hash, key_fingerprint)?;
 
-        let removed_entry = match location {
+        let (removed_entry, needs_resize) = match location {
             SlotLocation::Level {
                 level_idx,
                 slot_idx,
@@ -476,25 +476,18 @@ where
                 level.table.mark_tombstone(slot_idx);
                 level.len -= 1;
                 level.tombstones += 1;
-                if level.tombstones > level.capacity() / 2 {
-                    self.rebuild_level(level_idx);
-                }
-                removed
+                let needs_resize = level.tombstones > level.capacity() / 2;
+                (removed, needs_resize)
             }
             SlotLocation::SpecialPrimary { slot_idx } => {
                 let group_idx = slot_idx / GROUP_SIZE;
-                let removed = {
-                    let primary = &mut self.special.primary;
-                    let removed = unsafe { primary.table.take(slot_idx) };
-                    primary.table.mark_tombstone(slot_idx);
-                    primary.len -= 1;
-                    primary.group_tombstones[group_idx] += 1;
-                    removed
-                };
-                if self.special.primary.group_tombstones[group_idx] > GROUP_SIZE / 4 {
-                    self.rebuild_special_primary_group(group_idx);
-                }
-                removed
+                let primary = &mut self.special.primary;
+                let removed = unsafe { primary.table.take(slot_idx) };
+                primary.table.mark_tombstone(slot_idx);
+                primary.len -= 1;
+                primary.group_tombstones[group_idx] += 1;
+                let needs_resize = primary.group_tombstones[group_idx] > GROUP_SIZE / 4;
+                (removed, needs_resize)
             }
             SlotLocation::SpecialFallback { slot_idx } => {
                 let fallback = &mut self.special.fallback;
@@ -502,15 +495,16 @@ where
                 fallback.table.mark_tombstone(slot_idx);
                 fallback.len -= 1;
                 fallback.tombstones += 1;
-                if fallback.tombstones > fallback.capacity() / 2 {
-                    self.rebuild_special_fallback();
-                }
-                removed
+                let needs_resize = fallback.tombstones > fallback.capacity() / 2;
+                (removed, needs_resize)
             }
         };
 
         self.len -= 1;
         self.shrink_max_populated_level();
+        if needs_resize {
+            self.resize(self.capacity);
+        }
         Some(removed_entry.value)
     }
 
@@ -885,8 +879,8 @@ where
             }
         }
 
-        // Early exit: no tombstones + free slot in bucket → key can't be elsewhere.
-        // Use SIMD free_mask instead of linear scan (no need to find exact index).
+        // StopSearch: bucket has a free slot AND level never had a tombstone
+        // → no key ever overflowed past here.
         if level.tombstones == 0
             && level
                 .table
@@ -1190,99 +1184,6 @@ where
 
         self.find_in_special_fallback(key_hash, key_fingerprint, key)
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
-    }
-
-    fn rebuild_level(&mut self, level_idx: usize) {
-        let mut entries = Vec::with_capacity(self.levels[level_idx].len);
-        {
-            let level = &mut self.levels[level_idx];
-            for idx in 0..level.table.capacity() {
-                if level.table.control_at(idx).is_occupied() {
-                    let entry = unsafe { level.table.take(idx) };
-                    entries.push((entry.key, entry.value));
-                }
-            }
-            level.table.clear_all_controls();
-            level.len = 0;
-            level.tombstones = 0;
-        }
-
-        for (key, value) in entries {
-            let key_hash = self.hash_key(&key);
-            let key_fingerprint = ControlOps::control_fingerprint(key_hash);
-            let bucket_idx = self.levels[level_idx].bucket_index(key_hash);
-            let range = self.levels[level_idx].bucket_range(bucket_idx);
-            let controls = self.levels[level_idx].bucket_controls(bucket_idx);
-            let offset = controls
-                .iter()
-                .position(ControlByte::is_free)
-                .expect("rebuilt level should have free space");
-            let slot_idx = range.start + offset;
-            let level = &mut self.levels[level_idx];
-            level
-                .table
-                .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
-            level.len += 1;
-        }
-    }
-
-    fn rebuild_special_fallback(&mut self) {
-        let mut entries = Vec::with_capacity(self.special.fallback.len);
-        {
-            let fallback = &mut self.special.fallback;
-            for idx in 0..fallback.table.capacity() {
-                if fallback.table.control_at(idx).is_occupied() {
-                    let entry = unsafe { fallback.table.take(idx) };
-                    entries.push((entry.key, entry.value));
-                }
-            }
-            fallback.table.clear_all_controls();
-            fallback.len = 0;
-            fallback.tombstones = 0;
-        }
-
-        for (key, value) in entries {
-            let key_hash = self.hash_key(&key);
-            let key_fingerprint = ControlOps::control_fingerprint(key_hash);
-            let slot_idx = self
-                .first_free_in_special_fallback(key_hash)
-                .expect("rebuilt fallback should have free space");
-            let fallback = &mut self.special.fallback;
-            fallback
-                .table
-                .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
-            fallback.len += 1;
-        }
-    }
-
-    fn rebuild_special_primary_group(&mut self, group_idx: usize) {
-        let mut entries = Vec::new();
-        {
-            let primary = &mut self.special.primary;
-            let group_start = group_idx * GROUP_SIZE;
-            for slot_idx in group_start..group_start + GROUP_SIZE {
-                if primary.table.control_at(slot_idx).is_occupied() {
-                    let entry = unsafe { primary.table.take(slot_idx) };
-                    entries.push((entry.key, entry.value));
-                }
-                primary.table.clear_control(slot_idx);
-            }
-            primary.group_summaries[group_idx] = 0;
-            primary.group_tombstones[group_idx] = 0;
-        }
-
-        for (key, value) in entries {
-            let key_fingerprint = ControlOps::control_fingerprint(self.hash_key(&key));
-            let primary = &mut self.special.primary;
-            let slot_idx = primary
-                .table
-                .first_free_in_group(group_idx)
-                .expect("rebuilt primary group should have free space");
-            primary
-                .table
-                .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
-            primary.group_summaries[group_idx] |= ControlOps::fingerprint_bit(key_fingerprint);
-        }
     }
 
     fn shrink_max_populated_level(&mut self) {

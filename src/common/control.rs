@@ -1,1 +1,1 @@
-pub(crate) use super::simd::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps};
+pub(crate) use super::simd::{CTRL_TOMBSTONE, ControlByte, ControlOps};

@@ -5,7 +5,6 @@ use std::ptr::{self, NonNull};
 use super::bitmask::BitMask;
 use super::simd::{eq_mask_16, free_mask_16};
 
-use super::control::CTRL_EMPTY;
 use super::math::round_up_to_group;
 
 pub(crate) const GROUP_SIZE: usize = 16;
@@ -138,11 +137,6 @@ impl<T> RawTable<T> {
     #[inline]
     pub fn set_control(&mut self, idx: usize, new_control: u8) {
         unsafe { *self.ctrl_ptr().add(idx) = new_control };
-    }
-
-    #[inline]
-    pub fn clear_control(&mut self, idx: usize) {
-        self.set_control(idx, CTRL_EMPTY);
     }
 
     #[inline]
