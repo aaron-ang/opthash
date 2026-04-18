@@ -6,8 +6,8 @@ use std::hint::black_box;
 use std::path::Path;
 
 use common::{
-    LATENCY_SIZES, build_elastic_map, build_funnel_map, build_std_map, key_at, make_pairs,
-    size_label,
+    LATENCY_SIZES, VALUE_XOR_MIX_ALT, build_elastic_map, build_funnel_map, build_std_map, key_at,
+    make_pairs, size_label,
 };
 use criterion::{
     BatchSize, Criterion, Throughput, criterion_group, criterion_main, profiler::Profiler,
@@ -272,7 +272,7 @@ fn bench_delete_heavy_throughput(c: &mut Criterion) {
     let replacement_pairs: Vec<(u64, u64)> = (0..DELETE_OP_COUNT)
         .map(|idx| {
             let key = key_at(idx + 20_000_000);
-            (key, key ^ 0x5A5A_5A5A_5A5A_5A5A)
+            (key, key ^ VALUE_XOR_MIX_ALT)
         })
         .collect();
 

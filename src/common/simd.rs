@@ -19,6 +19,11 @@ use super::bitmask::BitMask;
 pub(crate) const CONTROL_GROUP_SIZE: usize = 16;
 pub(crate) const CTRL_EMPTY: u8 = 0;
 pub(crate) const CTRL_TOMBSTONE: u8 = 0x80;
+/// Low 7 bits hold the fingerprint; high bit distinguishes occupied (0) from
+/// the tombstone sentinel (`CTRL_TOMBSTONE`).
+pub(crate) const FINGERPRINT_MASK: u8 = 0x7F;
+/// Shift that pulls the 7 high bits of a 64-bit hash into bits [6:0].
+const FINGERPRINT_SHIFT: u32 = 57;
 
 pub(crate) trait ControlByte {
     fn is_occupied(&self) -> bool;
@@ -50,7 +55,8 @@ impl ControlOps {
     #[inline]
     #[must_use]
     pub(crate) fn control_fingerprint(hash: u64) -> u8 {
-        let high = u8::try_from((hash >> 57) & 0x7F).expect("7-bit fingerprint fits in u8");
+        let high = u8::try_from((hash >> FINGERPRINT_SHIFT) & u64::from(FINGERPRINT_MASK))
+            .expect("7-bit fingerprint fits in u8");
         high.max(1)
     }
 

@@ -10,7 +10,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use common::{build_elastic_map, build_funnel_map, build_std_map, key_at, make_pairs};
+use common::{
+    GOLDEN_RATIO_U64, VALUE_XOR_MIX, build_elastic_map, build_funnel_map, build_std_map, key_at,
+    make_pairs,
+};
 use hdrhistogram::Histogram;
 use opthash::{ElasticHashMap, FunnelHashMap};
 
@@ -120,7 +123,7 @@ fn new_hist() -> Histogram<u64> {
 }
 
 fn scatter(i: usize, n: usize) -> usize {
-    ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize) % n
+    ((i as u64).wrapping_mul(GOLDEN_RATIO_U64) as usize) % n
 }
 
 fn measure<F, R>(samples: usize, warmup: usize, mut op: F) -> Histogram<u64>
@@ -200,7 +203,7 @@ fn run_insert(map: &str, samples: usize, warmup: usize) -> Histogram<u64> {
     let insert_keys: Vec<(u64, u64)> = (0..total)
         .map(|i| {
             let k = key_at(i + 200_000_000);
-            (k, k ^ 0xA5A5_A5A5_A5A5_A5A5)
+            (k, k ^ VALUE_XOR_MIX)
         })
         .collect();
     match map {

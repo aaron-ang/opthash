@@ -6,15 +6,23 @@ use opthash::{ElasticHashMap, FunnelHashMap};
 
 pub const LATENCY_SIZES: &[usize] = &[100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
 
+/// Knuth multiplicative-hash constant (golden ratio * 2^64, odd).
+pub const GOLDEN_RATIO_U64: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Alternating 1010... bit pattern; cheap key→value mix that flips every bit.
+pub const VALUE_XOR_MIX: u64 = 0xA5A5_A5A5_A5A5_A5A5;
+/// Bit-inverse of [`VALUE_XOR_MIX`]; used in delete-heavy bench to mark
+/// replacement values as distinct from the initial value mix.
+pub const VALUE_XOR_MIX_ALT: u64 = 0x5A5A_5A5A_5A5A_5A5A;
+
 pub fn key_at(index: usize) -> u64 {
-    (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    (index as u64).wrapping_mul(GOLDEN_RATIO_U64)
 }
 
 pub fn make_pairs(count: usize) -> Vec<(u64, u64)> {
     (0..count)
         .map(|idx| {
             let key = key_at(idx);
-            (key, key ^ 0xA5A5_A5A5_A5A5_A5A5)
+            (key, key ^ VALUE_XOR_MIX)
         })
         .collect()
 }
