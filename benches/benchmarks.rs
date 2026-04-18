@@ -1,8 +1,45 @@
 use std::collections::HashMap as StdHashMap;
 use std::hint::black_box;
 
-use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use std::path::Path;
+
+use criterion::{
+    BatchSize, Criterion, Throughput, criterion_group, criterion_main, profiler::Profiler,
+};
 use opthash::{ElasticHashMap, FunnelHashMap};
+use pprof::{ProfilerGuard, flamegraph::Options as FlamegraphOptions};
+
+struct FlamegraphProfiler {
+    frequency: i32,
+    active: Option<ProfilerGuard<'static>>,
+}
+
+impl FlamegraphProfiler {
+    fn new() -> Self {
+        Self {
+            frequency: 997,
+            active: None,
+        }
+    }
+}
+
+impl Profiler for FlamegraphProfiler {
+    fn start_profiling(&mut self, _benchmark_id: &str, _benchmark_dir: &Path) {
+        self.active = Some(ProfilerGuard::new(self.frequency).unwrap());
+    }
+
+    fn stop_profiling(&mut self, _benchmark_id: &str, benchmark_dir: &Path) {
+        if let Some(guard) = self.active.take() {
+            let report = guard.report().build().unwrap();
+            let mut opts = FlamegraphOptions::default();
+            opts.deterministic = true;
+            std::fs::create_dir_all(benchmark_dir).unwrap();
+            let path = benchmark_dir.join("flamegraph.svg");
+            let file = std::fs::File::create(&path).unwrap();
+            report.flamegraph_with_options(file, &mut opts).unwrap();
+        }
+    }
+}
 
 const INSERT_COUNT: usize = 10_000;
 const LOOKUP_MAP_SIZE: usize = 20_000;
@@ -472,7 +509,7 @@ fn bench_get_hit_latency(c: &mut Criterion) {
 
 criterion_group!(
     name = benches;
-    config = Criterion::default();
+    config = Criterion::default().with_profiler(FlamegraphProfiler::new());
     targets =
         bench_insert_throughput,
         bench_get_hit_throughput,

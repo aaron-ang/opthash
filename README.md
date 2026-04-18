@@ -120,3 +120,20 @@ uv run scripts/generate_speedup_chart.py  # regenerate charts from Criterion JSO
 ```
 
 Criterion also generates an interactive HTML report at `target/criterion/report/index.html`.
+
+### Profiling / flamegraphs
+
+The benchmark harness integrates a custom Criterion `Profiler` backed by [`pprof`](https://crates.io/crates/pprof). Pass `--profile-time N` and Criterion captures CPU samples for `N` seconds per benchmark instead of timing, writing a flamegraph SVG per `(workload, impl)` pair.
+
+```bash
+cargo bench --bench benchmarks -- --profile-time 5                  # all workloads
+cargo bench --bench benchmarks -- --profile-time 5 "get_hit"        # filter by name
+```
+
+Output: `target/criterion/<workload>/<impl>/profile/flamegraph.svg`. Open in a browser — frames are searchable, hover for percentages. Inferno's `deterministic = true` flag gives the same colour to the same function across every flamegraph, so callers can be compared side by side.
+
+On Linux, profiling needs `perf_event_open` access. If it errors out, lower the paranoid level:
+
+```bash
+sudo sysctl kernel.perf_event_paranoid=1
+```
