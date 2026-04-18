@@ -2,12 +2,17 @@ use std::alloc::{self, Layout};
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 
+use super::bitmask::BitMask;
 use super::simd::{eq_mask_16, free_mask_16};
 
 use super::control::CTRL_EMPTY;
 use super::math::round_up_to_group;
 
 pub(crate) const GROUP_SIZE: usize = 16;
+
+/// Alignment for the control-byte region. Matches 64-byte cache lines so
+/// the first group is line-aligned and groups pack 4-per-line without splits.
+const CONTROL_ALIGN: usize = 64;
 
 #[derive(Debug)]
 pub(crate) struct Entry<K, V> {
@@ -77,10 +82,10 @@ impl<T> RawTable<T> {
         }
     }
 
-    /// Layout: `[slots (T-aligned)] [padding] [controls (16-aligned)]`.
+    /// Layout: `[slots (T-aligned)] [padding] [controls (64-aligned)]`.
     fn unified_layout(capacity: usize, group_count: usize) -> (Layout, usize) {
         let slots_layout = Layout::array::<T>(capacity).expect("slots layout overflow");
-        let controls_layout = Layout::from_size_align(group_count * GROUP_SIZE, GROUP_SIZE)
+        let controls_layout = Layout::from_size_align(group_count * GROUP_SIZE, CONTROL_ALIGN)
             .expect("controls layout overflow");
         let (combined, ctrl_offset) = slots_layout
             .extend(controls_layout)
@@ -176,24 +181,21 @@ impl<T> RawTable<T> {
     }
 
     #[inline]
-    pub fn group_match_mask(&self, group_idx: usize, target: u8) -> u16 {
+    pub fn group_match_mask(&self, group_idx: usize, target: u8) -> BitMask {
         let ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
         unsafe { eq_mask_16(ptr, target) }
     }
 
     #[inline]
-    pub fn group_free_mask(&self, group_idx: usize) -> u16 {
+    pub fn group_free_mask(&self, group_idx: usize) -> BitMask {
         let ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
         unsafe { free_mask_16(ptr) }
     }
 
     #[inline]
     pub fn first_free_in_group(&self, group_idx: usize) -> Option<usize> {
-        let mask = self.group_free_mask(group_idx);
-        if mask == 0 {
-            return None;
-        }
-        let slot_idx = group_idx * GROUP_SIZE + mask.trailing_zeros() as usize;
+        let offset = self.group_free_mask(group_idx).lowest()?;
+        let slot_idx = group_idx * GROUP_SIZE + offset;
         if slot_idx < self.capacity {
             Some(slot_idx)
         } else {

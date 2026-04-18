@@ -9,8 +9,8 @@ use crate::common::{
     control::{ControlByte, ControlOps},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
-        advance_wrapping_index, ceil_three_quarters, ceil_to_usize, floor_half_reserve_slots,
-        max_insertions, sanitize_reserve_fraction, usize_to_f64,
+        advance_wrapping_index, ceil_three_quarters, floor_half_reserve_slots, max_insertions,
+        sanitize_reserve_fraction, usize_to_f64,
     },
 };
 
@@ -482,15 +482,12 @@ where
         };
 
         for _ in 0..probe_limit {
-            let mut match_mask = level.table.group_match_mask(group_idx, key_fingerprint);
-            while match_mask != 0 {
-                let relative_idx = match_mask.trailing_zeros() as usize;
+            for relative_idx in level.table.group_match_mask(group_idx, key_fingerprint) {
                 let slot_idx = group_idx * GROUP_SIZE + relative_idx;
                 let entry = unsafe { level.table.get_ref(slot_idx) };
                 if entry.key.borrow() == key {
                     return Some(slot_idx);
                 }
-                match_mask &= match_mask - 1;
             }
 
             if level.tombstones == 0 && level.table.first_free_in_group(group_idx).is_some() {
@@ -621,6 +618,11 @@ fn level_salt(level_idx: usize) -> u64 {
     )
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn build_probe_budgets(
     capacity: usize,
     group_count: usize,
@@ -632,16 +634,36 @@ fn build_probe_budgets(
         return budgets.into_boxed_slice();
     }
 
-    let log_inverse_reserve_fraction = (1.0 / reserve_fraction).log2();
-    for (free_slots, budget) in budgets.iter_mut().enumerate().take(capacity + 1).skip(1) {
-        let free_fraction = usize_to_f64(free_slots) / usize_to_f64(capacity);
-        let log_sq_inverse_free_fraction = (1.0 / free_fraction).log2().powi(2);
-        let slot_budget = ceil_to_usize(
-            (probe_scale * log_sq_inverse_free_fraction.min(log_inverse_reserve_fraction)).max(1.0),
-        );
-        *budget = slot_budget
-            .div_ceil(GROUP_SIZE)
-            .clamp(1, group_count.max(1));
+    let max_budget = group_count.max(1);
+    let cap_f = usize_to_f64(capacity);
+    let log_cap = (1.0 / reserve_fraction).log2();
+
+    // Budget(fs) is a non-increasing staircase function of free_slots.
+    // Instead of computing log2/ceil per slot, find the threshold free_slots
+    // where each budget level transitions, then fill segments.
+    //
+    // Budget >= b when: fs < capacity / 2^sqrt((b-1)*GROUP_SIZE / probe_scale)
+    let mut thresholds: Vec<(usize, usize)> = Vec::new();
+    for b in 2..=max_budget {
+        let ratio = ((b - 1) * GROUP_SIZE) as f64 / probe_scale;
+        if ratio >= log_cap {
+            break;
+        }
+        let exact = cap_f / f64::exp2(ratio.sqrt());
+        let threshold = (exact.ceil() as usize).saturating_sub(1).min(capacity);
+        if threshold == 0 {
+            break;
+        }
+        thresholds.push((b, threshold));
+    }
+
+    // Fill from highest budget inward (thresholds decrease with increasing b).
+    let mut prev_end = 0;
+    for &(b, threshold) in thresholds.iter().rev() {
+        if threshold > prev_end {
+            budgets[(prev_end + 1)..=threshold].fill(b);
+            prev_end = threshold;
+        }
     }
 
     budgets.into_boxed_slice()

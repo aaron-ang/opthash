@@ -863,7 +863,41 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        Self::find_in_level_bucket_with_candidate(key_hash, key_fingerprint, key, level).0
+        if level.len == 0 || level.bucket_count == 0 {
+            return LookupStep::Continue;
+        }
+
+        let bucket_idx = level.bucket_index(key_hash);
+        let bucket_range = level.bucket_range(bucket_idx);
+        debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
+        let group_idx = bucket_range.start / GROUP_SIZE;
+
+        // SIMD fingerprint scan — same as _with_candidate.
+        for relative_idx in level
+            .table
+            .group_match_mask(group_idx, key_fingerprint)
+            .truncate_to(level.bucket_size)
+        {
+            let slot_idx = bucket_range.start + relative_idx;
+            let entry = unsafe { level.table.get_ref(slot_idx) };
+            if entry.key.borrow() == key {
+                return LookupStep::Found(slot_idx);
+            }
+        }
+
+        // Early exit: no tombstones + free slot in bucket → key can't be elsewhere.
+        // Use SIMD free_mask instead of linear scan (no need to find exact index).
+        if level.tombstones == 0
+            && level
+                .table
+                .group_free_mask(group_idx)
+                .truncate_to(level.bucket_size)
+                .any()
+        {
+            return LookupStep::StopSearch;
+        }
+
+        LookupStep::Continue
     }
 
     fn find_in_level_bucket_with_candidate<Q>(
@@ -890,29 +924,30 @@ where
         let group_idx = bucket_range.start / GROUP_SIZE;
 
         // SIMD fingerprint scan over the bucket's control bytes.
-        let mut match_mask = level.table.group_match_mask(group_idx, key_fingerprint);
-        while match_mask != 0 {
-            let relative_idx = match_mask.trailing_zeros() as usize;
-            if relative_idx < level.bucket_size {
-                let slot_idx = bucket_range.start + relative_idx;
-                let entry = unsafe { level.table.get_ref(slot_idx) };
-                if entry.key.borrow() == key {
-                    let free_candidate = level
-                        .bucket_controls(bucket_idx)
-                        .iter()
-                        .position(ControlByte::is_free)
-                        .map(|o| bucket_range.start + o);
-                    return (LookupStep::Found(slot_idx), free_candidate);
-                }
+        for relative_idx in level
+            .table
+            .group_match_mask(group_idx, key_fingerprint)
+            .truncate_to(level.bucket_size)
+        {
+            let slot_idx = bucket_range.start + relative_idx;
+            let entry = unsafe { level.table.get_ref(slot_idx) };
+            if entry.key.borrow() == key {
+                let free_candidate = level
+                    .table
+                    .group_free_mask(group_idx)
+                    .truncate_to(level.bucket_size)
+                    .lowest()
+                    .map(|o| bucket_range.start + o);
+                return (LookupStep::Found(slot_idx), free_candidate);
             }
-            match_mask &= match_mask - 1;
         }
 
         // No match — compute free candidate and early-exit status.
         let free_candidate = level
-            .bucket_controls(bucket_idx)
-            .iter()
-            .position(ControlByte::is_free)
+            .table
+            .group_free_mask(group_idx)
+            .truncate_to(level.bucket_size)
+            .lowest()
             .map(|o| bucket_range.start + o);
 
         let step = if level.tombstones == 0 && free_candidate.is_some() {
@@ -942,15 +977,12 @@ where
 
         for _ in 0..group_limit {
             if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
-                let mut match_mask = primary.table.group_match_mask(group_idx, key_fingerprint);
-                while match_mask != 0 {
-                    let relative_idx = match_mask.trailing_zeros() as usize;
+                for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
                     let slot_idx = group_idx * GROUP_SIZE + relative_idx;
                     let entry = unsafe { primary.table.get_ref(slot_idx) };
                     if entry.key.borrow() == key {
                         return LookupStep::Found(slot_idx);
                     }
-                    match_mask &= match_mask - 1;
                 }
             }
 
@@ -1002,15 +1034,12 @@ where
             }
 
             if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
-                let mut match_mask = primary.table.group_match_mask(group_idx, key_fingerprint);
-                while match_mask != 0 {
-                    let relative_idx = match_mask.trailing_zeros() as usize;
+                for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
                     let slot_idx = group_idx * GROUP_SIZE + relative_idx;
                     let entry = unsafe { primary.table.get_ref(slot_idx) };
                     if entry.key.borrow() == key {
                         return (LookupStep::Found(slot_idx), candidate);
                     }
-                    match_mask &= match_mask - 1;
                 }
             }
 
