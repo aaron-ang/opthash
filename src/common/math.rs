@@ -61,3 +61,14 @@ pub(crate) fn round_up_to_group(value: usize) -> usize {
         value.div_ceil(GROUP_SIZE) * GROUP_SIZE
     }
 }
+
+/// Per-level hash salt: mixes the level index into the hash to decorrelate
+/// bucket distributions across levels. Used by both elastic and funnel.
+#[inline]
+pub(crate) fn level_salt(level_idx: usize) -> u64 {
+    0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(
+        u64::try_from(level_idx)
+            .expect("level index fits in u64")
+            .wrapping_add(1),
+    )
+}

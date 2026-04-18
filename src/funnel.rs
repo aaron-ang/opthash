@@ -9,8 +9,8 @@ use crate::common::{
     control::{ControlByte, ControlOps},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
-        advance_wrapping_index, ceil_to_usize, floor_to_usize, max_insertions, round_to_usize,
-        round_up_to_group, sanitize_reserve_fraction, usize_to_f64,
+        advance_wrapping_index, ceil_to_usize, floor_to_usize, level_salt, max_insertions,
+        round_to_usize, round_up_to_group, sanitize_reserve_fraction, usize_to_f64,
     },
 };
 
@@ -50,11 +50,11 @@ struct BucketLevel<K, V> {
     tombstones: usize,
     bucket_size: usize,
     bucket_count: usize,
-    hash_rotation: u32,
+    salt: u64,
 }
 
 impl<K, V> BucketLevel<K, V> {
-    fn with_bucket_count(bucket_count: usize, bucket_size: usize, hash_rotation: u32) -> Self {
+    fn with_bucket_count(bucket_count: usize, bucket_size: usize, salt: u64) -> Self {
         let total_capacity = bucket_count.saturating_mul(bucket_size);
         Self {
             table: RawTable::new(total_capacity),
@@ -62,7 +62,7 @@ impl<K, V> BucketLevel<K, V> {
             tombstones: 0,
             bucket_size,
             bucket_count,
-            hash_rotation,
+            salt,
         }
     }
 
@@ -73,22 +73,13 @@ impl<K, V> BucketLevel<K, V> {
 
     #[inline]
     fn bucket_index(&self, key_hash: u64) -> usize {
-        ProbeOps::hash_to_usize(key_hash.rotate_left(self.hash_rotation)) % self.bucket_count
+        ProbeOps::hash_to_usize(key_hash ^ self.salt) % self.bucket_count
     }
 
     #[inline]
     fn bucket_range(&self, bucket_idx: usize) -> std::ops::Range<usize> {
         let start = bucket_idx * self.bucket_size;
         start..start + self.bucket_size
-    }
-
-    /// Returns a slice of control bytes for the given bucket.
-    #[inline]
-    fn bucket_controls(&self, bucket_idx: usize) -> &[u8] {
-        let range = self.bucket_range(bucket_idx);
-        unsafe {
-            std::slice::from_raw_parts(self.table.group_data_ptr(0).add(range.start), range.len())
-        }
     }
 }
 
@@ -289,9 +280,7 @@ where
             .into_iter()
             .enumerate()
             .map(|(level_idx, bucket_count)| {
-                let hash_rotation =
-                    (u32::try_from(level_idx).expect("level index fits in u32") * 7) % 64;
-                BucketLevel::with_bucket_count(bucket_count, bucket_width, hash_rotation)
+                BucketLevel::with_bucket_count(bucket_count, bucket_width, level_salt(level_idx))
             })
             .collect::<Vec<_>>();
 
@@ -786,11 +775,15 @@ where
         }
 
         let bucket_idx = level.bucket_index(key_hash);
-        let controls = level.bucket_controls(bucket_idx);
-        controls
-            .iter()
-            .position(ControlByte::is_free)
-            .map(|offset| level.bucket_range(bucket_idx).start + offset)
+        let bucket_range = level.bucket_range(bucket_idx);
+        debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
+        let group_idx = bucket_range.start / GROUP_SIZE;
+        level
+            .table
+            .group_free_mask(group_idx)
+            .truncate_to(level.bucket_size)
+            .lowest()
+            .map(|offset| bucket_range.start + offset)
     }
 
     fn first_free_in_special_primary(&self, key_hash: u64) -> Option<usize> {

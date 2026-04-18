@@ -9,8 +9,8 @@ use crate::common::{
     control::{ControlByte, ControlOps},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
-        advance_wrapping_index, ceil_three_quarters, floor_half_reserve_slots, max_insertions,
-        sanitize_reserve_fraction, usize_to_f64,
+        advance_wrapping_index, ceil_three_quarters, floor_half_reserve_slots, level_salt,
+        max_insertions, sanitize_reserve_fraction, usize_to_f64,
     },
 };
 
@@ -299,10 +299,11 @@ where
         };
 
         self.len -= 1;
-        if self.levels[level_idx].needs_cleanup() {
-            self.rebuild_level(level_idx);
-        }
+        let needs_resize = self.levels[level_idx].needs_cleanup();
         self.shrink_max_populated_level();
+        if needs_resize {
+            self.resize(self.capacity);
+        }
         Some(removed_entry.value)
     }
 
@@ -560,35 +561,6 @@ where
         (group_start, step)
     }
 
-    fn rebuild_level(&mut self, level_idx: usize) {
-        let mut entries = Vec::with_capacity(self.levels[level_idx].len);
-        {
-            let level = &mut self.levels[level_idx];
-            for idx in 0..level.table.capacity() {
-                if level.table.control_at(idx).is_occupied() {
-                    let entry = unsafe { level.table.take(idx) };
-                    entries.push((entry.key, entry.value));
-                }
-            }
-            level.table.clear_all_controls();
-            level.len = 0;
-            level.tombstones = 0;
-        }
-
-        for (key, value) in entries {
-            let key_hash = self.hash_key(&key);
-            let key_fingerprint = ControlOps::control_fingerprint(key_hash);
-            let slot_idx = self
-                .first_free_uniform(key_hash, level_idx)
-                .expect("rebuilt level should have free space");
-            let level = &mut self.levels[level_idx];
-            level
-                .table
-                .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
-            level.len += 1;
-        }
-    }
-
     fn shrink_max_populated_level(&mut self) {
         while self.max_populated_level > 0
             && self.levels[self.max_populated_level].len == 0
@@ -608,14 +580,6 @@ fn sanitize_probe_scale(probe_scale: f64) -> f64 {
     } else {
         DEFAULT_PROBE_SCALE
     }
-}
-
-fn level_salt(level_idx: usize) -> u64 {
-    0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(
-        u64::try_from(level_idx)
-            .expect("level index fits in u64")
-            .wrapping_add(1),
-    )
 }
 
 #[allow(
