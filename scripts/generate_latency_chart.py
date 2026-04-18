@@ -5,6 +5,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullLocator
 
 from plot_common import (
     ASSETS_DIR,
@@ -85,7 +86,7 @@ def _percentile_curve(buckets: list[dict]) -> tuple[np.ndarray, np.ndarray]:
 
 
 TAIL_TICK_QS = (0.0, 0.5, 0.9, 0.99, 0.999, 0.9999, 0.99999)
-TAIL_TICK_LABELS = ("0", "0.5", "0.9", "0.99", "0.999", "0.9999", "0.99999")
+TAIL_TICK_LABELS = ("p0", "p50", "p90", "p99", "p99.9", "p99.99", "p99.999")
 
 
 def _tail_x(q):
@@ -134,14 +135,18 @@ def plot_tail_cdf(size: int, op: str, output_path: Path) -> None:
     ax.set_xticklabels(TAIL_TICK_LABELS, fontsize=12)
     ax.set_xlim(1.0, max_x * 1.3)
 
-    size_label = f"{size:,}".replace(",", "\u202f")
+    ax.xaxis.set_minor_locator(NullLocator())
+    ax.yaxis.set_major_locator(LogLocator(base=10.0))
+    ax.yaxis.set_minor_locator(NullLocator())
+    ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
+
+    size_label = f"{size:,}"
     apply_axis_style(
         ax,
         title=f"Tail Latency \u2014 {OP_LABELS[op]} @ {size_label} entries",
-        subtitle="Latency at percentile q (log axes) \u2014 lower is better",
-        xlabel="Percentile (q)",
+        subtitle="Latency at percentile p (log axes) \u2014 lower is better",
+        xlabel="Percentile",
         ylabel="Latency (ns, log scale)",
-        y_formatter=lambda v, _: f"{v:,.0f}" if v >= 1 else "",
     )
     ax.legend(fontsize=12, loc="upper left")
 

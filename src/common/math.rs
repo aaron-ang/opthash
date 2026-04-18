@@ -72,3 +72,20 @@ pub(crate) fn level_salt(level_idx: usize) -> u64 {
             .wrapping_add(1),
     )
 }
+
+/// Lemire fastmod: precompute magic `M = ceil(2^64 / d)` so that `a % d`
+/// becomes `(((M.wrapping_mul(a as u64)) as u128 * d as u128) >> 64) as u32`.
+/// `d` must be non-zero.
+#[inline]
+pub(crate) fn fastmod_magic(d: u32) -> u64 {
+    debug_assert!(d != 0);
+    (u64::MAX / u64::from(d)).wrapping_add(1)
+}
+
+#[inline]
+pub(crate) fn fastmod_u32(a: u32, m: u64, d: u32) -> u32 {
+    let lowbits = m.wrapping_mul(u64::from(a));
+    #[allow(clippy::cast_possible_truncation)]
+    let hi = ((u128::from(lowbits) * u128::from(d)) >> 64) as u32;
+    hi
+}

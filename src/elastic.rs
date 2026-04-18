@@ -9,8 +9,9 @@ use crate::common::{
     control::{ControlByte, ControlOps},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
-        advance_wrapping_index, ceil_three_quarters, floor_half_reserve_slots, level_salt,
-        max_insertions, sanitize_reserve_fraction, usize_to_f64,
+        advance_wrapping_index, ceil_three_quarters, fastmod_magic, fastmod_u32,
+        floor_half_reserve_slots, level_salt, max_insertions, sanitize_reserve_fraction,
+        usize_to_f64,
     },
 };
 
@@ -52,6 +53,8 @@ struct Level<K, V> {
     limited_probe_budgets: Box<[usize]>,
     group_steps: Box<[usize]>,
     salt: u64,
+    group_count_magic: u64,
+    step_count_magic: u64,
 }
 
 impl<K, V> Level<K, V> {
@@ -66,6 +69,16 @@ impl<K, V> Level<K, V> {
         let group_steps = ProbeOps::build_group_steps(group_count);
         let limited_probe_budgets =
             build_probe_budgets(capacity, group_count, reserve_fraction, probe_scale);
+        let group_count_magic = if group_count > 1 {
+            fastmod_magic(u32::try_from(group_count).expect("group_count fits in u32"))
+        } else {
+            0
+        };
+        let step_count_magic = if group_steps.len() > 1 {
+            fastmod_magic(u32::try_from(group_steps.len()).expect("step count fits in u32"))
+        } else {
+            0
+        };
 
         Self {
             table,
@@ -75,6 +88,8 @@ impl<K, V> Level<K, V> {
             limited_probe_budgets,
             group_steps,
             salt: level_salt(level_idx),
+            group_count_magic,
+            step_count_magic,
         }
     }
 
@@ -562,9 +577,21 @@ where
         }
 
         let mixed = key_hash ^ level.salt;
-        let group_start = ProbeOps::hash_to_usize(mixed) % group_count;
-        let step = level.group_steps
-            [ProbeOps::hash_to_usize(mixed.rotate_left(29)) % level.group_steps.len()];
+        let group_start = fastmod_u32(
+            mixed as u32,
+            level.group_count_magic,
+            group_count as u32,
+        ) as usize;
+        let step = if level.group_steps.len() > 1 {
+            let step_idx = fastmod_u32(
+                mixed.rotate_left(29) as u32,
+                level.step_count_magic,
+                level.group_steps.len() as u32,
+            ) as usize;
+            level.group_steps[step_idx]
+        } else {
+            level.group_steps[0]
+        };
         (group_start, step)
     }
 
