@@ -70,12 +70,12 @@ impl<K, V> Level<K, V> {
         let limited_probe_budgets =
             build_probe_budgets(capacity, group_count, reserve_fraction, probe_scale);
         let group_count_magic = if group_count > 1 {
-            fastmod_magic(u32::try_from(group_count).expect("group_count fits in u32"))
+            fastmod_magic(group_count)
         } else {
             0
         };
         let step_count_magic = if group_steps.len() > 1 {
-            fastmod_magic(u32::try_from(group_steps.len()).expect("step count fits in u32"))
+            fastmod_magic(group_steps.len())
         } else {
             0
         };
@@ -577,17 +577,13 @@ where
         }
 
         let mixed = key_hash ^ level.salt;
-        let group_start = fastmod_u32(
-            mixed as u32,
-            level.group_count_magic,
-            group_count as u32,
-        ) as usize;
+        let group_start = fastmod_u32(mixed, level.group_count_magic, group_count);
         let step = if level.group_steps.len() > 1 {
             let step_idx = fastmod_u32(
-                mixed.rotate_left(29) as u32,
+                mixed.rotate_left(29),
                 level.step_count_magic,
-                level.group_steps.len() as u32,
-            ) as usize;
+                level.group_steps.len(),
+            );
             level.group_steps[step_idx]
         } else {
             level.group_steps[0]

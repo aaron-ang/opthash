@@ -59,7 +59,7 @@ impl<K, V> BucketLevel<K, V> {
     fn with_bucket_count(bucket_count: usize, bucket_size: usize, salt: u64) -> Self {
         let total_capacity = bucket_count.saturating_mul(bucket_size);
         let bucket_count_magic = if bucket_count > 1 {
-            fastmod_magic(u32::try_from(bucket_count).expect("bucket_count fits in u32"))
+            fastmod_magic(bucket_count)
         } else {
             0
         };
@@ -81,11 +81,7 @@ impl<K, V> BucketLevel<K, V> {
 
     #[inline]
     fn bucket_index(&self, key_hash: u64) -> usize {
-        #[allow(clippy::cast_possible_truncation)]
-        let mixed = (key_hash ^ self.salt) as u32;
-        #[allow(clippy::cast_possible_truncation)]
-        let result = fastmod_u32(mixed, self.bucket_count_magic, self.bucket_count as u32);
-        result as usize
+        fastmod_u32(key_hash ^ self.salt, self.bucket_count_magic, self.bucket_count)
     }
 
     #[inline]

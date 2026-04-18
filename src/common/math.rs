@@ -76,19 +76,33 @@ pub(crate) fn level_salt(level_idx: usize) -> u64 {
     )
 }
 
-/// Lemire fastmod: precompute magic `M = ceil(2^64 / d)` so that `a % d`
-/// becomes `(((M.wrapping_mul(a as u64)) as u128 * d as u128) >> 64) as u32`.
-/// `d` must be non-zero.
+/// Lemire fastmod: precompute magic `M = ceil(2^64 / d)` once so that each
+/// later `a % d` becomes a multiply-shift. `d` must be non-zero and fit in
+/// `u32` (panics otherwise).
 #[inline]
-pub(crate) fn fastmod_magic(d: u32) -> u64 {
-    debug_assert!(d != 0);
-    (u64::MAX / u64::from(d)).wrapping_add(1)
+#[must_use]
+pub(crate) fn fastmod_magic(d: usize) -> u64 {
+    let d_u32 = u32::try_from(d).expect("fastmod divisor fits in u32");
+    debug_assert!(d_u32 != 0);
+    (u64::MAX / u64::from(d_u32)).wrapping_add(1)
 }
 
+/// Evaluates `(a mod d)` using the magic produced by [`fastmod_magic`]. `a`
+/// contributes through its low 32 bits; `d` is the same value originally
+/// passed to `fastmod_magic`. All narrowing casts are safe given that
+/// precondition (see inline comments).
 #[inline]
-pub(crate) fn fastmod_u32(a: u32, m: u64, d: u32) -> u32 {
-    let lowbits = m.wrapping_mul(u64::from(a));
-    #[allow(clippy::cast_possible_truncation)]
-    let hi = ((u128::from(lowbits) * u128::from(d)) >> 64) as u32;
-    hi
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn fastmod_u32(a: u64, m: u64, d: usize) -> usize {
+    // `d` fits in u32 by the magic-builder precondition, so the truncation is
+    // exact. Only the low 32 bits of `a` participate in Lemire's trick; we
+    // sample them explicitly so callers don't need to narrow first.
+    let d_u32 = d as u32;
+    let a_lo = a as u32;
+    let lowbits = m.wrapping_mul(u64::from(a_lo));
+    // lowbits < 2^64 and d < 2^32, so (lowbits * d) < 2^96 and the final
+    // shift-right-by-64 yields a value that fits in u32.
+    let result = ((u128::from(lowbits) * u128::from(d_u32)) >> 64) as u32;
+    result as usize
 }

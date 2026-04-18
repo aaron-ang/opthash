@@ -1,5 +1,3 @@
-#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-
 mod common;
 
 use std::collections::HashMap as StdHashMap;
@@ -109,13 +107,19 @@ fn parse_args() -> Args {
     a
 }
 
+fn elapsed_ns(start: Instant) -> u64 {
+    // `Duration::as_nanos` returns u128; the u64 range covers ~584 years of
+    // elapsed time, so a measurement that exceeds it would be the bug.
+    u64::try_from(start.elapsed().as_nanos()).expect("elapsed fits in u64")
+}
+
 fn measure_clock_overhead_ns() -> u64 {
     let n = 10_000u64;
     let t0 = Instant::now();
     for _ in 0..n {
         black_box(Instant::now());
     }
-    (t0.elapsed().as_nanos() as u64) / n
+    elapsed_ns(t0) / n
 }
 
 fn new_hist() -> Histogram<u64> {
@@ -123,7 +127,12 @@ fn new_hist() -> Histogram<u64> {
 }
 
 fn scatter(i: usize, n: usize) -> usize {
-    ((i as u64).wrapping_mul(GOLDEN_RATIO_U64) as usize) % n
+    // `i as u64` is widening on 64-bit hosts; the trailing cast to usize is
+    // identity there. Narrowing on a hypothetical 32-bit build is acceptable —
+    // we only need uniform distribution in [0, n).
+    #[allow(clippy::cast_possible_truncation)]
+    let mixed = (i as u64).wrapping_mul(GOLDEN_RATIO_U64) as usize;
+    mixed % n
 }
 
 fn measure<F, R>(samples: usize, warmup: usize, mut op: F) -> Histogram<u64>
@@ -137,7 +146,7 @@ where
     for i in 0..samples {
         let t0 = Instant::now();
         let r = op(i);
-        let dt = t0.elapsed().as_nanos() as u64;
+        let dt = elapsed_ns(t0);
         black_box(r);
         h.record(dt.max(1)).unwrap();
     }
