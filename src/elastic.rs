@@ -441,9 +441,9 @@ where
         Q: Eq + ?Sized,
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
-        for level_idx in 0..search_limit {
+        for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
             if let Some(slot_idx) =
-                self.find_in_level_by_probe(key_hash, key_fingerprint, key, level_idx)
+                Self::find_in_level_by_probe(key_hash, key_fingerprint, key, level)
             {
                 return Some((level_idx, slot_idx));
             }
@@ -451,18 +451,17 @@ where
         None
     }
 
+    #[inline]
     fn find_in_level_by_probe<Q>(
-        &self,
         key_hash: u64,
         key_fingerprint: u8,
         key: &Q,
-        level_idx: usize,
+        level: &Level<K, V>,
     ) -> Option<usize>
     where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        let level = &self.levels[level_idx];
         if level.capacity() == 0 || level.len == 0 {
             return None;
         }
@@ -482,8 +481,13 @@ where
                 .min(group_count)
         };
 
+        let tombstone_free = level.tombstones == 0;
+        let capacity = level.capacity();
         for _ in 0..probe_limit {
-            for relative_idx in level.table.group_match_mask(group_idx, key_fingerprint) {
+            let (match_mask, free_mask) = level
+                .table
+                .group_match_and_free_mask(group_idx, key_fingerprint);
+            for relative_idx in match_mask {
                 let slot_idx = group_idx * GROUP_SIZE + relative_idx;
                 let entry = unsafe { level.table.get_ref(slot_idx) };
                 if entry.key.borrow() == key {
@@ -491,7 +495,10 @@ where
                 }
             }
 
-            if level.tombstones == 0 && level.table.first_free_in_group(group_idx).is_some() {
+            if tombstone_free
+                && let Some(off) = free_mask.lowest()
+                && group_idx * GROUP_SIZE + off < capacity
+            {
                 return None;
             }
 

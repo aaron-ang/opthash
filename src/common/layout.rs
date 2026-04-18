@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 
 use super::bitmask::BitMask;
-use super::simd::{eq_mask_16, free_mask_16};
+use super::simd::{eq_mask_16, free_mask_16, match_and_free_masks_16};
 
 use super::math::round_up_to_group;
 
@@ -184,6 +184,12 @@ impl<T> RawTable<T> {
     pub fn group_free_mask(&self, group_idx: usize) -> BitMask {
         let ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
         unsafe { free_mask_16(ptr) }
+    }
+
+    #[inline]
+    pub fn group_match_and_free_mask(&self, group_idx: usize, target: u8) -> (BitMask, BitMask) {
+        let ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
+        unsafe { match_and_free_masks_16(ptr, target) }
     }
 
     #[inline]
