@@ -102,7 +102,7 @@ FunnelHashMap
 
 ## Benchmarks
 
-All benchmarks on Apple M1 (aarch64, NEON SIMD) via Criterion. `std::HashMap` uses the same `RandomState` (SipHash) hasher as both custom maps.
+All benchmarks on ARM Cortex-X925 (Armv9.2-A, aarch64, NEON, 3.9 GHz) running Linux, via Criterion. `std::HashMap` uses the same `RandomState` (SipHash) hasher as both custom maps.
 
 ### Throughput
 
