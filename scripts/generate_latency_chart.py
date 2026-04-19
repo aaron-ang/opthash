@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -12,7 +11,6 @@ from plot_common import (
     IMPLEMENTATIONS,
     IMPL_LABELS,
     IMPL_MARKERS,
-    LATENCY_DIR,
     LATENCY_SIZES,
     apply_axis_style,
     load_criterion_mean_ns,
@@ -33,7 +31,9 @@ def plot_mean_latency_by_size(output_path: Path) -> None:
     for size_label in LATENCY_SIZES:
         group = f"get_hit_latency_{size_label}"
         try:
-            times = {impl: load_criterion_mean_ns(group, impl) for impl in IMPLEMENTATIONS}
+            times = {
+                impl: load_criterion_mean_ns(group, impl) for impl in IMPLEMENTATIONS
+            }
         except FileNotFoundError:
             continue
         sizes_found.append(size_label)
@@ -74,9 +74,12 @@ def plot_mean_latency_by_size(output_path: Path) -> None:
     save_svg(fig, output_path)
 
 
-def _percentile_curve(buckets: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+def _percentile_curve(
+    buckets: list[dict], overhead_ns: float = 0.0
+) -> tuple[np.ndarray, np.ndarray]:
     """Return (quantile, latency_ns) from sorted-by-ns_high bucket list."""
     highs = np.array([b["ns_high"] for b in buckets], dtype=float)
+    highs = np.maximum(highs - overhead_ns, 1.0)
     counts = np.array([b["count"] for b in buckets], dtype=float)
     total = counts.sum()
     if total == 0:
@@ -107,7 +110,8 @@ def plot_tail_cdf(size: int, op: str, output_path: Path) -> None:
         buckets = doc.get("histogram", [])
         if not buckets:
             continue
-        q, y = _percentile_curve(buckets)
+        overhead = float(doc.get("clock_overhead_ns", 0))
+        q, y = _percentile_curve(buckets, overhead)
         if q.size == 0:
             continue
         any_data = True
@@ -153,66 +157,21 @@ def plot_tail_cdf(size: int, op: str, output_path: Path) -> None:
     save_svg(fig, output_path)
 
 
-def discover_configs() -> list[tuple[int, str]]:
-    """Return (size, op) pairs present under target/latency/ for at least one impl."""
-    found: set[tuple[int, str]] = set()
-    if not LATENCY_DIR.exists():
-        return []
-    for impl_dir in LATENCY_DIR.iterdir():
-        if not impl_dir.is_dir():
-            continue
-        for size_dir in impl_dir.iterdir():
-            if not size_dir.is_dir():
-                continue
-            try:
-                size = int(size_dir.name)
-            except ValueError:
-                continue
-            for op_file in size_dir.glob("*.json"):
-                op = op_file.stem
-                if op in OPS:
-                    found.add((size, op))
-    return sorted(found)
+TAIL_CONFIGS: tuple[tuple[int, str], ...] = (
+    (1_000_000, "get-hit"),
+    (1_000_000, "get-miss"),
+    (1_000_000, "insert"),
+)
 
 
 def plot_all_tail_charts(assets_dir: Path) -> None:
-    configs = discover_configs()
-    if not configs:
-        print("no tail latency data found under target/latency/, skipping")
-        return
-    for size, op in configs:
+    for size, op in TAIL_CONFIGS:
         plot_tail_cdf(size, op, assets_dir / f"latency-tail-{size}-{op}.svg")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate latency charts")
-    parser.add_argument("--size", type=int, help="Map size to plot (omit to plot all found)")
-    parser.add_argument("--op", choices=OPS, help="Operation to plot (omit to plot all found)")
-    parser.add_argument(
-        "--mean-only",
-        action="store_true",
-        help="Only regenerate the Criterion-mean chart",
-    )
-    args = parser.parse_args()
-
     plot_mean_latency_by_size(ASSETS_DIR / "benchmark-latency.svg")
-    if args.mean_only:
-        return
-
-    if args.size is not None and args.op is not None:
-        plot_tail_cdf(args.size, args.op, ASSETS_DIR / f"latency-tail-{args.size}-{args.op}.svg")
-        return
-
-    configs = discover_configs()
-    if args.size is not None:
-        configs = [(s, o) for s, o in configs if s == args.size]
-    if args.op is not None:
-        configs = [(s, o) for s, o in configs if o == args.op]
-    if not configs:
-        print("no matching tail latency data, skipping")
-        return
-    for size, op in configs:
-        plot_tail_cdf(size, op, ASSETS_DIR / f"latency-tail-{size}-{op}.svg")
+    plot_all_tail_charts(ASSETS_DIR)
 
 
 if __name__ == "__main__":

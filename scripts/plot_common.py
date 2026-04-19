@@ -12,13 +12,14 @@ CRITERION_DIR = ROOT / "target" / "criterion"
 LATENCY_DIR = ROOT / "target" / "latency"
 ASSETS_DIR = ROOT / "assets"
 
-IMPLEMENTATIONS = ("std", "elastic", "funnel")
+IMPLEMENTATIONS = ("std", "hashbrown", "elastic", "funnel")
 IMPL_LABELS = {
     "std": "std::HashMap",
+    "hashbrown": "hashbrown::HashMap",
     "elastic": "ElasticHashMap",
     "funnel": "FunnelHashMap",
 }
-IMPL_MARKERS = {"std": "o", "elastic": "s", "funnel": "D"}
+IMPL_MARKERS = {"std": "o", "hashbrown": "v", "elastic": "s", "funnel": "D"}
 
 LATENCY_SIZES = ("100", "1K", "10K", "100K", "1M", "10M")
 

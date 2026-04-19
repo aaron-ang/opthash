@@ -33,7 +33,9 @@ def plot_throughput_speedup(output_path: Path) -> None:
 
     for workload, label in THROUGHPUT_WORKLOADS:
         try:
-            times = {impl: load_criterion_mean_ns(workload, impl) for impl in IMPLEMENTATIONS}
+            times = {
+                impl: load_criterion_mean_ns(workload, impl) for impl in IMPLEMENTATIONS
+            }
         except FileNotFoundError:
             continue
         labels.append(label)
