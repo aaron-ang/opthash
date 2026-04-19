@@ -1,7 +1,7 @@
 use std::borrow::Borrow;
-use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
+use crate::common::DefaultHashBuilder;
 use crate::common::simd::ProbeOps;
 
 use crate::common::{
@@ -124,7 +124,6 @@ impl<K, V> Drop for Level<K, V> {
     }
 }
 
-#[derive(Debug)]
 pub struct ElasticHashMap<K, V> {
     levels: Vec<Level<K, V>>,
     len: usize,
@@ -136,7 +135,17 @@ pub struct ElasticHashMap<K, V> {
     current_batch_index: usize,
     batch_remaining: usize,
     max_populated_level: usize,
-    hash_builder: RandomState,
+    hash_builder: DefaultHashBuilder,
+}
+
+impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for ElasticHashMap<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ElasticHashMap")
+            .field("len", &self.len)
+            .field("capacity", &self.capacity)
+            .field("max_populated_level", &self.max_populated_level)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<K, V> Default for ElasticHashMap<K, V>
@@ -164,10 +173,10 @@ where
 
     #[must_use]
     pub fn with_options(options: ElasticOptions) -> Self {
-        Self::with_options_and_hasher(options, RandomState::new())
+        Self::with_options_and_hasher(options, DefaultHashBuilder::default())
     }
 
-    fn with_options_and_hasher(options: ElasticOptions, hash_builder: RandomState) -> Self {
+    fn with_options_and_hasher(options: ElasticOptions, hash_builder: DefaultHashBuilder) -> Self {
         let reserve_fraction = sanitize_reserve_fraction(options.reserve_fraction);
         let probe_scale = sanitize_probe_scale(options.probe_scale);
         let capacity = options.capacity;

@@ -5,6 +5,8 @@ pub(crate) mod layout;
 pub(crate) mod math;
 pub(crate) mod simd;
 
+pub(crate) type DefaultHashBuilder = foldhash::fast::RandomState;
+
 #[cfg(test)]
 mod tests {
     use super::layout::RawTable;

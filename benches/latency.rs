@@ -1,7 +1,5 @@
 mod common;
 
-use std::collections::HashMap as StdHashMap;
-use std::env;
 use std::fs;
 use std::hint::black_box;
 use std::io::Write;
@@ -9,11 +7,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use common::{
-    GOLDEN_RATIO_U64, VALUE_XOR_MIX, build_elastic_map, build_funnel_map, build_std_map, key_at,
-    make_pairs,
+    GOLDEN_RATIO_U64, VALUE_XOR_MIX, build_elastic_map, build_funnel_map, build_hashbrown_map,
+    build_std_map, key_at, make_pairs,
 };
 use hdrhistogram::Histogram;
-use opthash::{ElasticHashMap, FunnelHashMap};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Op {
@@ -30,86 +27,15 @@ impl Op {
             Op::Insert => "insert",
         }
     }
-    fn parse(s: &str) -> Result<Op, String> {
-        match s {
-            "get-hit" => Ok(Op::GetHit),
-            "get-miss" => Ok(Op::GetMiss),
-            "insert" => Ok(Op::Insert),
-            other => Err(format!("unknown op '{other}'")),
-        }
-    }
 }
 
-const ALL_MAPS: &[&str] = &["std", "elastic", "funnel"];
-const DEFAULT_OPS: &[Op] = &[Op::GetHit, Op::GetMiss, Op::Insert];
-const DEFAULT_SIZES: &[usize] = &[10_000, 100_000, 1_000_000];
-const DEFAULT_SAMPLES: usize = 1_000_000;
-const DEFAULT_WARMUP: usize = 10_000;
-
-struct Args {
-    sizes: Vec<usize>,
-    ops: Vec<Op>,
-    maps: Vec<&'static str>,
-    samples: usize,
-    warmup: usize,
-}
-
-fn parse_args() -> Args {
-    let mut a = Args {
-        sizes: DEFAULT_SIZES.to_vec(),
-        ops: DEFAULT_OPS.to_vec(),
-        maps: ALL_MAPS.to_vec(),
-        samples: DEFAULT_SAMPLES,
-        warmup: DEFAULT_WARMUP,
-    };
-    let mut it = env::args().skip(1);
-    while let Some(flag) = it.next() {
-        match flag.as_str() {
-            "--size" => {
-                let v = it.next().expect("--size needs value");
-                a.sizes = v
-                    .split(',')
-                    .map(|s| s.parse().expect("size must be usize"))
-                    .collect();
-            }
-            "--op" => {
-                let v = it.next().expect("--op needs value");
-                a.ops = v.split(',').map(|s| Op::parse(s).unwrap()).collect();
-            }
-            "--map" => {
-                let v = it.next().expect("--map needs value");
-                a.maps = v
-                    .split(',')
-                    .map(|s| match s {
-                        "std" => "std",
-                        "elastic" => "elastic",
-                        "funnel" => "funnel",
-                        other => panic!("unknown map '{other}'"),
-                    })
-                    .collect();
-            }
-            "--samples" => {
-                a.samples = it
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .expect("--samples int");
-            }
-            "--warmup" => {
-                a.warmup = it
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .expect("--warmup int");
-            }
-            _ if flag.starts_with("--") => eprintln!("warning: ignoring flag {flag}"),
-            _ => {}
-        }
-    }
-    a
-}
+const MAPS: &[&str] = &["std", "hashbrown", "elastic", "funnel"];
+const OPS: &[Op] = &[Op::GetHit, Op::GetMiss, Op::Insert];
+const SIZES: &[usize] = &[10_000, 100_000, 1_000_000, 10_000_000];
+const SAMPLES: usize = 1_000_000;
+const WARMUP: usize = 10_000;
 
 fn elapsed_ns(start: Instant) -> u64 {
-    // `Duration::as_nanos` returns u128; the u64 range covers ~584 years of
-    // elapsed time, so a measurement that exceeds it would be the bug.
     u64::try_from(start.elapsed().as_nanos()).expect("elapsed fits in u64")
 }
 
@@ -123,13 +49,10 @@ fn measure_clock_overhead_ns() -> u64 {
 }
 
 fn new_hist() -> Histogram<u64> {
-    Histogram::<u64>::new_with_bounds(1, 10_000_000, 3).expect("valid hdr bounds")
+    Histogram::<u64>::new_with_bounds(1, 1_000_000_000, 3).expect("valid hdr bounds")
 }
 
 fn scatter(i: usize, n: usize) -> usize {
-    // `i as u64` is widening on 64-bit hosts; the trailing cast to usize is
-    // identity there. Narrowing on a hypothetical 32-bit build is acceptable —
-    // we only need uniform distribution in [0, n).
     #[allow(clippy::cast_possible_truncation)]
     let mixed = (i as u64).wrapping_mul(GOLDEN_RATIO_U64) as usize;
     mixed % n
@@ -164,6 +87,12 @@ fn run_get_hit(map: &str, size: usize, samples: usize, warmup: usize) -> Histogr
                 m.get(black_box(&keys[scatter(i, n)])).copied()
             })
         }
+        "hashbrown" => {
+            let m = build_hashbrown_map(&pairs);
+            measure(samples, warmup, |i| {
+                m.get(black_box(&keys[scatter(i, n)])).copied()
+            })
+        }
         "elastic" => {
             let m = build_elastic_map(&pairs);
             measure(samples, warmup, |i| {
@@ -191,6 +120,12 @@ fn run_get_miss(map: &str, size: usize, samples: usize, warmup: usize) -> Histog
                 m.get(black_box(&miss_keys[scatter(i, n)])).copied()
             })
         }
+        "hashbrown" => {
+            let m = build_hashbrown_map(&pairs);
+            measure(samples, warmup, |i| {
+                m.get(black_box(&miss_keys[scatter(i, n)])).copied()
+            })
+        }
         "elastic" => {
             let m = build_elastic_map(&pairs);
             measure(samples, warmup, |i| {
@@ -207,8 +142,10 @@ fn run_get_miss(map: &str, size: usize, samples: usize, warmup: usize) -> Histog
     }
 }
 
-fn run_insert(map: &str, samples: usize, warmup: usize) -> Histogram<u64> {
+fn run_insert(map: &str, size: usize, samples: usize, warmup: usize) -> Histogram<u64> {
     let total = samples + warmup;
+    let prefill = size.saturating_sub(total);
+    let prefill_pairs = make_pairs(prefill);
     let insert_keys: Vec<(u64, u64)> = (0..total)
         .map(|i| {
             let k = key_at(i + 200_000_000);
@@ -217,21 +154,28 @@ fn run_insert(map: &str, samples: usize, warmup: usize) -> Histogram<u64> {
         .collect();
     match map {
         "std" => {
-            let mut m: StdHashMap<u64, u64> = StdHashMap::new();
+            let mut m = build_std_map(&prefill_pairs);
+            measure(samples, warmup, |i| {
+                let (k, v) = insert_keys[i];
+                m.insert(k, v)
+            })
+        }
+        "hashbrown" => {
+            let mut m = build_hashbrown_map(&prefill_pairs);
             measure(samples, warmup, |i| {
                 let (k, v) = insert_keys[i];
                 m.insert(k, v)
             })
         }
         "elastic" => {
-            let mut m: ElasticHashMap<u64, u64> = ElasticHashMap::new();
+            let mut m = build_elastic_map(&prefill_pairs);
             measure(samples, warmup, |i| {
                 let (k, v) = insert_keys[i];
                 m.insert(k, v)
             })
         }
         "funnel" => {
-            let mut m: FunnelHashMap<u64, u64> = FunnelHashMap::new();
+            let mut m = build_funnel_map(&prefill_pairs);
             measure(samples, warmup, |i| {
                 let (k, v) = insert_keys[i];
                 m.insert(k, v)
@@ -245,7 +189,7 @@ fn run(map: &str, size: usize, op: Op, samples: usize, warmup: usize) -> Histogr
     match op {
         Op::GetHit => run_get_hit(map, size, samples, warmup),
         Op::GetMiss => run_get_miss(map, size, samples, warmup),
-        Op::Insert => run_insert(map, samples, warmup),
+        Op::Insert => run_insert(map, size, samples, warmup),
     }
 }
 
@@ -321,27 +265,21 @@ fn write_json(
 }
 
 fn main() {
-    let args = parse_args();
     let overhead = measure_clock_overhead_ns();
     eprintln!("clock_overhead_ns ≈ {overhead}");
 
-    for &size in &args.sizes {
-        for &op in &args.ops {
-            for &m in &args.maps {
-                if op == Op::Insert && size != args.sizes[0] {
-                    // Insert ignores `size` (uses `samples`), so run once per map instead of per size.
-                    continue;
-                }
+    for &size in SIZES {
+        for &op in OPS {
+            for &m in MAPS {
                 eprint!(
-                    "running map={m} size={size} op={} samples={} ... ",
-                    op.name(),
-                    args.samples
+                    "running map={m} size={size} op={} samples={SAMPLES} ... ",
+                    op.name()
                 );
                 let t0 = Instant::now();
-                let h = run(m, size, op, args.samples, args.warmup);
+                let h = run(m, size, op, SAMPLES, WARMUP);
                 let dur = t0.elapsed();
-                let path = write_json(m, size, op, &h, overhead, args.samples)
-                    .expect("write latency json");
+                let path =
+                    write_json(m, size, op, &h, overhead, SAMPLES).expect("write latency json");
                 eprintln!(
                     "done in {:.1}s | p50={}ns p99={}ns p999={}ns max={}ns → {}",
                     dur.as_secs_f64(),

@@ -1,6 +1,6 @@
 # Benchmarking
 
-Two bench targets compare `std::collections::HashMap`, `opthash::ElasticHashMap`, `opthash::FunnelHashMap`. Shared fixtures live in `benches/common.rs`.
+Two bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `opthash::ElasticHashMap`, `opthash::FunnelHashMap`. Shared fixtures live in `benches/common.rs`.
 
 ## `benches/speedup.rs` — throughput + mean latency (Criterion)
 
@@ -16,7 +16,7 @@ Throughput workloads:
 
 The tiny-map workload exercises the internal tiny-table engine. Delete-heavy and resize-heavy expose tombstone handling and growth costs instead of only steady-state inserts.
 
-Latency workload: `get_hit_latency_<size>` for sizes 100, 1K, 10K, 100K, 1M, 10M — Criterion-mean per-lookup time.
+Latency workload: `get_hit_latency_<size>` for sizes 100, 1K, 10K, 100K, 1M — Criterion-mean per-lookup time.
 
 Run:
 
@@ -27,16 +27,11 @@ cargo bench --bench speedup -- "get_hit"          # Criterion name filter
 
 ## `benches/latency.rs` — tail-latency histograms (hdrhistogram)
 
-Captures per-operation latency distributions (p50/p90/p99/p999/p9999/max) and dumps them to JSON for plotting. Custom `harness = false` main, not Criterion.
-
-Defaults: sizes 10K/100K/1M × ops get-hit/get-miss/insert × all three maps × 1M samples × 10K warmup.
+Captures per-operation latency distributions (p50/p90/p99/p999/p9999/max) and dumps them to JSON for plotting. Custom `harness = false` main, not Criterion. Hard-coded matrix: sizes 10K/100K/1M × ops get-hit/get-miss/insert × {std, elastic, funnel} × 1M samples × 10K warmup — edit the consts at the top of `benches/latency.rs` to change. Output: `target/latency/<map>/<size>/<op>.json`.
 
 ```bash
 cargo bench --bench latency
-cargo bench --bench latency -- --size 100000 --op get-hit --map elastic --samples 500000
 ```
-
-Multi-value: comma-separate (`--size 10000,100000`). Output: `target/latency/<map>/<size>/<op>.json`.
 
 ## Reports
 

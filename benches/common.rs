@@ -2,9 +2,10 @@
 
 use std::collections::HashMap as StdHashMap;
 
+use hashbrown::HashMap as HashbrownMap;
 use opthash::{ElasticHashMap, FunnelHashMap};
 
-pub const LATENCY_SIZES: &[usize] = &[100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
+pub const LATENCY_SIZES: &[usize] = &[100, 1_000, 10_000, 100_000, 1_000_000];
 
 /// Knuth multiplicative-hash constant (golden ratio * 2^64, odd).
 pub const GOLDEN_RATIO_U64: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -45,6 +46,14 @@ pub fn build_elastic_map(pairs: &[(u64, u64)]) -> ElasticHashMap<u64, u64> {
 
 pub fn build_funnel_map(pairs: &[(u64, u64)]) -> FunnelHashMap<u64, u64> {
     let mut map = FunnelHashMap::with_capacity(pairs.len() * 2);
+    for &(key, value) in pairs {
+        map.insert(key, value);
+    }
+    map
+}
+
+pub fn build_hashbrown_map(pairs: &[(u64, u64)]) -> HashbrownMap<u64, u64> {
+    let mut map = HashbrownMap::with_capacity(pairs.len() * 2);
     for &(key, value) in pairs {
         map.insert(key, value);
     }

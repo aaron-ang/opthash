@@ -4,14 +4,16 @@ use std::collections::HashMap as StdHashMap;
 use std::hint::black_box;
 
 use std::path::Path;
+use std::time::Duration;
 
 use common::{
-    LATENCY_SIZES, VALUE_XOR_MIX_ALT, build_elastic_map, build_funnel_map, build_std_map, key_at,
-    make_pairs, size_label,
+    LATENCY_SIZES, VALUE_XOR_MIX_ALT, build_elastic_map, build_funnel_map, build_hashbrown_map,
+    build_std_map, key_at, make_pairs, size_label,
 };
 use criterion::{
     BatchSize, Criterion, Throughput, criterion_group, criterion_main, profiler::Profiler,
 };
+use hashbrown::HashMap as HashbrownMap;
 use opthash::{ElasticHashMap, FunnelHashMap};
 use pprof::{ProfilerGuard, flamegraph::Options as FlamegraphOptions};
 
@@ -76,6 +78,19 @@ fn bench_insert_throughput(c: &mut Criterion) {
         );
     });
 
+    group.bench_function("hashbrown", |b| {
+        b.iter_batched_ref(
+            || HashbrownMap::<u64, u64>::with_capacity(INSERT_COUNT * 2),
+            |map| {
+                for &(key, value) in &pairs {
+                    map.insert(black_box(key), black_box(value));
+                }
+                black_box(map.len())
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
     group.bench_function("elastic", |b| {
         b.iter_batched_ref(
             || ElasticHashMap::with_capacity(INSERT_COUNT * 2),
@@ -117,6 +132,18 @@ fn bench_get_hit_throughput(c: &mut Criterion) {
     group.bench_function("std", |b| {
         b.iter_batched(
             || build_std_map(&pairs),
+            |map| {
+                for key in &query_keys {
+                    black_box(map.get(black_box(key)));
+                }
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.bench_function("hashbrown", |b| {
+        b.iter_batched(
+            || build_hashbrown_map(&pairs),
             |map| {
                 for key in &query_keys {
                     black_box(map.get(black_box(key)));
@@ -174,6 +201,18 @@ fn bench_get_miss_throughput(c: &mut Criterion) {
         );
     });
 
+    group.bench_function("hashbrown", |b| {
+        b.iter_batched(
+            || build_hashbrown_map(&pairs),
+            |map| {
+                for key in &query_keys {
+                    black_box(map.get(black_box(key)));
+                }
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
     group.bench_function("elastic", |b| {
         b.iter_batched(
             || build_elastic_map(&pairs),
@@ -219,6 +258,24 @@ fn bench_tiny_lookup_throughput(c: &mut Criterion) {
     group.bench_function("std", |b| {
         b.iter_batched(
             || build_std_map(&pairs),
+            |map| {
+                for key in &query_keys {
+                    black_box(map.get(black_box(key)));
+                }
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.bench_function("hashbrown", |b| {
+        b.iter_batched(
+            || {
+                let mut map = HashbrownMap::with_capacity(TINY_MAP_SIZE);
+                for &(key, value) in &pairs {
+                    map.insert(key, value);
+                }
+                map
+            },
             |map| {
                 for key in &query_keys {
                     black_box(map.get(black_box(key)));
@@ -293,6 +350,20 @@ fn bench_delete_heavy_throughput(c: &mut Criterion) {
         );
     });
 
+    group.bench_function("hashbrown", |b| {
+        b.iter_batched(
+            || build_hashbrown_map(&initial_pairs),
+            |mut map| {
+                for idx in 0..DELETE_OP_COUNT {
+                    black_box(map.remove(black_box(&initial_pairs[idx].0)));
+                    let (key, value) = replacement_pairs[idx];
+                    black_box(map.insert(black_box(key), black_box(value)));
+                }
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
     group.bench_function("elastic", |b| {
         b.iter_batched(
             || build_elastic_map(&initial_pairs),
@@ -332,6 +403,19 @@ fn bench_resize_heavy_throughput(c: &mut Criterion) {
     group.bench_function("std", |b| {
         b.iter_batched(
             StdHashMap::new,
+            |mut map| {
+                for &(key, value) in &pairs {
+                    black_box(map.insert(black_box(key), black_box(value)));
+                }
+                black_box(map.len())
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.bench_function("hashbrown", |b| {
+        b.iter_batched(
+            HashbrownMap::<u64, u64>::new,
             |mut map| {
                 for &(key, value) in &pairs {
                     black_box(map.insert(black_box(key), black_box(value)));
@@ -398,6 +482,18 @@ fn bench_mixed_lookup_throughput(c: &mut Criterion) {
         );
     });
 
+    group.bench_function("hashbrown", |b| {
+        b.iter_batched(
+            || build_hashbrown_map(&pairs),
+            |map| {
+                for key in &query_keys {
+                    black_box(map.get(black_box(key)));
+                }
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
     group.bench_function("elastic", |b| {
         b.iter_batched(
             || build_elastic_map(&pairs),
@@ -443,6 +539,16 @@ fn bench_get_hit_latency(c: &mut Criterion) {
             });
         });
 
+        group.bench_function("hashbrown", |b| {
+            let map = build_hashbrown_map(&pairs);
+            let mut i = 0;
+            b.iter(|| {
+                let key = &query_keys[i % size];
+                i = i.wrapping_add(1);
+                black_box(map.get(black_box(key)))
+            });
+        });
+
         group.bench_function("elastic", |b| {
             let map = build_elastic_map(&pairs);
             let mut i = 0;
@@ -469,7 +575,10 @@ fn bench_get_hit_latency(c: &mut Criterion) {
 
 criterion_group!(
     name = benches;
-    config = Criterion::default().with_profiler(FlamegraphProfiler::new());
+    config = Criterion::default()
+        .with_profiler(FlamegraphProfiler::new())
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(2));
     targets =
         bench_insert_throughput,
         bench_get_hit_throughput,

@@ -19,8 +19,12 @@ exclude = [
     "/requirements.txt",
 ]
 
+[dependencies]
+foldhash = "0.2"
+
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
+hashbrown = "0.17"
 hdrhistogram = "7.5"
 pprof = { version = "0.15", features = ["flamegraph"] }
 

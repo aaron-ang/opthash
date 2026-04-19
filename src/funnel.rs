@@ -1,7 +1,7 @@
 use std::borrow::Borrow;
-use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
+use crate::common::DefaultHashBuilder;
 use crate::common::simd::{ProbeOps, prefetch_read};
 
 use crate::common::{
@@ -81,7 +81,11 @@ impl<K, V> BucketLevel<K, V> {
 
     #[inline]
     fn bucket_index(&self, key_hash: u64) -> usize {
-        fastmod_u32(key_hash ^ self.salt, self.bucket_count_magic, self.bucket_count)
+        fastmod_u32(
+            key_hash ^ self.salt,
+            self.bucket_count_magic,
+            self.bucket_count,
+        )
     }
 
     #[inline]
@@ -219,7 +223,6 @@ enum LookupStep {
     StopSearch,
 }
 
-#[derive(Debug)]
 pub struct FunnelHashMap<K, V> {
     levels: Vec<BucketLevel<K, V>>,
     special: SpecialArray<K, V>,
@@ -229,7 +232,17 @@ pub struct FunnelHashMap<K, V> {
     reserve_fraction: f64,
     primary_probe_limit: usize,
     max_populated_level: usize,
-    hash_builder: RandomState,
+    hash_builder: DefaultHashBuilder,
+}
+
+impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for FunnelHashMap<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FunnelHashMap")
+            .field("len", &self.len)
+            .field("capacity", &self.capacity)
+            .field("max_populated_level", &self.max_populated_level)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<K, V> Default for FunnelHashMap<K, V>
@@ -257,10 +270,10 @@ where
 
     #[must_use]
     pub fn with_options(options: FunnelOptions) -> Self {
-        Self::with_options_and_hasher(options, RandomState::new())
+        Self::with_options_and_hasher(options, DefaultHashBuilder::default())
     }
 
-    fn with_options_and_hasher(options: FunnelOptions, hash_builder: RandomState) -> Self {
+    fn with_options_and_hasher(options: FunnelOptions, hash_builder: DefaultHashBuilder) -> Self {
         let reserve_fraction =
             sanitize_reserve_fraction(options.reserve_fraction).min(MAX_FUNNEL_RESERVE_FRACTION);
         let capacity = options.capacity;
