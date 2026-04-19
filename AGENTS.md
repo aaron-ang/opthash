@@ -13,7 +13,7 @@ cargo bench                                 # Run all benchmarks
 
 ## Benchmarks
 
-Criterion benchmark suite comparing `ElasticHashMap`, `FunnelHashMap`, and `std::HashMap`:
+Criterion benchmark suite comparing `ElasticHashMap`, `FunnelHashMap`, `std::HashMap`, and `hashbrown::HashMap` (SwissTable + foldhash — absolute ceiling reference):
 
 - **`cargo bench --bench speedup`** — throughput (insert, get hit/miss/mixed/tiny, delete-heavy, resize-heavy) and Criterion-mean per-lookup latency at varying map sizes
 - Run a subset: `cargo bench --bench speedup -- "get_hit_latency"` (Criterion name filter)
@@ -27,17 +27,16 @@ Example path: `target/criterion/get_hit_throughput/elastic/change/estimates.json
 
 ### Tail-latency harness
 
-- **`cargo bench --bench latency`** — per-operation latency distributions (p50/p90/p99/p999/p9999/max) via `hdrhistogram`. Defaults sweep sizes 10K/100K/1M × ops get-hit/get-miss/insert × all three maps.
-- CLI filters: `cargo bench --bench latency -- --size 100000 --op get-hit --map elastic --samples 500000 --warmup 10000` (comma-separate to pass multiple).
-- Output: `target/latency/<map>/<size>/<op>.json` — percentiles + histogram buckets.
+- **`cargo bench --bench latency`** — per-operation latency distributions (p50/p90/p99/p999/p9999/max) via `hdrhistogram`. Hard-coded matrix (edit the consts at the top of `benches/latency.rs` to change): sizes 10K/100K/1M/10M × ops get-hit/get-miss/insert × all four maps × 1M samples × 10K warmup. `insert` pre-fills to `size − samples` before measuring so tail percentiles reflect insert cost near the target load, not into an empty map.
+- Output: `target/latency/<map>/<size>/<op>.json` — percentiles + histogram buckets + `clock_overhead_ns`.
 
 ### Charts
 
 - `uv run scripts/generate_speedup_chart.py` — throughput speedup bar chart
-- `uv run scripts/generate_latency_chart.py [--size N --op OP] [--mean-only]` — Criterion-mean latency line + per-config tail CDFs + percentile bars
+- `uv run scripts/generate_latency_chart.py` — Criterion-mean latency line + pinned tail CDFs (edit `TAIL_CONFIGS` in the script to re-pin; currently 1M × 3 ops)
 - `uv run scripts/generate_all_charts.py` — regenerate everything
 
-Charts are saved in `assets/`. Shared plotting helpers live in `scripts/plot_common.py`.
+Charts are saved in `assets/`. Shared plotting helpers (`IMPLEMENTATIONS`, loaders, axis styling) live in `scripts/plot_common.py`. The tail plotter subtracts `clock_overhead_ns` so percentiles reflect per-op latency, not per-(op + `Instant::now()`).
 
 ## Project structure
 
@@ -47,12 +46,12 @@ Charts are saved in `assets/`. Shared plotting helpers live in `scripts/plot_com
 
 ## Refactoring guidelines
 
-- If a low-level helper is used by both the root crate and benchmarks, move it into `opthash-internal/` instead of duplicating it or exposing bench-only API from `src/`.
+- Low-level helpers used by both the library and benchmarks live in `src/common/` (bitmask, simd, layout, math). Benches pull fixtures from `benches/common.rs`. Don't duplicate primitives across `src/` and `benches/`.
 - Prefer layout and locality wins before adding more metadata.
 - Keep hot metadata contiguous. If fields are read together, store them together.
 - Avoid metadata that is expensive to maintain on every insert or delete unless benchmarks prove it wins overall.
 - Cache routing state that is reused in hot paths. Do not recompute it per probe.
 - Preserve SIMD-friendly control-byte scans: contiguous groups, cheap bitmask iteration, and early rejection before touching payloads.
 - Reject optimizations that improve only microbenchmarks but regress the public `throughput` suite.
-- Profile hot functions before and after changes. In this repo, focus on `find_*`, `first_free_*`, `place_new_entry`, and constructor/resize paths.
+- Profile hot functions before and after changes. In this repo, focus on `find_slot_indices_with_hash` / `find_in_level_by_probe` (elastic), `find_slot_location_with_hash` / `find_in_level_bucket` (funnel), `group_probe_params`, `choose_slot_for_new_key`, and the resize paths.
 - Use `target/criterion/` as the final gate. If the relevant benchmark regresses, the optimization does not stay.

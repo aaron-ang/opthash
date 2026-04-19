@@ -6,8 +6,10 @@ Both are open-addressing hash maps that achieve optimal expected probe complexit
 
 ## Data Structures
 
-* **`ElasticHashMap<K, V>`** — Multi-level table with geometrically halving levels. Each level is a `RawTable` plus probe budgets, group steps, and tombstone accounting.
-* **`FunnelHashMap<K, V>`** — Multi-level bucketed table with per-bucket metadata and a split special array: `primary` (group-probed) plus `fallback` (two-choice buckets).
+Both maps share a common core: `RawTable`-backed multi-level layouts, 7-bit fingerprint control bytes, SIMD control-byte scans for occupancy + lookup, tombstone accounting, and per-level Lemire fastmod magics for the hash → slot mapping. The default `BuildHasher` is [`foldhash`](https://crates.io/crates/foldhash).
+
+* **`ElasticHashMap<K, V>`** — Flat `RawTable` per level with geometrically halving capacities; insertion uses per-level probe budgets + coprime group steps.
+* **`FunnelHashMap<K, V>`** — Bucketed levels plus a split special array: `primary` (group-probed) and `fallback` (two-choice buckets).
 
 Both support `insert`, `get`, `get_mut`, `contains_key`, `remove`, and `clear`. Maps start with zero allocation (`new()`) and grow dynamically on demand. Advanced tuning is available through `ElasticOptions`, `FunnelOptions`, and `with_options(...)`.
 
@@ -66,7 +68,8 @@ ElasticHashMap
     Level 2    ...
 
     per-level  len, tombstones, half_reserve_slot_threshold,
-               limited_probe_budgets, group_steps, salt
+               limited_probe_budgets, group_steps, salt,
+               group_count_magic, step_count_magic
 
   table-wide   len, capacity, max_insertions, reserve_fraction,
                probe_scale, batch_plan, current_batch_index,
@@ -86,7 +89,8 @@ FunnelHashMap
     Level 1    (same layout, smaller buckets)
     ...
 
-    per-level  len, tombstones, bucket_size, bucket_count
+    per-level  len, tombstones, bucket_size, bucket_count,
+               salt, bucket_count_magic
 
   special: SpecialArray
 
@@ -102,7 +106,7 @@ FunnelHashMap
 
 ## Benchmarks
 
-All benchmarks on ARM Cortex-X925 (Armv9.2-A, aarch64, NEON, 3.9 GHz) running Linux, via Criterion. `std::HashMap` uses the same `RandomState` (SipHash) hasher as both custom maps.
+All benchmarks on ARM Cortex-X925 (Armv9.2-A, aarch64, NEON, 3.9 GHz) running Linux, via Criterion. Four variants are compared: `std::HashMap` (SwissTable + SipHash), `hashbrown::HashMap` (SwissTable + foldhash), and our `ElasticHashMap` / `FunnelHashMap` (multi-level + foldhash).
 
 ### Throughput
 
@@ -114,10 +118,10 @@ All benchmarks on ARM Cortex-X925 (Armv9.2-A, aarch64, NEON, 3.9 GHz) running Li
 
 #### Tail latency distributions
 
-![Tail latency — get-hit @ 10K](assets/latency-tail-10000-get-hit.svg)
+![Tail latency — get-hit @ 1M](assets/latency-tail-1000000-get-hit.svg)
 
-![Tail latency — get-miss @ 10K](assets/latency-tail-10000-get-miss.svg)
+![Tail latency — get-miss @ 1M](assets/latency-tail-1000000-get-miss.svg)
 
-![Tail latency — insert @ 10K](assets/latency-tail-10000-insert.svg)
+![Tail latency — insert @ 1M](assets/latency-tail-1000000-insert.svg)
 
 See [benches/README.md](benches/README.md) for bench target layout, CLI flags, chart regeneration, and flamegraph profiling.
