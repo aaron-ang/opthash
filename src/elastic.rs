@@ -547,20 +547,9 @@ where
         let group_count = level.table.group_count();
         let mut group_idx = group_start;
 
-        let probe_limit = if level.tombstones == 0 {
-            group_count
-        } else {
-            level
-                .limited_probe_budgets
-                .get(1)
-                .copied()
-                .unwrap_or(group_count)
-                .min(group_count)
-        };
-
         let tombstone_free = level.tombstones == 0;
         let capacity = level.capacity();
-        for _ in 0..probe_limit {
+        for _ in 0..group_count {
             let (match_mask, free_mask) = level
                 .table
                 .group_match_and_free_mask(group_idx, key_fingerprint);
@@ -914,28 +903,41 @@ mod tests {
 
     #[test]
     fn delete_heavy_preserves_correctness() {
-        let mut map = ElasticHashMap::with_capacity(200);
-        for i in 0..100 {
-            map.insert(i, i * 10);
-        }
-        // Delete most entries, then verify the rest are still findable.
-        for i in 0..80 {
-            assert_eq!(map.remove(&i), Some(i * 10));
-        }
-        for i in 80..100 {
-            assert_eq!(
-                map.get(&i),
-                Some(&(i * 10)),
-                "key {i} missing after deletes"
-            );
-        }
-        assert_eq!(map.len(), 20);
-        // Re-insert into tombstone-heavy map.
-        for i in 200..250 {
-            assert_eq!(map.insert(i, i), None);
-        }
-        for i in 200..250 {
-            assert_eq!(map.get(&i), Some(&i), "key {i} missing after re-insert");
+        let n = 10_000;
+        let cutoff = (n * 4) / 5;
+        for trial in 0..50 {
+            let mut map = ElasticHashMap::new();
+            for i in 0..n {
+                map.insert(i, i * 10);
+            }
+            // Delete the first 80% of keys.
+            for i in 0..cutoff {
+                assert_eq!(
+                    map.remove(&i),
+                    Some(i * 10),
+                    "trial {trial}: missing key {i} during delete"
+                );
+            }
+            // Lookup remaining keys (post-tombstone state).
+            for i in cutoff..n {
+                assert_eq!(
+                    map.get(&i),
+                    Some(&(i * 10)),
+                    "trial {trial}: key {i} missing after deletes"
+                );
+            }
+            assert_eq!(map.len(), (n - cutoff) as usize);
+            // Re-insert into tombstone-heavy map.
+            for i in n..(n + n / 5) {
+                assert_eq!(map.insert(i, i), None);
+            }
+            for i in n..(n + n / 5) {
+                assert_eq!(
+                    map.get(&i),
+                    Some(&i),
+                    "trial {trial}: key {i} missing after re-insert"
+                );
+            }
         }
     }
 

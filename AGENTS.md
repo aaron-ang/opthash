@@ -31,11 +31,24 @@ Example path: `target/criterion/get_hit_throughput/elastic/change/estimates.json
 - **`cargo bench --bench latency`** — per-operation latency distributions (p50/p90/p99/p999/p9999/max) via `hdrhistogram`. Hard-coded matrix (edit the consts at the top of `benches/latency.rs` to change): sizes 10K/100K/1M/10M × ops get-hit/get-miss/insert × all four maps × 1M samples × 10K warmup. `insert` pre-fills to `size − samples` before measuring so tail percentiles reflect insert cost near the target load, not into an empty map.
 - Output: `target/latency/<map>/<size>/<op>.json` — percentiles + histogram buckets + `clock_overhead_ns`.
 
+### Python-side benchmarks
+
+`benches/python.py` — pytest-benchmark suite comparing `dict`, `ElasticHashMap`, and `FunnelHashMap` from Python across insert / get_hit / get_miss / mixed / delete workloads at N = 10K. The opthash maps cross the GIL → `HashedAny::hash()` → Python bytecode per op, so `dict` will usually win; the chart is a reality check, not a perf claim.
+
+```bash
+pytest -o python_files='*.py' benches/python.py --benchmark-json=.benchmarks/python.json
+
+uv run --group charts python scripts/generate_python_chart.py
+```
+
+The `python_files` override is needed because the file is named `python.py` to match the Rust convention (`speedup.rs`, `latency.rs`) rather than pytest's default `test_*.py` pattern.
+
 ### Charts
 
 - `uv run --group charts scripts/generate_speedup_chart.py` — throughput speedup bar chart
 - `uv run --group charts scripts/generate_latency_chart.py` — Criterion-mean latency line + pinned tail CDFs (edit `TAIL_CONFIGS` in the script to re-pin; currently 1M × 3 ops)
 - `uv run --group charts scripts/generate_all_charts.py` — regenerate everything
+- `uv run --group charts scripts/generate_python_chart.py` — Python-side dict-vs-opthash speedup (reads `.benchmarks/python.json`)
 
 Charts are saved in `assets/`. Shared plotting helpers (`IMPLEMENTATIONS`, loaders, axis styling) live in `scripts/plot_common.py`. The tail plotter subtracts `clock_overhead_ns` so percentiles reflect per-op latency, not per-(op + `Instant::now()`).
 

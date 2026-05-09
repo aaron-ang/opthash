@@ -8,6 +8,7 @@ __pycache__/
 /wheels
 .pytest_cache/
 .hypothesis/
+.benchmarks/
 
 # Paper directory - ignore all except .pdf, .tex, and .bbl files
 /paper/*
