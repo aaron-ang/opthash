@@ -348,6 +348,59 @@ where
         self.max_populated_level = 0;
     }
 
+    #[must_use]
+    pub fn iter(&self) -> ElasticIter<'_, K, V> {
+        ElasticIter {
+            levels: &self.levels,
+            level_idx: 0,
+            slot_idx: 0,
+        }
+    }
+}
+
+pub struct ElasticIter<'a, K, V> {
+    levels: &'a [Level<K, V>],
+    level_idx: usize,
+    slot_idx: usize,
+}
+
+impl<'a, K, V> Iterator for ElasticIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.level_idx < self.levels.len() {
+            let level = &self.levels[self.level_idx];
+            while self.slot_idx < level.table.capacity() {
+                let idx = self.slot_idx;
+                self.slot_idx += 1;
+                if level.table.control_at(idx).is_occupied() {
+                    let entry = unsafe { level.table.get_ref(idx) };
+                    return Some((&entry.key, &entry.value));
+                }
+            }
+            self.level_idx += 1;
+            self.slot_idx = 0;
+        }
+        None
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a ElasticHashMap<K, V>
+where
+    K: Eq + Hash,
+{
+    type Item = (&'a K, &'a V);
+    type IntoIter = ElasticIter<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<K, V> ElasticHashMap<K, V>
+where
+    K: Eq + Hash,
+{
     fn resize(&mut self, new_capacity: usize) {
         let mut entries = Vec::with_capacity(self.len);
 
@@ -909,5 +962,39 @@ mod tests {
         for i in 0..15 {
             assert_eq!(map.get(&i), Some(&i));
         }
+    }
+
+    #[test]
+    fn iter_yields_every_inserted_pair_once() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..50 {
+            map.insert(i, i * 10);
+        }
+        let mut collected: Vec<(i32, i32)> = map.iter().map(|(&k, &v)| (k, v)).collect();
+        collected.sort();
+        let expected: Vec<(i32, i32)> = (0..50).map(|i| (i, i * 10)).collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn iter_skips_tombstones_after_remove() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(32);
+        for i in 0..20 {
+            map.insert(i, i);
+        }
+        for i in (0..20).step_by(2) {
+            map.remove(&i);
+        }
+        let keys: Vec<i32> = map.iter().map(|(&k, _)| k).collect();
+        assert_eq!(keys.len(), 10);
+        let mut sorted = keys;
+        sorted.sort();
+        assert_eq!(sorted, (1..20).step_by(2).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn iter_empty_map_is_empty() {
+        let map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        assert_eq!(map.iter().count(), 0);
     }
 }
