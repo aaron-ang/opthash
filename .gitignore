@@ -2,6 +2,12 @@
 /.venv
 __pycache__/
 *.pyc
+*.so
+*.pyd
+/dist
+/wheels
+.pytest_cache/
+.hypothesis/
 
 # Paper directory - ignore all except .pdf, .tex, and .bbl files
 /paper/*
