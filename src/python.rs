@@ -3,16 +3,17 @@
 use std::hash::{Hash, Hasher};
 
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
+use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyInt, PySet, PyString, PyTuple, PyType};
+use pyo3::types::{PyDict, PySet, PyString, PyTuple, PyType};
 
 use crate::funnel::MAX_FUNNEL_RESERVE_FRACTION;
 use crate::{ElasticHashMap, ElasticOptions, FunnelHashMap, FunnelOptions};
 
-#[derive(Clone)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 enum HashKind {
     Str,
-    Int(i64),
     Other,
 }
 
@@ -25,12 +26,12 @@ struct HashedAny {
 impl HashedAny {
     fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let hash = ob.hash()?;
-        let kind = if ob.is_exact_instance_of::<PyString>() {
-            HashKind::Str
-        } else if ob.is_exact_instance_of::<PyInt>() {
-            ob.extract::<i64>().map_or(HashKind::Other, HashKind::Int)
-        } else {
-            HashKind::Other
+        let kind = unsafe {
+            if ffi::Py_TYPE(ob.as_ptr()) == &raw mut ffi::PyUnicode_Type {
+                HashKind::Str
+            } else {
+                HashKind::Other
+            }
         };
         Ok(Self {
             obj: ob.clone().unbind(),
@@ -43,7 +44,7 @@ impl HashedAny {
         Self {
             obj: self.obj.clone_ref(py),
             hash: self.hash,
-            kind: self.kind.clone(),
+            kind: self.kind,
         }
     }
 }
@@ -62,13 +63,10 @@ impl PartialEq for HashedAny {
         if self.obj.as_ptr() == other.obj.as_ptr() {
             return true;
         }
-        // i64 fast path stays GIL-free.
-        if let (HashKind::Int(a), HashKind::Int(b)) = (&self.kind, &other.kind) {
-            return a == b;
-        }
         Python::attach(|py| {
             // Direct UTF-8 compare bypasses PyObject_RichCompareBool dispatch.
-            if let (HashKind::Str, HashKind::Str) = (&self.kind, &other.kind)
+            if self.kind == HashKind::Str
+                && other.kind == HashKind::Str
                 && let Ok(sa) = self.obj.bind(py).cast::<PyString>()
                 && let Ok(sb) = other.obj.bind(py).cast::<PyString>()
                 && let Ok(x) = sa.to_str()
