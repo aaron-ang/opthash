@@ -1,6 +1,6 @@
 # Benchmarking
 
-Rust bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `opthash::ElasticHashMap`, `opthash::FunnelHashMap`. Shared fixtures live in `benches/common.rs`. A Python-side bench (`benches/python.py`) compares the opthash bindings against builtin `dict`.
+Rust bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `opthash::ElasticHashMap`, `opthash::FunnelHashMap`. Shared fixtures live in `benches/common.rs`. A Python-side bench (`benches/test_python.py`) compares the opthash bindings against builtin `dict`.
 
 ## Results
 
@@ -55,16 +55,14 @@ Captures per-operation latency distributions (p50/p90/p99/p999/p9999/max) and du
 cargo bench --bench latency
 ```
 
-## `benches/python.py` — Python bindings vs builtin `dict` (pytest-benchmark)
+## `benches/test_python.py` — Python bindings vs builtin `dict` (pytest-benchmark)
 
 End-to-end workloads (insert / get_hit / get_miss / mixed / delete) at N=10K. Each opthash op crosses the GIL → `HashedAny::hash()` → Python bytecode, so this measures binding overhead as well as the map.
 
 ```bash
-pytest -o python_files='*.py' benches/python.py --benchmark-json=.benchmarks/python.json
+pytest benches/test_python.py --benchmark-json=.benchmarks/python.json
 uv run --group charts python scripts/generate_python_chart.py
 ```
-
-The `python_files` override is needed because the file is named `python.py` to match the Rust naming convention (`speedup.rs`, `latency.rs`) rather than pytest's default `test_*.py` pattern.
 
 ## `benches/profile_bindings.py` — per-op decomposition microbench
 
