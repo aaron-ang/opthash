@@ -55,6 +55,47 @@ Captures per-operation latency distributions (p50/p90/p99/p999/p9999/max) and du
 cargo bench --bench latency
 ```
 
+## `benches/python.py` — Python bindings vs builtin `dict` (pytest-benchmark)
+
+End-to-end workloads (insert / get_hit / get_miss / mixed / delete) at N=10K. Each opthash op crosses the GIL → `HashedAny::hash()` → Python bytecode, so this measures binding overhead as well as the map.
+
+```bash
+pytest -o python_files='*.py' benches/python.py --benchmark-json=.benchmarks/python.json
+uv run --group charts python scripts/generate_python_chart.py
+```
+
+The `python_files` override is needed because the file is named `python.py` to match the Rust naming convention (`speedup.rs`, `latency.rs`) rather than pytest's default `test_*.py` pattern.
+
+## `benches/profile_bindings.py` — per-op decomposition microbench
+
+Decomposes one `m[k]` call by comparing primitives in a tight `time.perf_counter_ns` loop:
+
+```
+loop only  ->  hash(k)  ->  dict[k]  ->  opthash __contains__  ->  __getitem__  ->  .get()
+```
+
+Δ between adjacent rows isolates the cost of one extra primitive on the path. Useful for attributing binding overhead (HashedAny construction, refcount churn, pyo3 dispatch) separately from map probe cost.
+
+```bash
+python benches/profile_bindings.py
+```
+
+Pair with native sampling for symbol-level attribution:
+
+```bash
+# Build a long-running hot loop, then sample with py-spy --native.
+py-spy record --native --rate 1000 --duration 8 \
+  --output /tmp/perf_raw.txt --format raw -- python -c '
+import opthash
+N=10_000; m=opthash.FunnelHashMap(capacity=N)
+for i in range(N): m[f"key_{i}"]=0
+for _ in range(5_000):
+    for i in range(N): m.__contains__(f"key_{i}")
+'
+```
+
+Aggregate inclusive frame counts from the folded-stack output to see which Rust symbols dominate (`HashedAny::eq`, `find_slot_*`, atomic refcount ops, pyo3 trampoline, etc.).
+
 ## Reports
 
 - Criterion HTML: `target/criterion/report/index.html`, per-workload pages below (e.g. `target/criterion/insert_throughput/report/index.html`)
