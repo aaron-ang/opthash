@@ -16,7 +16,7 @@ pre-commit run --all-files                  # Run formatters on the whole tree
 One-time setup (after cloning):
 
 ```bash
-pip install pre-commit
+uv tool install pre-commit
 pre-commit install
 ```
 

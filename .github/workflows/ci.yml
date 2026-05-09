@@ -19,13 +19,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: astral-sh/setup-uv@v4
         with:
-          python-version: '3.13'
+          python-version: "3.13"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - uses: pre-commit/action@v3.0.1
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+      - run: uvx pre-commit run --all-files --show-diff-on-failure
 
   rust:
     runs-on: ubuntu-latest
@@ -43,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: astral-sh/setup-uv@v4
         with:
           python-version: "3.13"
       - name: Build wheel
@@ -51,9 +55,8 @@ jobs:
         with:
           args: --release --features python --out dist
           sccache: true
-      - name: Install wheel + test deps
-        run: |
-          pip install dist/*.whl
-          pip install pytest hypothesis pytest-benchmark
       - name: Pytest
-        run: pytest tests/
+        run: |
+          uv venv
+          uv pip install dist/*.whl pytest hypothesis pytest-benchmark
+          uv run pytest tests/
