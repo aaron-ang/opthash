@@ -24,8 +24,6 @@ Rust bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `o
 
 ![Python speedup chart](../assets/benchmark-python-speedup.svg)
 
-The Python chart is a reality check, not a perf claim. The opthash bindings cross GIL → `HashedAny::hash()` → Python bytecode per op, so `dict` will usually win — the point is to know by how much and where.
-
 ## `benches/speedup.rs` — throughput + mean latency (Criterion)
 
 Throughput workloads:

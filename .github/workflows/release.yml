@@ -5,8 +5,20 @@ on:
     branches:
       - main
     tags:
-      - 'v*'
+      - "v*"
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "pyproject.toml"
+      - ".github/workflows/release.yml"
   pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "pyproject.toml"
+      - ".github/workflows/release.yml"
   workflow_dispatch:
 
 concurrency:
@@ -214,7 +226,7 @@ jobs:
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v3
         with:
-          subject-path: 'dist/*'
+          subject-path: "dist/*"
       - name: Publish to PyPI
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: pypa/gh-action-pypi-publish@release/v1
