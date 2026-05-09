@@ -5,10 +5,11 @@ Run all of these after every refactor. Check benchmark results in `target/criter
 ## Commands
 
 ```bash
-cargo fmt                                   # Format code
+cargo fmt                                   # Format Rust code
 cargo clippy -- -W clippy::pedantic         # Lint with pedantic warnings
 cargo test                                  # Run all tests
 cargo bench                                 # Run all benchmarks
+uvx ruff format                             # Format Python code (scripts/, tests/)
 ```
 
 ## Benchmarks
@@ -32,9 +33,9 @@ Example path: `target/criterion/get_hit_throughput/elastic/change/estimates.json
 
 ### Charts
 
-- `uv run scripts/generate_speedup_chart.py` — throughput speedup bar chart
-- `uv run scripts/generate_latency_chart.py` — Criterion-mean latency line + pinned tail CDFs (edit `TAIL_CONFIGS` in the script to re-pin; currently 1M × 3 ops)
-- `uv run scripts/generate_all_charts.py` — regenerate everything
+- `uv run --group charts scripts/generate_speedup_chart.py` — throughput speedup bar chart
+- `uv run --group charts scripts/generate_latency_chart.py` — Criterion-mean latency line + pinned tail CDFs (edit `TAIL_CONFIGS` in the script to re-pin; currently 1M × 3 ops)
+- `uv run --group charts scripts/generate_all_charts.py` — regenerate everything
 
 Charts are saved in `assets/`. Shared plotting helpers (`IMPLEMENTATIONS`, loaders, axis styling) live in `scripts/plot_common.py`. The tail plotter subtracts `clock_overhead_ns` so percentiles reflect per-op latency, not per-(op + `Instant::now()`).
 

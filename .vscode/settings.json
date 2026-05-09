@@ -1,0 +1,4 @@
+{
+  "rust-analyzer.cargo.features": ["python"],
+  "rust-analyzer.check.features": ["python"]
+}

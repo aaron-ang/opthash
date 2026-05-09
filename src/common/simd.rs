@@ -271,6 +271,16 @@ pub(crate) unsafe fn eq_mask_16(ptr: *const u8, target: u8) -> BitMask {
     unsafe {
         eq_mask_16_sse2(ptr, target)
     }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let mut m: u16 = 0;
+        for i in 0..CONTROL_GROUP_SIZE {
+            if unsafe { *ptr.add(i) } == target {
+                m |= 1u16 << i;
+            }
+        }
+        BitMask(m)
+    }
 }
 
 /// # Safety
@@ -285,6 +295,17 @@ pub(crate) unsafe fn free_mask_16(ptr: *const u8) -> BitMask {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         free_mask_16_sse2(ptr)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let mut m: u16 = 0;
+        for i in 0..CONTROL_GROUP_SIZE {
+            let b = unsafe { *ptr.add(i) };
+            if b == CTRL_EMPTY || b == CTRL_TOMBSTONE {
+                m |= 1u16 << i;
+            }
+        }
+        BitMask(m)
     }
 }
 
@@ -302,6 +323,21 @@ pub(crate) unsafe fn match_and_free_masks_16(ptr: *const u8, target: u8) -> (Bit
     #[cfg(target_arch = "x86_64")]
     unsafe {
         match_and_free_masks_16_sse2(ptr, target)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let mut match_mask: u16 = 0;
+        let mut free_mask: u16 = 0;
+        for i in 0..CONTROL_GROUP_SIZE {
+            let b = unsafe { *ptr.add(i) };
+            if b == target {
+                match_mask |= 1u16 << i;
+            }
+            if b == CTRL_EMPTY || b == CTRL_TOMBSTONE {
+                free_mask |= 1u16 << i;
+            }
+        }
+        (BitMask(match_mask), BitMask(free_mask))
     }
 }
 
