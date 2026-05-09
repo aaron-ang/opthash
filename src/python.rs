@@ -4,23 +4,47 @@ use std::hash::{Hash, Hasher};
 
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PySet, PyTuple, PyType};
+use pyo3::types::{PyDict, PyInt, PySet, PyString, PyTuple, PyType};
 
 use crate::funnel::MAX_FUNNEL_RESERVE_FRACTION;
 use crate::{ElasticHashMap, ElasticOptions, FunnelHashMap, FunnelOptions};
 
+#[derive(Clone)]
+enum HashKind {
+    Str,
+    Int(i64),
+    Other,
+}
+
 struct HashedAny {
     obj: Py<PyAny>,
     hash: isize,
+    kind: HashKind,
 }
 
 impl HashedAny {
     fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let hash = ob.hash()?;
+        let kind = if ob.is_exact_instance_of::<PyString>() {
+            HashKind::Str
+        } else if ob.is_exact_instance_of::<PyInt>() {
+            ob.extract::<i64>().map_or(HashKind::Other, HashKind::Int)
+        } else {
+            HashKind::Other
+        };
         Ok(Self {
             obj: ob.clone().unbind(),
             hash,
+            kind,
         })
+    }
+
+    fn clone_with_py(&self, py: Python<'_>) -> Self {
+        Self {
+            obj: self.obj.clone_ref(py),
+            hash: self.hash,
+            kind: self.kind.clone(),
+        }
     }
 }
 
@@ -38,7 +62,22 @@ impl PartialEq for HashedAny {
         if self.obj.as_ptr() == other.obj.as_ptr() {
             return true;
         }
-        Python::attach(|py| self.obj.bind(py).eq(other.obj.bind(py)).unwrap_or(false))
+        // i64 fast path stays GIL-free.
+        if let (HashKind::Int(a), HashKind::Int(b)) = (&self.kind, &other.kind) {
+            return a == b;
+        }
+        Python::attach(|py| {
+            // Direct UTF-8 compare bypasses PyObject_RichCompareBool dispatch.
+            if let (HashKind::Str, HashKind::Str) = (&self.kind, &other.kind)
+                && let Ok(sa) = self.obj.bind(py).cast::<PyString>()
+                && let Ok(sb) = other.obj.bind(py).cast::<PyString>()
+                && let Ok(x) = sa.to_str()
+                && let Ok(y) = sb.to_str()
+            {
+                return x == y;
+            }
+            self.obj.bind(py).eq(other.obj.bind(py)).unwrap_or(false)
+        })
     }
 }
 
@@ -171,12 +210,16 @@ impl PyElasticHashMap {
 #[pymethods]
 impl PyElasticHashMap {
     #[new]
-    #[pyo3(signature = (capacity = 0))]
-    fn new(capacity: usize) -> Self {
-        Self {
+    #[pyo3(signature = (other = None, *, capacity = 0))]
+    fn new(other: Option<&Bound<'_, PyAny>>, capacity: usize) -> PyResult<Self> {
+        let mut me = Self {
             inner: ElasticHashMap::with_capacity(capacity),
             generation: 0,
+        };
+        if let Some(other) = other {
+            me.update(other)?;
         }
+        Ok(me)
     }
 
     #[classmethod]
@@ -335,14 +378,11 @@ impl PyElasticHashMap {
         if self.inner.is_empty() {
             return Err(PyKeyError::new_err("popitem(): map is empty"));
         }
-        let (key_obj, key_hash) = {
+        let probe = {
             let (k, _) = self.inner.iter().next().expect("len > 0");
-            (k.obj.clone_ref(py), k.hash)
+            k.clone_with_py(py)
         };
-        let probe = HashedAny {
-            obj: key_obj.clone_ref(py),
-            hash: key_hash,
-        };
+        let key_obj = probe.obj.clone_ref(py);
         let value = self.inner.remove(&probe).expect("key from iter must exist");
         self.bump();
         PyTuple::new(py, [key_obj, value])
@@ -368,11 +408,7 @@ impl PyElasticHashMap {
     fn copy(&self, py: Python<'_>) -> Self {
         let mut new = ElasticHashMap::with_capacity(self.inner.len());
         for (k, v) in &self.inner {
-            let key = HashedAny {
-                obj: k.obj.clone_ref(py),
-                hash: k.hash,
-            };
-            new.insert(key, v.clone_ref(py));
+            new.insert(k.clone_with_py(py), v.clone_ref(py));
         }
         Self {
             inner: new,
@@ -425,12 +461,16 @@ impl PyFunnelHashMap {
 #[pymethods]
 impl PyFunnelHashMap {
     #[new]
-    #[pyo3(signature = (capacity = 0))]
-    fn new(capacity: usize) -> Self {
-        Self {
+    #[pyo3(signature = (other = None, *, capacity = 0))]
+    fn new(other: Option<&Bound<'_, PyAny>>, capacity: usize) -> PyResult<Self> {
+        let mut me = Self {
             inner: FunnelHashMap::with_capacity(capacity),
             generation: 0,
+        };
+        if let Some(other) = other {
+            me.update(other)?;
         }
+        Ok(me)
     }
 
     #[classmethod]
@@ -589,14 +629,11 @@ impl PyFunnelHashMap {
         if self.inner.is_empty() {
             return Err(PyKeyError::new_err("popitem(): map is empty"));
         }
-        let (key_obj, key_hash) = {
+        let probe = {
             let (k, _) = self.inner.iter().next().expect("len > 0");
-            (k.obj.clone_ref(py), k.hash)
+            k.clone_with_py(py)
         };
-        let probe = HashedAny {
-            obj: key_obj.clone_ref(py),
-            hash: key_hash,
-        };
+        let key_obj = probe.obj.clone_ref(py);
         let value = self.inner.remove(&probe).expect("key from iter must exist");
         self.bump();
         PyTuple::new(py, [key_obj, value])
@@ -622,11 +659,7 @@ impl PyFunnelHashMap {
     fn copy(&self, py: Python<'_>) -> Self {
         let mut new = FunnelHashMap::with_capacity(self.inner.len());
         for (k, v) in &self.inner {
-            let key = HashedAny {
-                obj: k.obj.clone_ref(py),
-                hash: k.hash,
-            };
-            new.insert(key, v.clone_ref(py));
+            new.insert(k.clone_with_py(py), v.clone_ref(py));
         }
         Self {
             inner: new,

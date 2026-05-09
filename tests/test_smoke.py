@@ -103,3 +103,28 @@ def test_repr_contains_class_name_and_len(m):
     text = repr(m)
     assert "len=1" in text
     assert "HashMap" in text
+
+
+def test_init_from_dict(map_cls):
+    m = map_cls({"a": 1, "b": 2})
+    assert len(m) == 2
+    assert m["a"] == 1 and m["b"] == 2
+
+
+def test_init_from_iterable_of_pairs(map_cls):
+    m = map_cls([("a", 1), ("b", 2)])
+    assert len(m) == 2
+    assert m["a"] == 1 and m["b"] == 2
+
+
+def test_init_from_other_map(map_cls):
+    src = map_cls({"a": 1, "b": 2})
+    m = map_cls(src)
+    assert len(m) == 2
+    assert m["a"] == 1 and m["b"] == 2
+
+
+def test_init_with_capacity_kwarg_only(map_cls):
+    m = map_cls({"a": 1}, capacity=64)
+    assert m["a"] == 1
+    assert m.capacity >= 64

@@ -28,7 +28,7 @@ python = ["dep:pyo3"]
 
 [dependencies]
 foldhash = "0.2"
-pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39"], optional = true }
+pyo3 = { version = "0.28", features = ["extension-module", "abi3-py310"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
