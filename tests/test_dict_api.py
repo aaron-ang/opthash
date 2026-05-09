@@ -21,26 +21,130 @@ def test_iter_empty_map(m):
     assert list(m) == []
 
 
-def test_keys_returns_list_of_keys(m):
+def test_keys_view_iterates_keys(m):
     _populate(m, 5)
     keys = m.keys()
-    assert isinstance(keys, list)
     assert sorted(keys) == [f"k{i}" for i in range(5)]
+    assert len(keys) == 5
 
 
-def test_values_returns_list_of_values(m):
+def test_values_view_iterates_values(m):
     _populate(m, 5)
     vals = m.values()
-    assert isinstance(vals, list)
     assert sorted(vals) == list(range(5))
+    assert len(vals) == 5
 
 
-def test_items_returns_list_of_pairs(m):
+def test_items_view_iterates_pairs(m):
     _populate(m, 5)
     items = m.items()
-    assert isinstance(items, list)
     assert all(isinstance(t, tuple) and len(t) == 2 for t in items)
     assert sorted(items) == [(f"k{i}", i) for i in range(5)]
+
+
+def test_views_are_live(m):
+    _populate(m, 3)
+    keys = m.keys()
+    values = m.values()
+    items = m.items()
+    assert len(keys) == 3
+    m["new"] = 99
+    assert len(keys) == 4
+    assert len(values) == 4
+    assert len(items) == 4
+    assert "new" in keys
+    assert 99 in values
+    assert ("new", 99) in items
+
+
+def test_keys_view_contains(m):
+    _populate(m, 3)
+    keys = m.keys()
+    assert "k0" in keys
+    assert "missing" not in keys
+
+
+def test_values_view_contains(m):
+    _populate(m, 3)
+    vals = m.values()
+    assert 1 in vals
+    assert 999 not in vals
+
+
+def test_items_view_contains(m):
+    _populate(m, 3)
+    items = m.items()
+    assert ("k0", 0) in items
+    assert ("k0", 999) not in items
+    assert ("missing", 0) not in items
+
+
+def test_keys_view_set_ops(m):
+    _populate(m, 5)  # k0..k4
+    other = {"k0", "k1", "extra"}
+    assert m.keys() & other == {"k0", "k1"}
+    assert m.keys() | other == {"k0", "k1", "k2", "k3", "k4", "extra"}
+    assert m.keys() - other == {"k2", "k3", "k4"}
+    assert m.keys() ^ other == {"k2", "k3", "k4", "extra"}
+
+
+def test_keys_view_eq_with_set(m):
+    _populate(m, 3)
+    assert m.keys() == {"k0", "k1", "k2"}
+    assert m.keys() != {"k0", "k1"}
+
+
+def test_items_view_set_ops(m):
+    _populate(m, 3)  # k0=0, k1=1, k2=2
+    other = {("k0", 0), ("k1", 999), ("extra", 7)}
+    assert m.items() & other == {("k0", 0)}
+    assert m.items() - other == {("k1", 1), ("k2", 2)}
+
+
+def test_iter_during_mutation_raises(m):
+    _populate(m, 3)
+    it = iter(m)
+    next(it)
+    m["new"] = 99
+    with pytest.raises(RuntimeError, match="changed size"):
+        next(it)
+
+
+def test_keys_view_iter_during_mutation_raises(m):
+    _populate(m, 3)
+    it = iter(m.keys())
+    next(it)
+    m["new"] = 99
+    with pytest.raises(RuntimeError, match="changed size"):
+        next(it)
+
+
+def test_values_view_iter_during_mutation_raises(m):
+    _populate(m, 3)
+    it = iter(m.values())
+    next(it)
+    m["new"] = 99
+    with pytest.raises(RuntimeError, match="changed size"):
+        next(it)
+
+
+def test_items_view_iter_during_mutation_raises(m):
+    _populate(m, 3)
+    it = iter(m.items())
+    next(it)
+    m["new"] = 99
+    with pytest.raises(RuntimeError, match="changed size"):
+        next(it)
+
+
+def test_view_repr_contains_class_name(m):
+    _populate(m, 2)
+    r = repr(m.keys())
+    assert "keys" in r
+    r = repr(m.values())
+    assert "values" in r
+    r = repr(m.items())
+    assert "items" in r
 
 
 def test_dict_comprehension_works(m):
@@ -51,7 +155,7 @@ def test_dict_comprehension_works(m):
 
 def test_list_iter_snapshot(m):
     _populate(m, 3)
-    snapshot = list(m)
+    snapshot = list(m)  # exhausts iterator before any mutation
     m["new"] = 99
     assert "new" not in snapshot  # snapshot was taken before mutation
 
