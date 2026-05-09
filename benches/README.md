@@ -1,6 +1,30 @@
 # Benchmarking
 
-Two bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `opthash::ElasticHashMap`, `opthash::FunnelHashMap`. Shared fixtures live in `benches/common.rs`.
+Rust bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `opthash::ElasticHashMap`, `opthash::FunnelHashMap`. Shared fixtures live in `benches/common.rs`. A Python-side bench (`benches/python.py`) compares the opthash bindings against builtin `dict`.
+
+## Results
+
+### Throughput (Rust, vs `std::HashMap`)
+
+![Throughput speedup chart](../assets/benchmark-speedup.svg)
+
+### Mean latency by map size (Rust)
+
+![Latency chart](../assets/benchmark-latency.svg)
+
+### Tail latency distributions (Rust)
+
+![Tail latency — get-hit](../assets/latency-tail-1000000-get-hit.svg)
+
+![Tail latency — get-miss](../assets/latency-tail-1000000-get-miss.svg)
+
+![Tail latency — insert](../assets/latency-tail-1000000-insert.svg)
+
+### Python: opthash bindings vs builtin `dict`
+
+![Python speedup chart](../assets/benchmark-python-speedup.svg)
+
+The Python chart is a reality check, not a perf claim. The opthash bindings cross GIL → `HashedAny::hash()` → Python bytecode per op, so `dict` will usually win — the point is to know by how much and where.
 
 ## `benches/speedup.rs` — throughput + mean latency (Criterion)
 
@@ -16,7 +40,7 @@ Throughput workloads:
 
 The tiny-map workload exercises the internal tiny-table engine. Delete-heavy and resize-heavy expose tombstone handling and growth costs instead of only steady-state inserts.
 
-Latency workload: `get_hit_latency_<size>` for sizes 100, 1K, 10K, 100K, 1M — Criterion-mean per-lookup time.
+Latency workload: `get_hit_latency_<size>` — Criterion-mean per-lookup time across map sizes (configured at the top of `benches/speedup.rs`).
 
 Run:
 
@@ -27,7 +51,7 @@ cargo bench --bench speedup -- "get_hit"          # Criterion name filter
 
 ## `benches/latency.rs` — tail-latency histograms (hdrhistogram)
 
-Captures per-operation latency distributions (p50/p90/p99/p999/p9999/max) and dumps them to JSON for plotting. Custom `harness = false` main, not Criterion. Hard-coded matrix: sizes 10K/100K/1M × ops get-hit/get-miss/insert × {std, elastic, funnel} × 1M samples × 10K warmup — edit the consts at the top of `benches/latency.rs` to change. Output: `target/latency/<map>/<size>/<op>.json`.
+Captures per-operation latency distributions (p50/p90/p99/p999/p9999/max) and dumps them to JSON for plotting. Custom `harness = false` main, not Criterion. The size × op × map matrix and sample/warmup counts are hardcoded — edit the consts at the top of `benches/latency.rs` to change. Output: `target/latency/<map>/<size>/<op>.json`.
 
 ```bash
 cargo bench --bench latency

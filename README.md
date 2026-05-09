@@ -106,22 +106,4 @@ FunnelHashMap
 
 ## Benchmarks
 
-All benchmarks on ARM Cortex-X925 (Armv9.2-A, aarch64, NEON, 3.9 GHz) running Linux, via Criterion. Four variants are compared: `std::HashMap` (SwissTable + SipHash), `hashbrown::HashMap` (SwissTable + foldhash), and our `ElasticHashMap` / `FunnelHashMap` (multi-level + foldhash).
-
-### Throughput
-
-![Throughput speedup chart](assets/benchmark-speedup.svg)
-
-### Latency
-
-![Latency chart](assets/benchmark-latency.svg)
-
-#### Tail latency distributions
-
-![Tail latency — get-hit @ 1M](assets/latency-tail-1000000-get-hit.svg)
-
-![Tail latency — get-miss @ 1M](assets/latency-tail-1000000-get-miss.svg)
-
-![Tail latency — insert @ 1M](assets/latency-tail-1000000-insert.svg)
-
-See [benches/README.md](benches/README.md) for bench target layout, CLI flags, chart regeneration, and flamegraph profiling.
+See [benches/README.md](benches/README.md) for bench target layout, charts, CLI flags, chart regeneration, and flamegraph profiling.

@@ -7,14 +7,13 @@ name = "opthash"
 description = "Rust implementations of Elastic Hashing and Funnel Hashing with Python bindings"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [{ name = "Aaron Ang" }]
 keywords = ["hashmap", "open-addressing", "elastic-hashing", "funnel-hashing"]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -35,7 +34,7 @@ Repository = "https://github.com/aaron-ang/opthash"
 Issues = "https://github.com/aaron-ang/opthash/issues"
 
 [project.optional-dependencies]
-test = ["pytest>=8", "hypothesis>=6"]
+test = ["pytest>=8", "hypothesis>=6", "pytest-benchmark>=5"]
 
 [dependency-groups]
 charts = ["matplotlib>=3.9"]
@@ -43,6 +42,10 @@ charts = ["matplotlib>=3.9"]
 [tool.maturin]
 features = ["python"]
 module-name = "opthash"
+
+[tool.maturin.generate-ci.github]
+trusted-publishing = true
+publishing-environment = "pypi"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
