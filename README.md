@@ -5,7 +5,7 @@
 [![CI](https://github.com/aaron-ang/opthash/actions/workflows/ci.yml/badge.svg)](https://github.com/aaron-ang/opthash/actions/workflows/ci.yml)
 [![Release](https://github.com/aaron-ang/opthash/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/aaron-ang/opthash/actions/workflows/release.yml)
 [![Python](https://img.shields.io/pypi/pyversions/opthash?logo=python&logoColor=white)](https://pypi.org/project/opthash/)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 Rust implementations of **Elastic Hashing** and **Funnel Hashing** from [_Optimal Bounds for Open Addressing Without Reordering_](https://arxiv.org/abs/2501.02305) (Farach-Colton, Krapivin, Kuszmaul, 2025).
 
