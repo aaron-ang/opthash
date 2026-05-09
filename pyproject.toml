@@ -43,5 +43,9 @@ charts = ["matplotlib>=3.9"]
 features = ["python"]
 module-name = "opthash"
 
+[tool.maturin.generate-ci.github]
+trusted-publishing = true
+publishing-environment = "pypi"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
