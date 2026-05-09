@@ -33,7 +33,7 @@ Example path: `target/criterion/get_hit_throughput/elastic/change/estimates.json
 
 ### Python-side benchmarks
 
-`benches/python.py` — pytest-benchmark suite comparing `dict`, `ElasticHashMap`, and `FunnelHashMap` from Python across insert / get_hit / get_miss / mixed / delete workloads at N = 10K. The opthash maps cross the GIL → `HashedAny::hash()` → Python bytecode per op, so `dict` will usually win; the chart is a reality check, not a perf claim.
+`benches/python.py` — pytest-benchmark suite comparing `dict`, `ElasticHashMap`, and `FunnelHashMap` from Python across insert / get_hit / get_miss / mixed / delete workloads at N = 10K. Each opthash op crosses the GIL → `HashedAny::hash()` → Python bytecode.
 
 ```bash
 pytest -o python_files='*.py' benches/python.py --benchmark-json=.benchmarks/python.json
