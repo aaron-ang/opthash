@@ -10,6 +10,14 @@ cargo clippy --all-features -- -W clippy::pedantic   # Lint with pedantic warnin
 cargo test                                  # Run all tests
 cargo bench                                 # Run all benchmarks
 uvx ruff format                             # Format Python code (scripts/, tests/)
+pre-commit run --all-files                  # Run formatters on the whole tree
+```
+
+One-time setup (after cloning):
+
+```bash
+pip install pre-commit
+pre-commit install
 ```
 
 ## Benchmarks

@@ -15,15 +15,25 @@ permissions:
   contents: read
 
 jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: pre-commit/action@v3.0.1
+
   rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - name: Format check
-        run: cargo fmt --check
+          components: clippy
       - name: Clippy
         run: cargo clippy --all-features -- -W clippy::pedantic
       - name: Test
