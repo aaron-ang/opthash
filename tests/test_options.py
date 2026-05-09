@@ -67,6 +67,17 @@ def test_funnel_options_custom_kwargs():
 def test_funnel_options_reject_invalid_reserve_fraction():
     with pytest.raises(ValueError):
         opthash.FunnelOptions(reserve_fraction=1.0)
+    with pytest.raises(ValueError):
+        opthash.FunnelOptions(reserve_fraction=0.5)  # above 1/8 cap
+    with pytest.raises(ValueError):
+        opthash.FunnelOptions(reserve_fraction=0.0)
+    with pytest.raises(ValueError):
+        opthash.FunnelOptions(reserve_fraction=-0.1)
+
+
+def test_funnel_options_accept_max_reserve_fraction():
+    opts = opthash.FunnelOptions(reserve_fraction=0.125)
+    assert opts.reserve_fraction == pytest.approx(0.125)
 
 
 def test_funnel_options_reject_zero_probe_limit():

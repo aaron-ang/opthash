@@ -15,7 +15,7 @@ use crate::common::{
     },
 };
 
-const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
+pub(crate) const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct FunnelOptions {

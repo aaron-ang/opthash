@@ -6,6 +6,7 @@ use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 
+use crate::funnel::MAX_FUNNEL_RESERVE_FRACTION;
 use crate::{ElasticHashMap, ElasticOptions, FunnelHashMap, FunnelOptions};
 
 struct HashedAny {
@@ -43,13 +44,24 @@ impl PartialEq for HashedAny {
 
 impl Eq for HashedAny {}
 
-fn validate_reserve_fraction(value: f64) -> PyResult<()> {
+fn validate_elastic_reserve_fraction(value: f64) -> PyResult<()> {
     if value > 0.0 && value < 1.0 {
         Ok(())
     } else {
         Err(PyValueError::new_err(
             "reserve_fraction must be in the open interval (0, 1)",
         ))
+    }
+}
+
+fn validate_funnel_reserve_fraction(value: f64) -> PyResult<()> {
+    if value > 0.0 && value <= MAX_FUNNEL_RESERVE_FRACTION {
+        Ok(())
+    } else {
+        Err(PyValueError::new_err(format!(
+            "reserve_fraction must be in (0, {MAX_FUNNEL_RESERVE_FRACTION}]; \
+             FunnelHashMap caps the load factor at 1/8 by design"
+        )))
     }
 }
 
@@ -69,7 +81,7 @@ impl PyElasticOptions {
     ) -> PyResult<Self> {
         let mut inner = ElasticOptions::with_capacity(capacity);
         if let Some(rf) = reserve_fraction {
-            validate_reserve_fraction(rf)?;
+            validate_elastic_reserve_fraction(rf)?;
             inner.reserve_fraction = rf;
         }
         if let Some(ps) = probe_scale {
@@ -113,7 +125,7 @@ impl PyFunnelOptions {
     ) -> PyResult<Self> {
         let mut inner = FunnelOptions::with_capacity(capacity);
         if let Some(rf) = reserve_fraction {
-            validate_reserve_fraction(rf)?;
+            validate_funnel_reserve_fraction(rf)?;
             inner.reserve_fraction = rf;
         }
         if let Some(limit) = primary_probe_limit {
