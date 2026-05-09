@@ -70,10 +70,10 @@ def plot_speedup(means: dict[str, dict[str, float]], output_path: Path) -> None:
     w = 0.34
 
     elastic_bars = ax.bar(
-        x - w / 2, elastic_speedups, width=w, label="ElasticHashMap"
+        x - w / 2, elastic_speedups, width=w, label=PY_IMPL_LABELS["elastic"]
     )
     funnel_bars = ax.bar(
-        x + w / 2, funnel_speedups, width=w, label="FunnelHashMap"
+        x + w / 2, funnel_speedups, width=w, label=PY_IMPL_LABELS["funnel"]
     )
 
     max_val = max(1.0, *(elastic_speedups + funnel_speedups))
@@ -84,8 +84,8 @@ def plot_speedup(means: dict[str, dict[str, float]], output_path: Path) -> None:
     ax.set_xticklabels(labels, fontsize=12)
     apply_axis_style(
         ax,
-        title="Python-side Throughput Speedup over builtin dict",
-        subtitle="pytest-benchmark — builtin dict is the 1.0× baseline",
+        title=f"Python-side Throughput Speedup over {PY_IMPL_LABELS['dict']}",
+        subtitle=f"pytest-benchmark — {PY_IMPL_LABELS['dict']} is the 1.0× baseline",
         xlabel="Workload",
         ylabel="Speedup (higher is better)",
         y_formatter=lambda v, _: f"{v:.2f}",
