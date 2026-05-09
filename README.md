@@ -106,6 +106,4 @@ FunnelHashMap
 
 ## Benchmarks
 
-Compared against `std::collections::HashMap` (SwissTable + SipHash), `hashbrown::HashMap` (SwissTable + foldhash) on the Rust side, and the builtin `dict` on the Python side.
-
-See [benches/README.md](benches/README.md) for bench target layout, charts (throughput, latency, tail-CDF, Python-vs-`dict` speedup), CLI flags, chart regeneration, and flamegraph profiling.
+See [benches/README.md](benches/README.md) for bench target layout, charts, CLI flags, chart regeneration, and flamegraph profiling.
