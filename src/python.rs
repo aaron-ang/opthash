@@ -218,7 +218,7 @@ impl PyFunnelOptions {
     }
 }
 
-#[pyclass(name = "ElasticHashMap", module = "opthash", unsendable)]
+#[pyclass(name = "ElasticHashMap", module = "opthash")]
 struct PyElasticHashMap {
     inner: ElasticHashMap<HashedAny, Py<PyAny>>,
     generation: u64,
@@ -469,7 +469,7 @@ impl PyElasticHashMap {
     }
 }
 
-#[pyclass(name = "FunnelHashMap", module = "opthash", unsendable)]
+#[pyclass(name = "FunnelHashMap", module = "opthash")]
 struct PyFunnelHashMap {
     inner: FunnelHashMap<HashedAny, Py<PyAny>>,
     generation: u64,
@@ -724,7 +724,7 @@ impl PyFunnelHashMap {
 // Elastic views + iterators
 // =============================================================================
 
-#[pyclass(name = "_ElasticKeyIter", module = "opthash", unsendable)]
+#[pyclass(name = "_ElasticKeyIter", module = "opthash")]
 struct PyElasticKeyIter {
     map: Py<PyElasticHashMap>,
     snapshot: Vec<Py<PyAny>>,
@@ -752,7 +752,7 @@ impl PyElasticKeyIter {
     }
 }
 
-#[pyclass(name = "_ElasticValueIter", module = "opthash", unsendable)]
+#[pyclass(name = "_ElasticValueIter", module = "opthash")]
 struct PyElasticValueIter {
     map: Py<PyElasticHashMap>,
     snapshot: Vec<Py<PyAny>>,
@@ -780,7 +780,7 @@ impl PyElasticValueIter {
     }
 }
 
-#[pyclass(name = "_ElasticItemIter", module = "opthash", unsendable)]
+#[pyclass(name = "_ElasticItemIter", module = "opthash")]
 struct PyElasticItemIter {
     map: Py<PyElasticHashMap>,
     snapshot: Vec<Py<PyAny>>,
@@ -808,7 +808,7 @@ impl PyElasticItemIter {
     }
 }
 
-#[pyclass(name = "elastic_keys", module = "opthash", unsendable)]
+#[pyclass(name = "elastic_keys", module = "opthash")]
 struct PyElasticKeysView {
     map: Py<PyElasticHashMap>,
 }
@@ -915,7 +915,7 @@ impl PyElasticKeysView {
     }
 }
 
-#[pyclass(name = "elastic_values", module = "opthash", unsendable)]
+#[pyclass(name = "elastic_values", module = "opthash")]
 struct PyElasticValuesView {
     map: Py<PyElasticHashMap>,
 }
@@ -955,7 +955,7 @@ impl PyElasticValuesView {
     }
 }
 
-#[pyclass(name = "elastic_items", module = "opthash", unsendable)]
+#[pyclass(name = "elastic_items", module = "opthash")]
 struct PyElasticItemsView {
     map: Py<PyElasticHashMap>,
 }
@@ -1071,7 +1071,7 @@ impl PyElasticItemsView {
 // Funnel views + iterators (mirrors Elastic)
 // =============================================================================
 
-#[pyclass(name = "_FunnelKeyIter", module = "opthash", unsendable)]
+#[pyclass(name = "_FunnelKeyIter", module = "opthash")]
 struct PyFunnelKeyIter {
     map: Py<PyFunnelHashMap>,
     snapshot: Vec<Py<PyAny>>,
@@ -1099,7 +1099,7 @@ impl PyFunnelKeyIter {
     }
 }
 
-#[pyclass(name = "_FunnelValueIter", module = "opthash", unsendable)]
+#[pyclass(name = "_FunnelValueIter", module = "opthash")]
 struct PyFunnelValueIter {
     map: Py<PyFunnelHashMap>,
     snapshot: Vec<Py<PyAny>>,
@@ -1127,7 +1127,7 @@ impl PyFunnelValueIter {
     }
 }
 
-#[pyclass(name = "_FunnelItemIter", module = "opthash", unsendable)]
+#[pyclass(name = "_FunnelItemIter", module = "opthash")]
 struct PyFunnelItemIter {
     map: Py<PyFunnelHashMap>,
     snapshot: Vec<Py<PyAny>>,
@@ -1155,7 +1155,7 @@ impl PyFunnelItemIter {
     }
 }
 
-#[pyclass(name = "funnel_keys", module = "opthash", unsendable)]
+#[pyclass(name = "funnel_keys", module = "opthash")]
 struct PyFunnelKeysView {
     map: Py<PyFunnelHashMap>,
 }
@@ -1262,7 +1262,7 @@ impl PyFunnelKeysView {
     }
 }
 
-#[pyclass(name = "funnel_values", module = "opthash", unsendable)]
+#[pyclass(name = "funnel_values", module = "opthash")]
 struct PyFunnelValuesView {
     map: Py<PyFunnelHashMap>,
 }
@@ -1302,7 +1302,7 @@ impl PyFunnelValuesView {
     }
 }
 
-#[pyclass(name = "funnel_items", module = "opthash", unsendable)]
+#[pyclass(name = "funnel_items", module = "opthash")]
 struct PyFunnelItemsView {
     map: Py<PyFunnelHashMap>,
 }
