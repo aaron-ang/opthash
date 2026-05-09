@@ -6,7 +6,7 @@ Run all of these after every refactor. Check benchmark results in `target/criter
 
 ```bash
 cargo fmt                                   # Format Rust code
-cargo clippy -- -W clippy::pedantic         # Lint with pedantic warnings
+cargo clippy --all-features -- -W clippy::pedantic   # Lint with pedantic warnings
 cargo test                                  # Run all tests
 cargo bench                                 # Run all benchmarks
 uvx ruff format                             # Format Python code (scripts/, tests/)
