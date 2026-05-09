@@ -35,6 +35,12 @@ pub(crate) struct RawTable<T> {
     _marker: PhantomData<T>,
 }
 
+// SAFETY: RawTable<T> owns its allocation exclusively; data_ptr is not aliased.
+// Sending across threads is sound when T: Send (same as Box<[T]>). Sync requires
+// T: Sync because shared &RawTable<T> can hand out shared &T via get_ref.
+unsafe impl<T: Send> Send for RawTable<T> {}
+unsafe impl<T: Sync> Sync for RawTable<T> {}
+
 impl<T> std::fmt::Debug for RawTable<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RawTable")

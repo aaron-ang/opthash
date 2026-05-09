@@ -1,6 +1,7 @@
 #![cfg(feature = "python")]
 
 use std::hash::{Hash, Hasher};
+use std::mem::ManuallyDrop;
 
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::ffi;
@@ -46,6 +47,31 @@ impl HashedAny {
             hash: self.hash,
             kind: self.kind,
         }
+    }
+}
+
+struct ProbeKey {
+    inner: ManuallyDrop<HashedAny>,
+}
+
+impl ProbeKey {
+    fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let hash = ob.hash()?;
+        let kind = unsafe {
+            if ffi::Py_TYPE(ob.as_ptr()) == &raw mut ffi::PyUnicode_Type {
+                HashKind::Str
+            } else {
+                HashKind::Other
+            }
+        };
+        let obj = unsafe { std::ptr::read(ob.as_unbound()) };
+        Ok(Self {
+            inner: ManuallyDrop::new(HashedAny { obj, hash, kind }),
+        })
+    }
+
+    fn as_key(&self) -> &HashedAny {
+        &self.inner
     }
 }
 
@@ -192,7 +218,7 @@ impl PyFunnelOptions {
     }
 }
 
-#[pyclass(name = "ElasticHashMap", module = "opthash", unsendable)]
+#[pyclass(name = "ElasticHashMap", module = "opthash")]
 struct PyElasticHashMap {
     inner: ElasticHashMap<HashedAny, Py<PyAny>>,
     generation: u64,
@@ -238,13 +264,13 @@ impl PyElasticHashMap {
     }
 
     fn __contains__(&self, key: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let k = HashedAny::from_bound(key)?;
-        Ok(self.inner.contains_key(&k))
+        let probe = ProbeKey::from_bound(key)?;
+        Ok(self.inner.contains_key(probe.as_key()))
     }
 
     fn __getitem__(&self, key: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let k = HashedAny::from_bound(key)?;
-        match self.inner.get(&k) {
+        let probe = ProbeKey::from_bound(key)?;
+        match self.inner.get(probe.as_key()) {
             Some(v) => Ok(v.clone_ref(py)),
             None => Err(PyKeyError::new_err(key.clone().unbind())),
         }
@@ -258,8 +284,8 @@ impl PyElasticHashMap {
     }
 
     fn __delitem__(&mut self, key: &Bound<'_, PyAny>) -> PyResult<()> {
-        let k = HashedAny::from_bound(key)?;
-        match self.inner.remove(&k) {
+        let probe = ProbeKey::from_bound(key)?;
+        match self.inner.remove(probe.as_key()) {
             Some(_) => {
                 self.bump();
                 Ok(())
@@ -275,8 +301,8 @@ impl PyElasticHashMap {
         default: Option<Py<PyAny>>,
         py: Python<'_>,
     ) -> PyResult<Py<PyAny>> {
-        let k = HashedAny::from_bound(key)?;
-        Ok(match self.inner.get(&k) {
+        let probe = ProbeKey::from_bound(key)?;
+        Ok(match self.inner.get(probe.as_key()) {
             Some(v) => v.clone_ref(py),
             None => default.unwrap_or_else(|| py.None()),
         })
@@ -362,8 +388,8 @@ impl PyElasticHashMap {
 
     #[pyo3(signature = (key, default = None))]
     fn pop(&mut self, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
-        let k = HashedAny::from_bound(key)?;
-        match self.inner.remove(&k) {
+        let probe = ProbeKey::from_bound(key)?;
+        match self.inner.remove(probe.as_key()) {
             Some(v) => {
                 self.bump();
                 Ok(v)
@@ -443,7 +469,7 @@ impl PyElasticHashMap {
     }
 }
 
-#[pyclass(name = "FunnelHashMap", module = "opthash", unsendable)]
+#[pyclass(name = "FunnelHashMap", module = "opthash")]
 struct PyFunnelHashMap {
     inner: FunnelHashMap<HashedAny, Py<PyAny>>,
     generation: u64,
@@ -489,13 +515,13 @@ impl PyFunnelHashMap {
     }
 
     fn __contains__(&self, key: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let k = HashedAny::from_bound(key)?;
-        Ok(self.inner.contains_key(&k))
+        let probe = ProbeKey::from_bound(key)?;
+        Ok(self.inner.contains_key(probe.as_key()))
     }
 
     fn __getitem__(&self, key: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let k = HashedAny::from_bound(key)?;
-        match self.inner.get(&k) {
+        let probe = ProbeKey::from_bound(key)?;
+        match self.inner.get(probe.as_key()) {
             Some(v) => Ok(v.clone_ref(py)),
             None => Err(PyKeyError::new_err(key.clone().unbind())),
         }
@@ -509,8 +535,8 @@ impl PyFunnelHashMap {
     }
 
     fn __delitem__(&mut self, key: &Bound<'_, PyAny>) -> PyResult<()> {
-        let k = HashedAny::from_bound(key)?;
-        match self.inner.remove(&k) {
+        let probe = ProbeKey::from_bound(key)?;
+        match self.inner.remove(probe.as_key()) {
             Some(_) => {
                 self.bump();
                 Ok(())
@@ -526,8 +552,8 @@ impl PyFunnelHashMap {
         default: Option<Py<PyAny>>,
         py: Python<'_>,
     ) -> PyResult<Py<PyAny>> {
-        let k = HashedAny::from_bound(key)?;
-        Ok(match self.inner.get(&k) {
+        let probe = ProbeKey::from_bound(key)?;
+        Ok(match self.inner.get(probe.as_key()) {
             Some(v) => v.clone_ref(py),
             None => default.unwrap_or_else(|| py.None()),
         })
@@ -613,8 +639,8 @@ impl PyFunnelHashMap {
 
     #[pyo3(signature = (key, default = None))]
     fn pop(&mut self, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
-        let k = HashedAny::from_bound(key)?;
-        match self.inner.remove(&k) {
+        let probe = ProbeKey::from_bound(key)?;
+        match self.inner.remove(probe.as_key()) {
             Some(v) => {
                 self.bump();
                 Ok(v)
@@ -698,7 +724,7 @@ impl PyFunnelHashMap {
 // Elastic views + iterators
 // =============================================================================
 
-#[pyclass(name = "_ElasticKeyIter", module = "opthash", unsendable)]
+#[pyclass(name = "_ElasticKeyIter", module = "opthash")]
 struct PyElasticKeyIter {
     map: Py<PyElasticHashMap>,
     snapshot: Vec<Py<PyAny>>,
@@ -726,7 +752,7 @@ impl PyElasticKeyIter {
     }
 }
 
-#[pyclass(name = "_ElasticValueIter", module = "opthash", unsendable)]
+#[pyclass(name = "_ElasticValueIter", module = "opthash")]
 struct PyElasticValueIter {
     map: Py<PyElasticHashMap>,
     snapshot: Vec<Py<PyAny>>,
@@ -754,7 +780,7 @@ impl PyElasticValueIter {
     }
 }
 
-#[pyclass(name = "_ElasticItemIter", module = "opthash", unsendable)]
+#[pyclass(name = "_ElasticItemIter", module = "opthash")]
 struct PyElasticItemIter {
     map: Py<PyElasticHashMap>,
     snapshot: Vec<Py<PyAny>>,
@@ -782,7 +808,7 @@ impl PyElasticItemIter {
     }
 }
 
-#[pyclass(name = "elastic_keys", module = "opthash", unsendable)]
+#[pyclass(name = "elastic_keys", module = "opthash")]
 struct PyElasticKeysView {
     map: Py<PyElasticHashMap>,
 }
@@ -889,7 +915,7 @@ impl PyElasticKeysView {
     }
 }
 
-#[pyclass(name = "elastic_values", module = "opthash", unsendable)]
+#[pyclass(name = "elastic_values", module = "opthash")]
 struct PyElasticValuesView {
     map: Py<PyElasticHashMap>,
 }
@@ -929,7 +955,7 @@ impl PyElasticValuesView {
     }
 }
 
-#[pyclass(name = "elastic_items", module = "opthash", unsendable)]
+#[pyclass(name = "elastic_items", module = "opthash")]
 struct PyElasticItemsView {
     map: Py<PyElasticHashMap>,
 }
@@ -1045,7 +1071,7 @@ impl PyElasticItemsView {
 // Funnel views + iterators (mirrors Elastic)
 // =============================================================================
 
-#[pyclass(name = "_FunnelKeyIter", module = "opthash", unsendable)]
+#[pyclass(name = "_FunnelKeyIter", module = "opthash")]
 struct PyFunnelKeyIter {
     map: Py<PyFunnelHashMap>,
     snapshot: Vec<Py<PyAny>>,
@@ -1073,7 +1099,7 @@ impl PyFunnelKeyIter {
     }
 }
 
-#[pyclass(name = "_FunnelValueIter", module = "opthash", unsendable)]
+#[pyclass(name = "_FunnelValueIter", module = "opthash")]
 struct PyFunnelValueIter {
     map: Py<PyFunnelHashMap>,
     snapshot: Vec<Py<PyAny>>,
@@ -1101,7 +1127,7 @@ impl PyFunnelValueIter {
     }
 }
 
-#[pyclass(name = "_FunnelItemIter", module = "opthash", unsendable)]
+#[pyclass(name = "_FunnelItemIter", module = "opthash")]
 struct PyFunnelItemIter {
     map: Py<PyFunnelHashMap>,
     snapshot: Vec<Py<PyAny>>,
@@ -1129,7 +1155,7 @@ impl PyFunnelItemIter {
     }
 }
 
-#[pyclass(name = "funnel_keys", module = "opthash", unsendable)]
+#[pyclass(name = "funnel_keys", module = "opthash")]
 struct PyFunnelKeysView {
     map: Py<PyFunnelHashMap>,
 }
@@ -1236,7 +1262,7 @@ impl PyFunnelKeysView {
     }
 }
 
-#[pyclass(name = "funnel_values", module = "opthash", unsendable)]
+#[pyclass(name = "funnel_values", module = "opthash")]
 struct PyFunnelValuesView {
     map: Py<PyFunnelHashMap>,
 }
@@ -1276,7 +1302,7 @@ impl PyFunnelValuesView {
     }
 }
 
-#[pyclass(name = "funnel_items", module = "opthash", unsendable)]
+#[pyclass(name = "funnel_items", module = "opthash")]
 struct PyFunnelItemsView {
     map: Py<PyFunnelHashMap>,
 }

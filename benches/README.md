@@ -1,6 +1,6 @@
 # Benchmarking
 
-Rust bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `opthash::ElasticHashMap`, `opthash::FunnelHashMap`. Shared fixtures live in `benches/common.rs`. A Python-side bench (`benches/python.py`) compares the opthash bindings against builtin `dict`.
+Rust bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `opthash::ElasticHashMap`, `opthash::FunnelHashMap`. Shared fixtures live in `benches/common.rs`. A Python-side bench (`benches/test_python.py`) compares the opthash bindings against builtin `dict`.
 
 ## Results
 
@@ -53,6 +53,27 @@ Captures per-operation latency distributions (p50/p90/p99/p999/p9999/max) and du
 
 ```bash
 cargo bench --bench latency
+```
+
+## `benches/test_python.py` — Python bindings vs builtin `dict` (pytest-benchmark)
+
+End-to-end workloads (insert / get_hit / get_miss / mixed / delete). Each opthash op crosses the GIL → `HashedAny::hash()` → Python bytecode, so this measures binding overhead as well as the map.
+
+```bash
+pytest benches/test_python.py --benchmark-json=.benchmarks/python.json
+uv run --group charts python scripts/generate_python_chart.py
+```
+
+## `benches/profile_bindings.py` — per-op binding overhead
+
+Decomposes one `m[k]` call: `loop -> hash(k) -> dict[k] -> __contains__ -> __getitem__ -> .get()`. Δ between rows attributes each primitive's ns cost. Run with `python benches/profile_bindings.py`.
+
+For symbol-level attribution, drive a hot loop under `py-spy --native` and aggregate the folded-stack output:
+
+```bash
+py-spy record --native --rate 1000 --duration 8 \
+  --format raw --output /tmp/perf_raw.txt -- \
+  python benches/profile_bindings.py
 ```
 
 ## Reports
