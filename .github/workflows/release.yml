@@ -8,8 +8,6 @@ on:
       - 'v*'
     paths:
       - 'src/**'
-      - 'tests/**'
-      - 'benches/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'pyproject.toml'
@@ -17,8 +15,6 @@ on:
   pull_request:
     paths:
       - 'src/**'
-      - 'tests/**'
-      - 'benches/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'pyproject.toml'
