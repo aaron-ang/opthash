@@ -1,4 +1,13 @@
 {
   "rust-analyzer.cargo.features": ["python"],
-  "rust-analyzer.check.features": ["python"]
+  "rust-analyzer.check.features": ["python"],
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/target/**": true,
+    "**/.venv/**": true,
+    "**/__pycache__/**": true,
+    "**/.benchmarks/**": true,
+    "**/node_modules/**": true
+  }
 }
