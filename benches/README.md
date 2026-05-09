@@ -1,6 +1,32 @@
 # Benchmarking
 
-Two bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `opthash::ElasticHashMap`, `opthash::FunnelHashMap`. Shared fixtures live in `benches/common.rs`.
+Two Rust bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `opthash::ElasticHashMap`, `opthash::FunnelHashMap`. Shared fixtures live in `benches/common.rs`. A Python-side bench (`benches/python.py`) compares the opthash bindings against builtin `dict`.
+
+All Rust benchmarks were run on ARM Cortex-X925 (Armv9.2-A, aarch64, NEON, 3.9 GHz) Linux via Criterion.
+
+## Results
+
+### Throughput (Rust, vs `std::HashMap`)
+
+![Throughput speedup chart](../assets/benchmark-speedup.svg)
+
+### Mean latency by map size (Rust)
+
+![Latency chart](../assets/benchmark-latency.svg)
+
+### Tail latency distributions @ 1M entries (Rust)
+
+![Tail latency — get-hit @ 1M](../assets/latency-tail-1000000-get-hit.svg)
+
+![Tail latency — get-miss @ 1M](../assets/latency-tail-1000000-get-miss.svg)
+
+![Tail latency — insert @ 1M](../assets/latency-tail-1000000-insert.svg)
+
+### Python: opthash bindings vs builtin `dict`
+
+![Python speedup chart](../assets/benchmark-python-speedup.svg)
+
+The Python chart is a reality check, not a perf claim. The opthash bindings cross GIL → `HashedAny::hash()` → Python bytecode per op, so `dict` will usually win — the point is to know by how much and where.
 
 ## `benches/speedup.rs` — throughput + mean latency (Criterion)
 
