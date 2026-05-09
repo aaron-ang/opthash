@@ -1,13 +1,5 @@
-"""Microbench breaking down per-op overhead in opthash Python bindings.
-
-Decomposes the cost of one `m[k]` call by comparing primitives:
-
-    raw loop  -> hash(k)  -> dict[k]  -> opthash __contains__  -> opthash __getitem__
-
-Δ between adjacent rows is the cost of one extra primitive on the path.
-"""
-
 import time
+
 import opthash
 
 N = 10_000
@@ -28,7 +20,9 @@ def bench(name, fn):
     samples.sort()
     median = samples[len(samples) // 2]
     ns_per_op = median / N
-    print(f"{name:<45} {ns_per_op:>7.1f} ns/op   (median {median/1e3:>7.1f} µs / {N} ops)")
+    print(
+        f"{name:<45} {ns_per_op:>7.1f} ns/op   (median {median / 1e3:>7.1f} µs / {N} ops)"
+    )
     return ns_per_op
 
 
@@ -46,8 +40,8 @@ def main():
     e = make_loaded(opthash.ElasticHashMap, keys)
     f = make_loaded(opthash.FunnelHashMap, keys)
 
-    raw = bench("loop only (pass)", lambda: [None for _ in keys])
-    h = bench("hash(k)", lambda: [hash(k) for k in keys])
+    bench("loop only (pass)", lambda: [None for _ in keys])
+    bench("hash(k)", lambda: [hash(k) for k in keys])
     bench("dict[k]", lambda: [d[k] for k in keys])
 
     # contains skips value clone_ref → isolates HashedAny + map probe
