@@ -181,6 +181,25 @@ def test_update_from_iterable_rejects_non_pair(m):
         m.update([("a", 1), ("b", 2, 3)])
 
 
+def test_update_accepts_list_of_lists(m):
+    m.update([["a", 1], ["b", 2]])
+    assert m["a"] == 1
+    assert m["b"] == 2
+
+
+def test_eq_with_list_returns_false_even_if_indices_match(m):
+    # Without the hasattr("keys") guard, {0: 'a', 1: 'b'} == ['a', 'b'] would
+    # be True because list[0] == 'a' and list[1] == 'b'. Verify the guard.
+    m[0] = "a"
+    m[1] = "b"
+    assert m != ["a", "b"]
+
+
+def test_eq_with_set_returns_false(m):
+    _populate(m, 3)
+    assert m != {"k0", "k1", "k2"}
+
+
 def test_pop_returns_and_removes(m):
     _populate(m, 3)
     val = m.pop("k1")

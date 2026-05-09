@@ -302,16 +302,16 @@ impl PyElasticHashMap {
         }
         for item in other.try_iter()? {
             let item = item?;
-            let pair = item
-                .cast::<PyTuple>()
+            let len = item
+                .len()
                 .map_err(|_| PyValueError::new_err("update sequence elements must be 2-tuples"))?;
-            if pair.len() != 2 {
+            if len != 2 {
                 return Err(PyValueError::new_err(
                     "update sequence elements must be 2-tuples",
                 ));
             }
-            let k = pair.get_item(0)?;
-            let v = pair.get_item(1)?;
+            let k = item.get_item(0)?;
+            let v = item.get_item(1)?;
             let key = HashedAny::from_bound(&k)?;
             self.inner.insert(key, v.unbind());
         }
@@ -381,6 +381,9 @@ impl PyElasticHashMap {
     }
 
     fn __eq__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
+        if !other.hasattr("keys").unwrap_or(false) {
+            return false;
+        }
         let Ok(other_len) = other.len() else {
             return false;
         };
@@ -553,16 +556,16 @@ impl PyFunnelHashMap {
         }
         for item in other.try_iter()? {
             let item = item?;
-            let pair = item
-                .cast::<PyTuple>()
+            let len = item
+                .len()
                 .map_err(|_| PyValueError::new_err("update sequence elements must be 2-tuples"))?;
-            if pair.len() != 2 {
+            if len != 2 {
                 return Err(PyValueError::new_err(
                     "update sequence elements must be 2-tuples",
                 ));
             }
-            let k = pair.get_item(0)?;
-            let v = pair.get_item(1)?;
+            let k = item.get_item(0)?;
+            let v = item.get_item(1)?;
             let key = HashedAny::from_bound(&k)?;
             self.inner.insert(key, v.unbind());
         }
@@ -632,6 +635,9 @@ impl PyFunnelHashMap {
     }
 
     fn __eq__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
+        if !other.hasattr("keys").unwrap_or(false) {
+            return false;
+        }
         let Ok(other_len) = other.len() else {
             return false;
         };
