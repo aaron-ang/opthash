@@ -518,6 +518,18 @@ where
         Some(removed_entry.value)
     }
 
+    #[must_use]
+    pub fn iter(&self) -> FunnelIter<'_, K, V> {
+        FunnelIter {
+            levels: &self.levels,
+            primary: &self.special.primary,
+            fallback: &self.special.fallback,
+            phase: FunnelIterPhase::Levels,
+            level_idx: 0,
+            slot_idx: 0,
+        }
+    }
+
     pub fn clear(&mut self) {
         for level in &mut self.levels {
             for idx in 0..level.table.capacity() {
@@ -1210,6 +1222,89 @@ where
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FunnelIterPhase {
+    Levels,
+    Primary,
+    Fallback,
+    Done,
+}
+
+pub struct FunnelIter<'a, K, V> {
+    levels: &'a [BucketLevel<K, V>],
+    primary: &'a SpecialPrimary<K, V>,
+    fallback: &'a SpecialFallback<K, V>,
+    phase: FunnelIterPhase,
+    level_idx: usize,
+    slot_idx: usize,
+}
+
+impl<'a, K, V> Iterator for FunnelIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.phase {
+                FunnelIterPhase::Levels => {
+                    while self.level_idx < self.levels.len() {
+                        let table = &self.levels[self.level_idx].table;
+                        while self.slot_idx < table.capacity() {
+                            let idx = self.slot_idx;
+                            self.slot_idx += 1;
+                            if table.control_at(idx).is_occupied() {
+                                let entry = unsafe { table.get_ref(idx) };
+                                return Some((&entry.key, &entry.value));
+                            }
+                        }
+                        self.level_idx += 1;
+                        self.slot_idx = 0;
+                    }
+                    self.phase = FunnelIterPhase::Primary;
+                    self.slot_idx = 0;
+                }
+                FunnelIterPhase::Primary => {
+                    let table = &self.primary.table;
+                    while self.slot_idx < table.capacity() {
+                        let idx = self.slot_idx;
+                        self.slot_idx += 1;
+                        if table.control_at(idx).is_occupied() {
+                            let entry = unsafe { table.get_ref(idx) };
+                            return Some((&entry.key, &entry.value));
+                        }
+                    }
+                    self.phase = FunnelIterPhase::Fallback;
+                    self.slot_idx = 0;
+                }
+                FunnelIterPhase::Fallback => {
+                    let table = &self.fallback.table;
+                    while self.slot_idx < table.capacity() {
+                        let idx = self.slot_idx;
+                        self.slot_idx += 1;
+                        if table.control_at(idx).is_occupied() {
+                            let entry = unsafe { table.get_ref(idx) };
+                            return Some((&entry.key, &entry.value));
+                        }
+                    }
+                    self.phase = FunnelIterPhase::Done;
+                }
+                FunnelIterPhase::Done => return None,
+            }
+        }
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a FunnelHashMap<K, V>
+where
+    K: Eq + Hash,
+{
+    type Item = (&'a K, &'a V);
+    type IntoIter = FunnelIter<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 fn compute_level_count(reserve_fraction: f64) -> usize {
     ceil_to_usize((4.0 * (1.0 / reserve_fraction).log2() + 10.0).max(1.0))
 }
@@ -1553,5 +1648,36 @@ mod tests {
                 i + n
             );
         }
+    }
+
+    #[test]
+    fn iter_yields_every_inserted_pair_once() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
+        for i in 0..80 {
+            map.insert(i, i * 7);
+        }
+        let mut collected: Vec<(i32, i32)> = map.iter().map(|(&k, &v)| (k, v)).collect();
+        collected.sort();
+        let expected: Vec<(i32, i32)> = (0..80).map(|i| (i, i * 7)).collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn iter_skips_tombstones_after_remove() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
+        for i in 0..40 {
+            map.insert(i, i);
+        }
+        for i in (0..40).step_by(3) {
+            map.remove(&i);
+        }
+        let keys: Vec<i32> = map.iter().map(|(&k, _)| k).collect();
+        assert_eq!(keys.len(), map.len());
+    }
+
+    #[test]
+    fn iter_empty_map_is_empty() {
+        let map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        assert_eq!(map.iter().count(), 0);
     }
 }
