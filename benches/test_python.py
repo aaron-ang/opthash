@@ -123,3 +123,76 @@ def test_delete(benchmark, factory, keys):
             del m[k]
 
     benchmark(run)
+
+
+@pytest.mark.benchmark(group="setdefault_hit")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_setdefault_hit(benchmark, factory, keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+
+    def run():
+        for k in keys:
+            _ = m.setdefault(k, 1)
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="setdefault_miss")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_setdefault_miss(benchmark, factory, keys, miss_keys):
+    def run():
+        m = factory(N)
+        for k in keys:
+            m[k] = 0
+        for k in miss_keys:
+            _ = m.setdefault(k, 1)
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="keys_contains_hit")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_keys_contains_hit(benchmark, factory, keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+    view = m.keys()
+
+    def run():
+        for k in keys:
+            _ = k in view
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="keys_contains_miss")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_keys_contains_miss(benchmark, factory, keys, miss_keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+    view = m.keys()
+
+    def run():
+        for k in miss_keys:
+            _ = k in view
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="items_contains_hit")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_items_contains_hit(benchmark, factory, keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+    view = m.items()
+    pairs = [(k, 0) for k in keys]
+
+    def run():
+        for p in pairs:
+            _ = p in view
+
+    benchmark(run)
