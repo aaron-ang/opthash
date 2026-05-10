@@ -282,3 +282,17 @@ def test_eq_same(benchmark, factory, keys):
         _ = a == b
 
     benchmark(run)
+
+
+@pytest.mark.benchmark(group="update_dict")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_update_dict(benchmark, factory, keys, miss_keys):
+    other = {k: 1 for k in miss_keys}
+
+    def run():
+        m = factory(N)
+        for k in keys:
+            m[k] = 0
+        m.update(other)
+
+    benchmark(run)

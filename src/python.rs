@@ -420,17 +420,22 @@ macro_rules! define_map_classes {
                     if let Ok(other_map) = other.cast::<Self>() {
                         let py = other.py();
                         let borrowed = other_map.borrow();
+                        self.inner.reserve(borrowed.inner.len());
                         for (k, v) in &borrowed.inner {
                             self.inner.insert(k.clone_with_py(py), v.clone_ref(py));
                             touched = true;
                         }
                     } else if let Ok(dict) = other.cast::<PyDict>() {
+                        self.inner.reserve(dict.len());
                         for (k, v) in dict.iter() {
                             let key = HashedAny::from_bound(&k)?;
                             self.inner.insert(key, v.unbind());
                             touched = true;
                         }
                     } else if other.hasattr("keys")? {
+                        if let Ok(hint) = other.len() {
+                            self.inner.reserve(hint);
+                        }
                         let keys = other.call_method0("keys")?;
                         for k in keys.try_iter()? {
                             let k = k?;
@@ -440,6 +445,9 @@ macro_rules! define_map_classes {
                             touched = true;
                         }
                     } else {
+                        if let Ok(hint) = other.len() {
+                            self.inner.reserve(hint);
+                        }
                         for item in other.try_iter()? {
                             let item = item?;
                             let len = item.len().map_err(|_| {
@@ -459,6 +467,7 @@ macro_rules! define_map_classes {
                     }
                 }
                 if let Some(kwargs) = kwargs {
+                    self.inner.reserve(kwargs.len());
                     for (k, v) in kwargs.iter() {
                         let key = HashedAny::from_bound(&k)?;
                         self.inner.insert(key, v.unbind());
