@@ -296,3 +296,46 @@ def test_update_dict(benchmark, factory, keys, miss_keys):
         m.update(other)
 
     benchmark(run)
+
+
+@pytest.mark.benchmark(group="values_contains_hit")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_values_contains_hit(benchmark, factory, keys):
+    m = factory(N)
+    sentinel = object()
+    for k in keys:
+        m[k] = sentinel
+    view = m.values()
+
+    def run():
+        _ = sentinel in view
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="values_contains_miss")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_values_contains_miss(benchmark, factory, keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+    view = m.values()
+    target = object()
+
+    def run():
+        _ = target in view
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="copy")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_copy(benchmark, factory, keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+
+    def run():
+        _ = m.copy()
+
+    benchmark(run)
