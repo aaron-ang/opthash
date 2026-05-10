@@ -15,11 +15,9 @@ import opthash
 
 
 N = 10_000
-SEED = 0
+SEED = 42
 
 
-# All three factories grow from zero. dict() doesn't accept a capacity hint, so
-# pre-allocating opthash maps would give them an unfair head-start.
 def _factory_dict(_n: int):
     return dict()
 
@@ -236,5 +234,16 @@ def test_eq_dict(benchmark, factory, keys):
 
     def run():
         _ = m == other
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="fromkeys")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_fromkeys(benchmark, factory, keys):
+    cls = factory(0).__class__
+
+    def run():
+        _ = cls.fromkeys(keys, 0)
 
     benchmark(run)

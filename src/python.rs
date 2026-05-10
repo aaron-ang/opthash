@@ -286,8 +286,9 @@ macro_rules! define_map_classes {
                 value: Option<Py<PyAny>>,
                 py: Python<'_>,
             ) -> PyResult<Self> {
+                let cap = iterable.len().unwrap_or(0);
                 let mut me = Self {
-                    inner: $Inner::with_capacity(0),
+                    inner: $Inner::with_capacity(cap),
                     generation: 0,
                 };
                 let val = value.unwrap_or_else(|| py.None());
