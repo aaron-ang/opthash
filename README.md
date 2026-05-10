@@ -15,7 +15,7 @@ Both are open-addressing hash maps that achieve optimal expected probe complexit
 
 Both maps share a common core: `RawTable`-backed multi-level layouts, 7-bit fingerprint control bytes, SIMD control-byte scans for occupancy + lookup, tombstone accounting, and per-level Lemire fastmod magics for the hash → slot mapping. The default `BuildHasher` is [`foldhash`](https://crates.io/crates/foldhash).
 
-- **`ElasticHashMap<K, V>`** — Flat `RawTable` per level wsith geometrically halving capacities; insertion uses per-level probe budgets + coprime group steps.
+- **`ElasticHashMap<K, V>`** — Flat `RawTable` per level with geometrically halving capacities; insertion uses per-level probe budgets + coprime group steps.
 - **`FunnelHashMap<K, V>`** — Bucketed levels plus a split special array: `primary` (group-probed) and `fallback` (two-choice buckets).
 
 Both support `insert`, `get`, `get_mut`, `contains_key`, `remove`, and `clear`. Maps start with zero allocation (`new()`) and grow dynamically on demand. Advanced tuning is available through `ElasticOptions`, `FunnelOptions`, and `with_options(...)`.
@@ -59,20 +59,20 @@ pip install opthash
 ```
 
 ```python
-from opthash import ElasticHashMap, ElasticOptions, FunnelHashMap, FunnelOptions
+from opthash import ElasticHashMap, FunnelHashMap
 
 m = ElasticHashMap()
 m["key"] = 42
 assert m["key"] == 42
 assert "key" in m and len(m) == 1
 
-m = ElasticHashMap.with_options(ElasticOptions(
-    capacity=1024, reserve_fraction=0.10, probe_scale=12.0,
-))
+m = ElasticHashMap.with_options(
+    capacity=1024, reserve_fraction=0.10, probe_scale=12.0
+)
 
-m = FunnelHashMap.with_options(FunnelOptions(
-    capacity=1024, reserve_fraction=0.10, primary_probe_limit=8,
-))
+m = FunnelHashMap.with_options(
+    capacity=1024, reserve_fraction=0.10, primary_probe_limit=8
+)
 ```
 
 ## Layout Sketch

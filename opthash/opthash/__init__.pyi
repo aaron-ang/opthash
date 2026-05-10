@@ -17,34 +17,6 @@ T = TypeVar("T")
 K2 = TypeVar("K2", bound=Hashable)
 V2 = TypeVar("V2")
 
-class ElasticOptions:
-    def __init__(
-        self,
-        capacity: int = 0,
-        reserve_fraction: float | None = None,
-        probe_scale: float | None = None,
-    ) -> None: ...
-    @property
-    def capacity(self) -> int: ...
-    @property
-    def reserve_fraction(self) -> float: ...
-    @property
-    def probe_scale(self) -> float: ...
-
-class FunnelOptions:
-    def __init__(
-        self,
-        capacity: int = 0,
-        reserve_fraction: float | None = None,
-        primary_probe_limit: int | None = None,
-    ) -> None: ...
-    @property
-    def capacity(self) -> int: ...
-    @property
-    def reserve_fraction(self) -> float: ...
-    @property
-    def primary_probe_limit(self) -> int | None: ...
-
 class ElasticHashMap(MutableMapping[K, V]):
     __hash__: ClassVar[None]  # type: ignore[assignment]
     @overload
@@ -76,7 +48,12 @@ class ElasticHashMap(MutableMapping[K, V]):
         **kwargs: V,
     ) -> None: ...
     @classmethod
-    def with_options(cls, options: ElasticOptions) -> ElasticHashMap[K, V]: ...
+    def with_options(
+        cls,
+        capacity: int = 0,
+        reserve_fraction: float | None = None,
+        probe_scale: float | None = None,
+    ) -> ElasticHashMap[K, V]: ...
     @overload
     @classmethod
     def fromkeys(
@@ -167,7 +144,12 @@ class FunnelHashMap(MutableMapping[K, V]):
         **kwargs: V,
     ) -> None: ...
     @classmethod
-    def with_options(cls, options: FunnelOptions) -> FunnelHashMap[K, V]: ...
+    def with_options(
+        cls,
+        capacity: int = 0,
+        reserve_fraction: float | None = None,
+        primary_probe_limit: int | None = None,
+    ) -> FunnelHashMap[K, V]: ...
     @overload
     @classmethod
     def fromkeys(

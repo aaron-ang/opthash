@@ -2,9 +2,7 @@ from collections.abc import ItemsView, KeysView, MutableMapping, ValuesView
 
 from .opthash import (
     ElasticHashMap,
-    ElasticOptions,
     FunnelHashMap,
-    FunnelOptions,
     elastic_items,
     elastic_keys,
     elastic_values,
@@ -24,7 +22,5 @@ ItemsView.register(funnel_items)
 
 __all__ = [
     "ElasticHashMap",
-    "ElasticOptions",
     "FunnelHashMap",
-    "FunnelOptions",
 ]

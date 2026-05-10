@@ -12,6 +12,55 @@ use pyo3::types::{PyDict, PySet, PyString, PyTuple, PyType};
 use crate::funnel::MAX_FUNNEL_RESERVE_FRACTION;
 use crate::{ElasticHashMap, ElasticOptions, FunnelHashMap, FunnelOptions};
 
+fn build_elastic_options(
+    capacity: usize,
+    reserve_fraction: Option<f64>,
+    probe_scale: Option<f64>,
+) -> PyResult<ElasticOptions> {
+    let mut opts = ElasticOptions::with_capacity(capacity);
+    if let Some(rf) = reserve_fraction {
+        if !(rf > 0.0 && rf < 1.0) {
+            return Err(PyValueError::new_err(
+                "reserve_fraction must be in the open interval (0, 1)",
+            ));
+        }
+        opts.reserve_fraction = rf;
+    }
+    if let Some(ps) = probe_scale {
+        if ps <= 0.0 {
+            return Err(PyValueError::new_err("probe_scale must be positive"));
+        }
+        opts.probe_scale = ps;
+    }
+    Ok(opts)
+}
+
+fn build_funnel_options(
+    capacity: usize,
+    reserve_fraction: Option<f64>,
+    primary_probe_limit: Option<usize>,
+) -> PyResult<FunnelOptions> {
+    let mut opts = FunnelOptions::with_capacity(capacity);
+    if let Some(rf) = reserve_fraction {
+        if !(rf > 0.0 && rf <= MAX_FUNNEL_RESERVE_FRACTION) {
+            return Err(PyValueError::new_err(format!(
+                "reserve_fraction must be in (0, {MAX_FUNNEL_RESERVE_FRACTION}]; \
+                 FunnelHashMap caps the load factor at 1/8 by design"
+            )));
+        }
+        opts.reserve_fraction = rf;
+    }
+    if let Some(limit) = primary_probe_limit {
+        if limit == 0 {
+            return Err(PyValueError::new_err(
+                "primary_probe_limit must be positive",
+            ));
+        }
+        opts.primary_probe_limit = Some(limit);
+    }
+    Ok(opts)
+}
+
 #[derive(Clone, Copy, PartialEq)]
 #[repr(u8)]
 enum HashKind {
@@ -108,123 +157,14 @@ impl PartialEq for HashedAny {
 
 impl Eq for HashedAny {}
 
-fn validate_elastic_reserve_fraction(value: f64) -> PyResult<()> {
-    if value > 0.0 && value < 1.0 {
-        Ok(())
-    } else {
-        Err(PyValueError::new_err(
-            "reserve_fraction must be in the open interval (0, 1)",
-        ))
-    }
-}
-
-fn validate_funnel_reserve_fraction(value: f64) -> PyResult<()> {
-    if value > 0.0 && value <= MAX_FUNNEL_RESERVE_FRACTION {
-        Ok(())
-    } else {
-        Err(PyValueError::new_err(format!(
-            "reserve_fraction must be in (0, {MAX_FUNNEL_RESERVE_FRACTION}]; \
-             FunnelHashMap caps the load factor at 1/8 by design"
-        )))
-    }
-}
-
-#[pyclass(name = "ElasticOptions", module = "opthash")]
-struct PyElasticOptions {
-    inner: ElasticOptions,
-}
-
-#[pymethods]
-impl PyElasticOptions {
-    #[new]
-    #[pyo3(signature = (capacity = 0, reserve_fraction = None, probe_scale = None))]
-    fn new(
-        capacity: usize,
-        reserve_fraction: Option<f64>,
-        probe_scale: Option<f64>,
-    ) -> PyResult<Self> {
-        let mut inner = ElasticOptions::with_capacity(capacity);
-        if let Some(rf) = reserve_fraction {
-            validate_elastic_reserve_fraction(rf)?;
-            inner.reserve_fraction = rf;
-        }
-        if let Some(ps) = probe_scale {
-            if ps <= 0.0 {
-                return Err(PyValueError::new_err("probe_scale must be positive"));
-            }
-            inner.probe_scale = ps;
-        }
-        Ok(Self { inner })
-    }
-
-    #[getter]
-    fn capacity(&self) -> usize {
-        self.inner.capacity
-    }
-
-    #[getter]
-    fn reserve_fraction(&self) -> f64 {
-        self.inner.reserve_fraction
-    }
-
-    #[getter]
-    fn probe_scale(&self) -> f64 {
-        self.inner.probe_scale
-    }
-}
-
-#[pyclass(name = "FunnelOptions", module = "opthash")]
-struct PyFunnelOptions {
-    inner: FunnelOptions,
-}
-
-#[pymethods]
-impl PyFunnelOptions {
-    #[new]
-    #[pyo3(signature = (capacity = 0, reserve_fraction = None, primary_probe_limit = None))]
-    fn new(
-        capacity: usize,
-        reserve_fraction: Option<f64>,
-        primary_probe_limit: Option<usize>,
-    ) -> PyResult<Self> {
-        let mut inner = FunnelOptions::with_capacity(capacity);
-        if let Some(rf) = reserve_fraction {
-            validate_funnel_reserve_fraction(rf)?;
-            inner.reserve_fraction = rf;
-        }
-        if let Some(limit) = primary_probe_limit {
-            if limit == 0 {
-                return Err(PyValueError::new_err(
-                    "primary_probe_limit must be positive",
-                ));
-            }
-            inner.primary_probe_limit = Some(limit);
-        }
-        Ok(Self { inner })
-    }
-
-    #[getter]
-    fn capacity(&self) -> usize {
-        self.inner.capacity
-    }
-
-    #[getter]
-    fn reserve_fraction(&self) -> f64 {
-        self.inner.reserve_fraction
-    }
-
-    #[getter]
-    fn primary_probe_limit(&self) -> Option<usize> {
-        self.inner.primary_probe_limit
-    }
-}
-
 macro_rules! define_map_classes {
     (
         py_map = $PyMap:ident,
         py_map_name = $py_map_name:literal,
         inner = $Inner:ident,
-        py_options = $PyOptions:ident,
+        build_options = $build_options:ident,
+        extra_arg = $extra_arg:ident,
+        extra_ty = $extra_ty:ty,
         key_iter = $KeyIter:ident,
         key_iter_name = $key_iter_name:literal,
         value_iter = $ValueIter:ident,
@@ -271,11 +211,18 @@ macro_rules! define_map_classes {
             }
 
             #[classmethod]
-            fn with_options(_cls: &Bound<'_, PyType>, options: &$PyOptions) -> Self {
-                Self {
-                    inner: $Inner::with_options(options.inner),
+            #[pyo3(signature = (capacity = 0, reserve_fraction = None, $extra_arg = None))]
+            fn with_options(
+                _cls: &Bound<'_, PyType>,
+                capacity: usize,
+                reserve_fraction: Option<f64>,
+                $extra_arg: Option<$extra_ty>,
+            ) -> PyResult<Self> {
+                let opts = $build_options(capacity, reserve_fraction, $extra_arg)?;
+                Ok(Self {
+                    inner: $Inner::with_options(opts),
                     generation: 0,
-                }
+                })
             }
 
             #[classmethod]
@@ -939,7 +886,9 @@ define_map_classes! {
     py_map = PyElasticHashMap,
     py_map_name = "ElasticHashMap",
     inner = ElasticHashMap,
-    py_options = PyElasticOptions,
+    build_options = build_elastic_options,
+    extra_arg = probe_scale,
+    extra_ty = f64,
     key_iter = PyElasticKeyIter,
     key_iter_name = "_ElasticKeyIter",
     value_iter = PyElasticValueIter,
@@ -958,7 +907,9 @@ define_map_classes! {
     py_map = PyFunnelHashMap,
     py_map_name = "FunnelHashMap",
     inner = FunnelHashMap,
-    py_options = PyFunnelOptions,
+    build_options = build_funnel_options,
+    extra_arg = primary_probe_limit,
+    extra_ty = usize,
     key_iter = PyFunnelKeyIter,
     key_iter_name = "_FunnelKeyIter",
     value_iter = PyFunnelValueIter,
@@ -977,8 +928,6 @@ define_map_classes! {
 fn opthash(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyElasticHashMap>()?;
     m.add_class::<PyFunnelHashMap>()?;
-    m.add_class::<PyElasticOptions>()?;
-    m.add_class::<PyFunnelOptions>()?;
     m.add_class::<PyElasticKeysView>()?;
     m.add_class::<PyElasticValuesView>()?;
     m.add_class::<PyElasticItemsView>()?;
