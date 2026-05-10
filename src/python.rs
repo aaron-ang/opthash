@@ -500,10 +500,11 @@ macro_rules! define_map_classes {
                 default: Option<Py<PyAny>>,
                 py: Python<'_>,
             ) -> PyResult<Py<PyAny>> {
-                let k = HashedAny::from_bound(key)?;
-                if let Some(v) = self.inner.get(&k) {
+                let probe = ProbeKey::from_bound(key)?;
+                if let Some(v) = self.inner.get(probe.as_key()) {
                     return Ok(v.clone_ref(py));
                 }
+                let k = HashedAny::from_bound(key)?;
                 let value = default.unwrap_or_else(|| py.None());
                 self.inner.insert(k, value.clone_ref(py));
                 self.bump();
@@ -593,8 +594,8 @@ macro_rules! define_map_classes {
             }
             fn __contains__(&self, key: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<bool> {
                 let m = self.map.borrow(py);
-                let k = HashedAny::from_bound(key)?;
-                Ok(m.inner.contains_key(&k))
+                let probe = ProbeKey::from_bound(key)?;
+                Ok(m.inner.contains_key(probe.as_key()))
             }
             fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
                 let m = self.map.borrow(py);
@@ -672,8 +673,8 @@ macro_rules! define_map_classes {
                 let m = self.map.borrow(py);
                 for item in other.try_iter()? {
                     let item = item?;
-                    let h = HashedAny::from_bound(&item)?;
-                    if !m.inner.contains_key(&h) {
+                    let probe = ProbeKey::from_bound(&item)?;
+                    if !m.inner.contains_key(probe.as_key()) {
                         result.add(item)?;
                     }
                 }
@@ -761,8 +762,8 @@ macro_rules! define_map_classes {
                 let k = tup.get_item(0)?;
                 let v = tup.get_item(1)?;
                 let m = self.map.borrow(py);
-                let h = HashedAny::from_bound(&k)?;
-                match m.inner.get(&h) {
+                let probe = ProbeKey::from_bound(&k)?;
+                match m.inner.get(probe.as_key()) {
                     Some(stored_v) => Ok(stored_v.bind(py).eq(&v).unwrap_or(false)),
                     None => Ok(false),
                 }
