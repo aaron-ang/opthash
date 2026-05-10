@@ -1,4 +1,5 @@
 #![cfg(feature = "python")]
+#![allow(clippy::ptr_as_ptr, clippy::borrow_as_ptr, clippy::ref_as_ptr)]
 
 use std::hash::{Hash, Hasher};
 use std::mem::ManuallyDrop;
@@ -218,1340 +219,696 @@ impl PyFunnelOptions {
     }
 }
 
-#[pyclass(name = "ElasticHashMap", module = "opthash")]
-struct PyElasticHashMap {
-    inner: ElasticHashMap<HashedAny, Py<PyAny>>,
-    generation: u64,
-}
-
-impl PyElasticHashMap {
-    #[inline]
-    fn bump(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-    }
-}
-
-#[pymethods]
-impl PyElasticHashMap {
-    #[new]
-    #[pyo3(signature = (other = None, *, capacity = 0, **kwargs))]
-    fn new(
-        other: Option<&Bound<'_, PyAny>>,
-        capacity: usize,
-        kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Self> {
-        let mut me = Self {
-            inner: ElasticHashMap::with_capacity(capacity),
-            generation: 0,
-        };
-        if other.is_some() || kwargs.is_some() {
-            me.update(other, kwargs)?;
+macro_rules! define_map_classes {
+    (
+        py_map = $PyMap:ident,
+        py_map_name = $py_map_name:literal,
+        inner = $Inner:ident,
+        py_options = $PyOptions:ident,
+        key_iter = $KeyIter:ident,
+        key_iter_name = $key_iter_name:literal,
+        value_iter = $ValueIter:ident,
+        value_iter_name = $value_iter_name:literal,
+        item_iter = $ItemIter:ident,
+        item_iter_name = $item_iter_name:literal,
+        keys_view = $KeysView:ident,
+        keys_view_name = $keys_view_name:literal,
+        values_view = $ValuesView:ident,
+        values_view_name = $values_view_name:literal,
+        items_view = $ItemsView:ident,
+        items_view_name = $items_view_name:literal,
+    ) => {
+        #[pyclass(name = $py_map_name, module = "opthash")]
+        struct $PyMap {
+            inner: $Inner<HashedAny, Py<PyAny>>,
+            generation: u64,
         }
-        Ok(me)
-    }
 
-    #[classmethod]
-    fn with_options(_cls: &Bound<'_, PyType>, options: &PyElasticOptions) -> Self {
-        Self {
-            inner: ElasticHashMap::with_options(options.inner),
-            generation: 0,
+        impl $PyMap {
+            #[inline]
+            fn bump(&mut self) {
+                self.generation = self.generation.wrapping_add(1);
+            }
         }
-    }
 
-    #[classmethod]
-    #[pyo3(signature = (iterable, value = None))]
-    fn fromkeys(
-        _cls: &Bound<'_, PyType>,
-        iterable: &Bound<'_, PyAny>,
-        value: Option<Py<PyAny>>,
-        py: Python<'_>,
-    ) -> PyResult<Self> {
-        let mut me = Self {
-            inner: ElasticHashMap::with_capacity(0),
-            generation: 0,
-        };
-        let val = value.unwrap_or_else(|| py.None());
-        for k in iterable.try_iter()? {
-            let k = k?;
-            let key = HashedAny::from_bound(&k)?;
-            me.inner.insert(key, val.clone_ref(py));
-        }
-        me.bump();
-        Ok(me)
-    }
+        #[pymethods]
+        impl $PyMap {
+            #[new]
+            #[pyo3(signature = (other = None, *, capacity = 0, **kwargs))]
+            fn new(
+                other: Option<&Bound<'_, PyAny>>,
+                capacity: usize,
+                kwargs: Option<&Bound<'_, PyDict>>,
+            ) -> PyResult<Self> {
+                let mut me = Self {
+                    inner: $Inner::with_capacity(capacity),
+                    generation: 0,
+                };
+                if other.is_some() || kwargs.is_some() {
+                    me.update(other, kwargs)?;
+                }
+                Ok(me)
+            }
 
-    #[classmethod]
-    fn __class_getitem__<'py>(
-        cls: &Bound<'py, PyType>,
-        item: &Bound<'py, PyAny>,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        py.import("types")?
-            .getattr("GenericAlias")?
-            .call1((cls, item))
-    }
+            #[classmethod]
+            fn with_options(_cls: &Bound<'_, PyType>, options: &$PyOptions) -> Self {
+                Self {
+                    inner: $Inner::with_options(options.inner),
+                    generation: 0,
+                }
+            }
 
-    fn __len__(&self) -> usize {
-        self.inner.len()
-    }
+            #[classmethod]
+            #[pyo3(signature = (iterable, value = None))]
+            fn fromkeys(
+                _cls: &Bound<'_, PyType>,
+                iterable: &Bound<'_, PyAny>,
+                value: Option<Py<PyAny>>,
+                py: Python<'_>,
+            ) -> PyResult<Self> {
+                let mut me = Self {
+                    inner: $Inner::with_capacity(0),
+                    generation: 0,
+                };
+                let val = value.unwrap_or_else(|| py.None());
+                for k in iterable.try_iter()? {
+                    let k = k?;
+                    let key = HashedAny::from_bound(&k)?;
+                    me.inner.insert(key, val.clone_ref(py));
+                }
+                me.bump();
+                Ok(me)
+            }
 
-    #[getter]
-    fn capacity(&self) -> usize {
-        self.inner.capacity()
-    }
+            #[classmethod]
+            fn __class_getitem__<'py>(
+                cls: &Bound<'py, PyType>,
+                item: &Bound<'py, PyAny>,
+                py: Python<'py>,
+            ) -> PyResult<Bound<'py, PyAny>> {
+                py.import("types")?
+                    .getattr("GenericAlias")?
+                    .call1((cls, item))
+            }
 
-    fn __contains__(&self, key: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let probe = ProbeKey::from_bound(key)?;
-        Ok(self.inner.contains_key(probe.as_key()))
-    }
+            fn __len__(&self) -> usize {
+                self.inner.len()
+            }
 
-    fn __getitem__(&self, key: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let probe = ProbeKey::from_bound(key)?;
-        match self.inner.get(probe.as_key()) {
-            Some(v) => Ok(v.clone_ref(py)),
-            None => Err(PyKeyError::new_err(key.clone().unbind())),
-        }
-    }
+            #[getter]
+            fn capacity(&self) -> usize {
+                self.inner.capacity()
+            }
 
-    fn __setitem__(&mut self, key: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let k = HashedAny::from_bound(key)?;
-        self.inner.insert(k, value.clone().unbind());
-        self.bump();
-        Ok(())
-    }
+            fn __contains__(&self, key: &Bound<'_, PyAny>) -> PyResult<bool> {
+                let probe = ProbeKey::from_bound(key)?;
+                Ok(self.inner.contains_key(probe.as_key()))
+            }
 
-    fn __delitem__(&mut self, key: &Bound<'_, PyAny>) -> PyResult<()> {
-        let probe = ProbeKey::from_bound(key)?;
-        match self.inner.remove(probe.as_key()) {
-            Some(_) => {
+            fn __getitem__(&self, key: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+                let probe = ProbeKey::from_bound(key)?;
+                match self.inner.get(probe.as_key()) {
+                    Some(v) => Ok(v.clone_ref(py)),
+                    None => Err(PyKeyError::new_err(key.clone().unbind())),
+                }
+            }
+
+            fn __setitem__(
+                &mut self,
+                key: &Bound<'_, PyAny>,
+                value: &Bound<'_, PyAny>,
+            ) -> PyResult<()> {
+                let k = HashedAny::from_bound(key)?;
+                self.inner.insert(k, value.clone().unbind());
                 self.bump();
                 Ok(())
             }
-            None => Err(PyKeyError::new_err(key.clone().unbind())),
-        }
-    }
 
-    #[pyo3(signature = (key, default = None))]
-    fn get(
-        &self,
-        key: &Bound<'_, PyAny>,
-        default: Option<Py<PyAny>>,
-        py: Python<'_>,
-    ) -> PyResult<Py<PyAny>> {
-        let probe = ProbeKey::from_bound(key)?;
-        Ok(match self.inner.get(probe.as_key()) {
-            Some(v) => v.clone_ref(py),
-            None => default.unwrap_or_else(|| py.None()),
-        })
-    }
-
-    fn clear(&mut self) {
-        self.inner.clear();
-        self.bump();
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "ElasticHashMap(len={}, capacity={})",
-            self.inner.len(),
-            self.inner.capacity()
-        )
-    }
-
-    fn __iter__(slf: Bound<'_, Self>) -> PyElasticKeyIter {
-        let py = slf.py();
-        let m = slf.borrow();
-        let snapshot = m.inner.iter().map(|(k, _)| k.obj.clone_ref(py)).collect();
-        let expected_gen = m.generation;
-        drop(m);
-        PyElasticKeyIter {
-            map: slf.unbind(),
-            snapshot,
-            expected_gen,
-            pos: 0,
-        }
-    }
-
-    fn keys(slf: Bound<'_, Self>) -> PyElasticKeysView {
-        PyElasticKeysView { map: slf.unbind() }
-    }
-
-    fn values(slf: Bound<'_, Self>) -> PyElasticValuesView {
-        PyElasticValuesView { map: slf.unbind() }
-    }
-
-    fn items(slf: Bound<'_, Self>) -> PyElasticItemsView {
-        PyElasticItemsView { map: slf.unbind() }
-    }
-
-    #[pyo3(signature = (other = None, **kwargs))]
-    fn update(
-        &mut self,
-        other: Option<&Bound<'_, PyAny>>,
-        kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<()> {
-        let mut touched = false;
-        if let Some(other) = other {
-            if let Ok(dict) = other.cast::<PyDict>() {
-                for (k, v) in dict.iter() {
-                    let key = HashedAny::from_bound(&k)?;
-                    self.inner.insert(key, v.unbind());
-                }
-            } else if other.hasattr("keys")? {
-                let keys = other.call_method0("keys")?;
-                for k in keys.try_iter()? {
-                    let k = k?;
-                    let v = other.get_item(&k)?;
-                    let key = HashedAny::from_bound(&k)?;
-                    self.inner.insert(key, v.unbind());
-                }
-            } else {
-                for item in other.try_iter()? {
-                    let item = item?;
-                    let len = item.len().map_err(|_| {
-                        PyValueError::new_err("update sequence elements must be 2-tuples")
-                    })?;
-                    if len != 2 {
-                        return Err(PyValueError::new_err(
-                            "update sequence elements must be 2-tuples",
-                        ));
+            fn __delitem__(&mut self, key: &Bound<'_, PyAny>) -> PyResult<()> {
+                let probe = ProbeKey::from_bound(key)?;
+                match self.inner.remove(probe.as_key()) {
+                    Some(_) => {
+                        self.bump();
+                        Ok(())
                     }
-                    let k = item.get_item(0)?;
-                    let v = item.get_item(1)?;
-                    let key = HashedAny::from_bound(&k)?;
-                    self.inner.insert(key, v.unbind());
+                    None => Err(PyKeyError::new_err(key.clone().unbind())),
                 }
             }
-            touched = true;
-        }
-        if let Some(kwargs) = kwargs
-            && !kwargs.is_empty()
-        {
-            for (k, v) in kwargs.iter() {
-                let key = HashedAny::from_bound(&k)?;
-                self.inner.insert(key, v.unbind());
-            }
-            touched = true;
-        }
-        if touched {
-            self.bump();
-        }
-        Ok(())
-    }
 
-    #[pyo3(signature = (key, default = None))]
-    fn pop(&mut self, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
-        let probe = ProbeKey::from_bound(key)?;
-        match self.inner.remove(probe.as_key()) {
-            Some(v) => {
+            #[pyo3(signature = (key, default = None))]
+            fn get(
+                &self,
+                key: &Bound<'_, PyAny>,
+                default: Option<Py<PyAny>>,
+                py: Python<'_>,
+            ) -> PyResult<Py<PyAny>> {
+                let probe = ProbeKey::from_bound(key)?;
+                Ok(match self.inner.get(probe.as_key()) {
+                    Some(v) => v.clone_ref(py),
+                    None => default.unwrap_or_else(|| py.None()),
+                })
+            }
+
+            fn clear(&mut self) {
+                self.inner.clear();
                 self.bump();
-                Ok(v)
             }
-            None => default.ok_or_else(|| PyKeyError::new_err(key.clone().unbind())),
-        }
-    }
 
-    fn popitem<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        if self.inner.is_empty() {
-            return Err(PyKeyError::new_err("popitem(): map is empty"));
-        }
-        let probe = {
-            let (k, _) = self.inner.iter().next().expect("len > 0");
-            k.clone_with_py(py)
-        };
-        let key_obj = probe.obj.clone_ref(py);
-        let value = self.inner.remove(&probe).expect("key from iter must exist");
-        self.bump();
-        PyTuple::new(py, [key_obj, value])
-    }
-
-    #[pyo3(signature = (key, default = None))]
-    fn setdefault(
-        &mut self,
-        key: &Bound<'_, PyAny>,
-        default: Option<Py<PyAny>>,
-        py: Python<'_>,
-    ) -> PyResult<Py<PyAny>> {
-        let k = HashedAny::from_bound(key)?;
-        if let Some(v) = self.inner.get(&k) {
-            return Ok(v.clone_ref(py));
-        }
-        let value = default.unwrap_or_else(|| py.None());
-        self.inner.insert(k, value.clone_ref(py));
-        self.bump();
-        Ok(value)
-    }
-
-    fn copy(&self, py: Python<'_>) -> Self {
-        let mut new = ElasticHashMap::with_capacity(self.inner.len());
-        for (k, v) in &self.inner {
-            new.insert(k.clone_with_py(py), v.clone_ref(py));
-        }
-        Self {
-            inner: new,
-            generation: 0,
-        }
-    }
-
-    fn __eq__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
-        if !other.hasattr("keys").unwrap_or(false) {
-            return false;
-        }
-        let Ok(other_len) = other.len() else {
-            return false;
-        };
-        if other_len != self.inner.len() {
-            return false;
-        }
-        for (k, v) in &self.inner {
-            let key_b = k.obj.bind(py);
-            let Ok(other_v) = other.get_item(key_b) else {
-                return false;
-            };
-            if !v.bind(py).eq(&other_v).unwrap_or(false) {
-                return false;
+            fn __repr__(&self) -> String {
+                format!(
+                    concat!($py_map_name, "(len={}, capacity={})"),
+                    self.inner.len(),
+                    self.inner.capacity()
+                )
             }
-        }
-        true
-    }
 
-    fn __or__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
-        let mut new = self.copy(py);
-        new.update(Some(other), None)?;
-        Ok(new)
-    }
+            fn __iter__(slf: Bound<'_, Self>) -> $KeyIter {
+                let py = slf.py();
+                let m = slf.borrow();
+                let snapshot = m.inner.iter().map(|(k, _)| k.obj.clone_ref(py)).collect();
+                let expected_gen = m.generation;
+                drop(m);
+                $KeyIter {
+                    map: slf.unbind(),
+                    snapshot,
+                    expected_gen,
+                    pos: 0,
+                }
+            }
 
-    fn __ror__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
-        let mut new = Self {
-            inner: ElasticHashMap::with_capacity(0),
-            generation: 0,
-        };
-        new.update(Some(other), None)?;
-        for (k, v) in &self.inner {
-            new.inner.insert(k.clone_with_py(py), v.clone_ref(py));
-        }
-        new.bump();
-        Ok(new)
-    }
+            fn keys(slf: Bound<'_, Self>) -> $KeysView {
+                $KeysView { map: slf.unbind() }
+            }
 
-    fn __ior__(&mut self, other: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.update(Some(other), None)
-    }
-}
+            fn values(slf: Bound<'_, Self>) -> $ValuesView {
+                $ValuesView { map: slf.unbind() }
+            }
 
-#[pyclass(name = "FunnelHashMap", module = "opthash")]
-struct PyFunnelHashMap {
-    inner: FunnelHashMap<HashedAny, Py<PyAny>>,
-    generation: u64,
-}
+            fn items(slf: Bound<'_, Self>) -> $ItemsView {
+                $ItemsView { map: slf.unbind() }
+            }
 
-impl PyFunnelHashMap {
-    #[inline]
-    fn bump(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-    }
-}
-
-#[pymethods]
-impl PyFunnelHashMap {
-    #[new]
-    #[pyo3(signature = (other = None, *, capacity = 0, **kwargs))]
-    fn new(
-        other: Option<&Bound<'_, PyAny>>,
-        capacity: usize,
-        kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Self> {
-        let mut me = Self {
-            inner: FunnelHashMap::with_capacity(capacity),
-            generation: 0,
-        };
-        if other.is_some() || kwargs.is_some() {
-            me.update(other, kwargs)?;
-        }
-        Ok(me)
-    }
-
-    #[classmethod]
-    fn with_options(_cls: &Bound<'_, PyType>, options: &PyFunnelOptions) -> Self {
-        Self {
-            inner: FunnelHashMap::with_options(options.inner),
-            generation: 0,
-        }
-    }
-
-    #[classmethod]
-    #[pyo3(signature = (iterable, value = None))]
-    fn fromkeys(
-        _cls: &Bound<'_, PyType>,
-        iterable: &Bound<'_, PyAny>,
-        value: Option<Py<PyAny>>,
-        py: Python<'_>,
-    ) -> PyResult<Self> {
-        let mut me = Self {
-            inner: FunnelHashMap::with_capacity(0),
-            generation: 0,
-        };
-        let val = value.unwrap_or_else(|| py.None());
-        for k in iterable.try_iter()? {
-            let k = k?;
-            let key = HashedAny::from_bound(&k)?;
-            me.inner.insert(key, val.clone_ref(py));
-        }
-        me.bump();
-        Ok(me)
-    }
-
-    #[classmethod]
-    fn __class_getitem__<'py>(
-        cls: &Bound<'py, PyType>,
-        item: &Bound<'py, PyAny>,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        py.import("types")?
-            .getattr("GenericAlias")?
-            .call1((cls, item))
-    }
-
-    fn __len__(&self) -> usize {
-        self.inner.len()
-    }
-
-    #[getter]
-    fn capacity(&self) -> usize {
-        self.inner.capacity()
-    }
-
-    fn __contains__(&self, key: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let probe = ProbeKey::from_bound(key)?;
-        Ok(self.inner.contains_key(probe.as_key()))
-    }
-
-    fn __getitem__(&self, key: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let probe = ProbeKey::from_bound(key)?;
-        match self.inner.get(probe.as_key()) {
-            Some(v) => Ok(v.clone_ref(py)),
-            None => Err(PyKeyError::new_err(key.clone().unbind())),
-        }
-    }
-
-    fn __setitem__(&mut self, key: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let k = HashedAny::from_bound(key)?;
-        self.inner.insert(k, value.clone().unbind());
-        self.bump();
-        Ok(())
-    }
-
-    fn __delitem__(&mut self, key: &Bound<'_, PyAny>) -> PyResult<()> {
-        let probe = ProbeKey::from_bound(key)?;
-        match self.inner.remove(probe.as_key()) {
-            Some(_) => {
-                self.bump();
+            #[pyo3(signature = (other = None, **kwargs))]
+            fn update(
+                &mut self,
+                other: Option<&Bound<'_, PyAny>>,
+                kwargs: Option<&Bound<'_, PyDict>>,
+            ) -> PyResult<()> {
+                let mut touched = false;
+                if let Some(other) = other {
+                    if let Ok(dict) = other.cast::<PyDict>() {
+                        for (k, v) in dict.iter() {
+                            let key = HashedAny::from_bound(&k)?;
+                            self.inner.insert(key, v.unbind());
+                        }
+                    } else if other.hasattr("keys")? {
+                        let keys = other.call_method0("keys")?;
+                        for k in keys.try_iter()? {
+                            let k = k?;
+                            let v = other.get_item(&k)?;
+                            let key = HashedAny::from_bound(&k)?;
+                            self.inner.insert(key, v.unbind());
+                        }
+                    } else {
+                        for item in other.try_iter()? {
+                            let item = item?;
+                            let len = item.len().map_err(|_| {
+                                PyValueError::new_err("update sequence elements must be 2-tuples")
+                            })?;
+                            if len != 2 {
+                                return Err(PyValueError::new_err(
+                                    "update sequence elements must be 2-tuples",
+                                ));
+                            }
+                            let k = item.get_item(0)?;
+                            let v = item.get_item(1)?;
+                            let key = HashedAny::from_bound(&k)?;
+                            self.inner.insert(key, v.unbind());
+                        }
+                    }
+                    touched = true;
+                }
+                if let Some(kwargs) = kwargs
+                    && !kwargs.is_empty()
+                {
+                    for (k, v) in kwargs.iter() {
+                        let key = HashedAny::from_bound(&k)?;
+                        self.inner.insert(key, v.unbind());
+                    }
+                    touched = true;
+                }
+                if touched {
+                    self.bump();
+                }
                 Ok(())
             }
-            None => Err(PyKeyError::new_err(key.clone().unbind())),
-        }
-    }
 
-    #[pyo3(signature = (key, default = None))]
-    fn get(
-        &self,
-        key: &Bound<'_, PyAny>,
-        default: Option<Py<PyAny>>,
-        py: Python<'_>,
-    ) -> PyResult<Py<PyAny>> {
-        let probe = ProbeKey::from_bound(key)?;
-        Ok(match self.inner.get(probe.as_key()) {
-            Some(v) => v.clone_ref(py),
-            None => default.unwrap_or_else(|| py.None()),
-        })
-    }
-
-    fn clear(&mut self) {
-        self.inner.clear();
-        self.bump();
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "FunnelHashMap(len={}, capacity={})",
-            self.inner.len(),
-            self.inner.capacity()
-        )
-    }
-
-    fn __iter__(slf: Bound<'_, Self>) -> PyFunnelKeyIter {
-        let py = slf.py();
-        let m = slf.borrow();
-        let snapshot = m.inner.iter().map(|(k, _)| k.obj.clone_ref(py)).collect();
-        let expected_gen = m.generation;
-        drop(m);
-        PyFunnelKeyIter {
-            map: slf.unbind(),
-            snapshot,
-            expected_gen,
-            pos: 0,
-        }
-    }
-
-    fn keys(slf: Bound<'_, Self>) -> PyFunnelKeysView {
-        PyFunnelKeysView { map: slf.unbind() }
-    }
-
-    fn values(slf: Bound<'_, Self>) -> PyFunnelValuesView {
-        PyFunnelValuesView { map: slf.unbind() }
-    }
-
-    fn items(slf: Bound<'_, Self>) -> PyFunnelItemsView {
-        PyFunnelItemsView { map: slf.unbind() }
-    }
-
-    #[pyo3(signature = (other = None, **kwargs))]
-    fn update(
-        &mut self,
-        other: Option<&Bound<'_, PyAny>>,
-        kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<()> {
-        let mut touched = false;
-        if let Some(other) = other {
-            if let Ok(dict) = other.cast::<PyDict>() {
-                for (k, v) in dict.iter() {
-                    let key = HashedAny::from_bound(&k)?;
-                    self.inner.insert(key, v.unbind());
+            #[pyo3(signature = (key, default = None))]
+            fn pop(
+                &mut self,
+                key: &Bound<'_, PyAny>,
+                default: Option<Py<PyAny>>,
+            ) -> PyResult<Py<PyAny>> {
+                let probe = ProbeKey::from_bound(key)?;
+                match self.inner.remove(probe.as_key()) {
+                    Some(v) => {
+                        self.bump();
+                        Ok(v)
+                    }
+                    None => default.ok_or_else(|| PyKeyError::new_err(key.clone().unbind())),
                 }
-            } else if other.hasattr("keys")? {
-                let keys = other.call_method0("keys")?;
-                for k in keys.try_iter()? {
-                    let k = k?;
-                    let v = other.get_item(&k)?;
-                    let key = HashedAny::from_bound(&k)?;
-                    self.inner.insert(key, v.unbind());
+            }
+
+            fn popitem<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+                if self.inner.is_empty() {
+                    return Err(PyKeyError::new_err("popitem(): map is empty"));
                 }
-            } else {
+                let probe = {
+                    let (k, _) = self.inner.iter().next().expect("len > 0");
+                    k.clone_with_py(py)
+                };
+                let key_obj = probe.obj.clone_ref(py);
+                let value = self.inner.remove(&probe).expect("key from iter must exist");
+                self.bump();
+                PyTuple::new(py, [key_obj, value])
+            }
+
+            #[pyo3(signature = (key, default = None))]
+            fn setdefault(
+                &mut self,
+                key: &Bound<'_, PyAny>,
+                default: Option<Py<PyAny>>,
+                py: Python<'_>,
+            ) -> PyResult<Py<PyAny>> {
+                let k = HashedAny::from_bound(key)?;
+                if let Some(v) = self.inner.get(&k) {
+                    return Ok(v.clone_ref(py));
+                }
+                let value = default.unwrap_or_else(|| py.None());
+                self.inner.insert(k, value.clone_ref(py));
+                self.bump();
+                Ok(value)
+            }
+
+            fn copy(&self, py: Python<'_>) -> Self {
+                let mut new = $Inner::with_capacity(self.inner.len());
+                for (k, v) in &self.inner {
+                    new.insert(k.clone_with_py(py), v.clone_ref(py));
+                }
+                Self {
+                    inner: new,
+                    generation: 0,
+                }
+            }
+
+            fn __eq__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
+                if !other.hasattr("keys").unwrap_or(false) {
+                    return false;
+                }
+                let Ok(other_len) = other.len() else {
+                    return false;
+                };
+                if other_len != self.inner.len() {
+                    return false;
+                }
+                for (k, v) in &self.inner {
+                    let key_b = k.obj.bind(py);
+                    let Ok(other_v) = other.get_item(key_b) else {
+                        return false;
+                    };
+                    if !v.bind(py).eq(&other_v).unwrap_or(false) {
+                        return false;
+                    }
+                }
+                true
+            }
+
+            fn __or__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
+                let mut new = self.copy(py);
+                new.update(Some(other), None)?;
+                Ok(new)
+            }
+
+            fn __ror__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
+                let mut new = Self {
+                    inner: $Inner::with_capacity(0),
+                    generation: 0,
+                };
+                new.update(Some(other), None)?;
+                for (k, v) in &self.inner {
+                    new.inner.insert(k.clone_with_py(py), v.clone_ref(py));
+                }
+                new.bump();
+                Ok(new)
+            }
+
+            fn __ior__(&mut self, other: &Bound<'_, PyAny>) -> PyResult<()> {
+                self.update(Some(other), None)
+            }
+        }
+
+        define_iter!($KeyIter, $key_iter_name, $PyMap);
+        define_iter!($ValueIter, $value_iter_name, $PyMap);
+        define_iter!($ItemIter, $item_iter_name, $PyMap);
+
+        #[pyclass(name = $keys_view_name, module = "opthash")]
+        struct $KeysView {
+            map: Py<$PyMap>,
+        }
+
+        #[pymethods]
+        impl $KeysView {
+            fn __iter__(&self, py: Python<'_>) -> $KeyIter {
+                let m = self.map.borrow(py);
+                let snapshot = m.inner.iter().map(|(k, _)| k.obj.clone_ref(py)).collect();
+                $KeyIter {
+                    map: self.map.clone_ref(py),
+                    snapshot,
+                    expected_gen: m.generation,
+                    pos: 0,
+                }
+            }
+            fn __len__(&self, py: Python<'_>) -> usize {
+                self.map.borrow(py).inner.len()
+            }
+            fn __contains__(&self, key: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<bool> {
+                let m = self.map.borrow(py);
+                let k = HashedAny::from_bound(key)?;
+                Ok(m.inner.contains_key(&k))
+            }
+            fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+                let m = self.map.borrow(py);
+                let parts: PyResult<Vec<String>> = m
+                    .inner
+                    .iter()
+                    .map(|(k, _)| Ok(k.obj.bind(py).repr()?.to_string()))
+                    .collect();
+                Ok(format!(
+                    concat!($keys_view_name, "([{}])"),
+                    parts?.join(", ")
+                ))
+            }
+            fn __eq__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
+                let m = self.map.borrow(py);
+                let Ok(other_len) = other.len() else {
+                    return false;
+                };
+                if other_len != m.inner.len() {
+                    return false;
+                }
+                for (k, _) in &m.inner {
+                    if !other.contains(k.obj.bind(py)).unwrap_or(false) {
+                        return false;
+                    }
+                }
+                true
+            }
+            fn __and__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
+                let result = PySet::empty(py)?;
+                let m = self.map.borrow(py);
+                for (k, _) in &m.inner {
+                    let key_b = k.obj.bind(py);
+                    if other.contains(key_b)? {
+                        result.add(key_b)?;
+                    }
+                }
+                Ok(result.unbind())
+            }
+            fn __or__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
+                let result = PySet::empty(py)?;
+                {
+                    let m = self.map.borrow(py);
+                    for (k, _) in &m.inner {
+                        result.add(k.obj.bind(py))?;
+                    }
+                }
+                for item in other.try_iter()? {
+                    result.add(item?)?;
+                }
+                Ok(result.unbind())
+            }
+            fn __sub__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
+                let result = PySet::empty(py)?;
+                let m = self.map.borrow(py);
+                for (k, _) in &m.inner {
+                    let key_b = k.obj.bind(py);
+                    if !other.contains(key_b)? {
+                        result.add(key_b)?;
+                    }
+                }
+                Ok(result.unbind())
+            }
+            fn __xor__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
+                let result = PySet::empty(py)?;
+                {
+                    let m = self.map.borrow(py);
+                    for (k, _) in &m.inner {
+                        let key_b = k.obj.bind(py);
+                        if !other.contains(key_b)? {
+                            result.add(key_b)?;
+                        }
+                    }
+                }
+                let m = self.map.borrow(py);
                 for item in other.try_iter()? {
                     let item = item?;
-                    let len = item.len().map_err(|_| {
-                        PyValueError::new_err("update sequence elements must be 2-tuples")
-                    })?;
-                    if len != 2 {
-                        return Err(PyValueError::new_err(
-                            "update sequence elements must be 2-tuples",
-                        ));
+                    let h = HashedAny::from_bound(&item)?;
+                    if !m.inner.contains_key(&h) {
+                        result.add(item)?;
                     }
-                    let k = item.get_item(0)?;
-                    let v = item.get_item(1)?;
-                    let key = HashedAny::from_bound(&k)?;
-                    self.inner.insert(key, v.unbind());
+                }
+                Ok(result.unbind())
+            }
+        }
+
+        #[pyclass(name = $values_view_name, module = "opthash")]
+        struct $ValuesView {
+            map: Py<$PyMap>,
+        }
+
+        #[pymethods]
+        impl $ValuesView {
+            fn __iter__(&self, py: Python<'_>) -> $ValueIter {
+                let m = self.map.borrow(py);
+                let snapshot = m.inner.iter().map(|(_, v)| v.clone_ref(py)).collect();
+                $ValueIter {
+                    map: self.map.clone_ref(py),
+                    snapshot,
+                    expected_gen: m.generation,
+                    pos: 0,
                 }
             }
-            touched = true;
-        }
-        if let Some(kwargs) = kwargs
-            && !kwargs.is_empty()
-        {
-            for (k, v) in kwargs.iter() {
-                let key = HashedAny::from_bound(&k)?;
-                self.inner.insert(key, v.unbind());
+            fn __len__(&self, py: Python<'_>) -> usize {
+                self.map.borrow(py).inner.len()
             }
-            touched = true;
-        }
-        if touched {
-            self.bump();
-        }
-        Ok(())
-    }
-
-    #[pyo3(signature = (key, default = None))]
-    fn pop(&mut self, key: &Bound<'_, PyAny>, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
-        let probe = ProbeKey::from_bound(key)?;
-        match self.inner.remove(probe.as_key()) {
-            Some(v) => {
-                self.bump();
-                Ok(v)
+            fn __contains__(&self, value: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
+                let m = self.map.borrow(py);
+                for (_, v) in &m.inner {
+                    if v.bind(py).eq(value).unwrap_or(false) {
+                        return true;
+                    }
+                }
+                false
             }
-            None => default.ok_or_else(|| PyKeyError::new_err(key.clone().unbind())),
-        }
-    }
-
-    fn popitem<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        if self.inner.is_empty() {
-            return Err(PyKeyError::new_err("popitem(): map is empty"));
-        }
-        let probe = {
-            let (k, _) = self.inner.iter().next().expect("len > 0");
-            k.clone_with_py(py)
-        };
-        let key_obj = probe.obj.clone_ref(py);
-        let value = self.inner.remove(&probe).expect("key from iter must exist");
-        self.bump();
-        PyTuple::new(py, [key_obj, value])
-    }
-
-    #[pyo3(signature = (key, default = None))]
-    fn setdefault(
-        &mut self,
-        key: &Bound<'_, PyAny>,
-        default: Option<Py<PyAny>>,
-        py: Python<'_>,
-    ) -> PyResult<Py<PyAny>> {
-        let k = HashedAny::from_bound(key)?;
-        if let Some(v) = self.inner.get(&k) {
-            return Ok(v.clone_ref(py));
-        }
-        let value = default.unwrap_or_else(|| py.None());
-        self.inner.insert(k, value.clone_ref(py));
-        self.bump();
-        Ok(value)
-    }
-
-    fn copy(&self, py: Python<'_>) -> Self {
-        let mut new = FunnelHashMap::with_capacity(self.inner.len());
-        for (k, v) in &self.inner {
-            new.insert(k.clone_with_py(py), v.clone_ref(py));
-        }
-        Self {
-            inner: new,
-            generation: 0,
-        }
-    }
-
-    fn __eq__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
-        if !other.hasattr("keys").unwrap_or(false) {
-            return false;
-        }
-        let Ok(other_len) = other.len() else {
-            return false;
-        };
-        if other_len != self.inner.len() {
-            return false;
-        }
-        for (k, v) in &self.inner {
-            let key_b = k.obj.bind(py);
-            let Ok(other_v) = other.get_item(key_b) else {
-                return false;
-            };
-            if !v.bind(py).eq(&other_v).unwrap_or(false) {
-                return false;
+            fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+                let m = self.map.borrow(py);
+                let parts: PyResult<Vec<String>> = m
+                    .inner
+                    .iter()
+                    .map(|(_, v)| Ok(v.bind(py).repr()?.to_string()))
+                    .collect();
+                Ok(format!(
+                    concat!($values_view_name, "([{}])"),
+                    parts?.join(", ")
+                ))
             }
         }
-        true
-    }
 
-    fn __or__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
-        let mut new = self.copy(py);
-        new.update(Some(other), None)?;
-        Ok(new)
-    }
-
-    fn __ror__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
-        let mut new = Self {
-            inner: FunnelHashMap::with_capacity(0),
-            generation: 0,
-        };
-        new.update(Some(other), None)?;
-        for (k, v) in &self.inner {
-            new.inner.insert(k.clone_with_py(py), v.clone_ref(py));
+        #[pyclass(name = $items_view_name, module = "opthash")]
+        struct $ItemsView {
+            map: Py<$PyMap>,
         }
-        new.bump();
-        Ok(new)
-    }
 
-    fn __ior__(&mut self, other: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.update(Some(other), None)
-    }
-}
-
-// =============================================================================
-// Elastic views + iterators
-// =============================================================================
-
-#[pyclass(name = "_ElasticKeyIter", module = "opthash")]
-struct PyElasticKeyIter {
-    map: Py<PyElasticHashMap>,
-    snapshot: Vec<Py<PyAny>>,
-    expected_gen: u64,
-    pos: usize,
-}
-
-#[pymethods]
-impl PyElasticKeyIter {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        if self.map.borrow(py).generation != self.expected_gen {
-            return Err(PyRuntimeError::new_err(
-                "dictionary changed size during iteration",
-            ));
-        }
-        if self.pos >= self.snapshot.len() {
-            return Ok(None);
-        }
-        let v = self.snapshot[self.pos].clone_ref(py);
-        self.pos += 1;
-        Ok(Some(v))
-    }
-}
-
-#[pyclass(name = "_ElasticValueIter", module = "opthash")]
-struct PyElasticValueIter {
-    map: Py<PyElasticHashMap>,
-    snapshot: Vec<Py<PyAny>>,
-    expected_gen: u64,
-    pos: usize,
-}
-
-#[pymethods]
-impl PyElasticValueIter {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        if self.map.borrow(py).generation != self.expected_gen {
-            return Err(PyRuntimeError::new_err(
-                "dictionary changed size during iteration",
-            ));
-        }
-        if self.pos >= self.snapshot.len() {
-            return Ok(None);
-        }
-        let v = self.snapshot[self.pos].clone_ref(py);
-        self.pos += 1;
-        Ok(Some(v))
-    }
-}
-
-#[pyclass(name = "_ElasticItemIter", module = "opthash")]
-struct PyElasticItemIter {
-    map: Py<PyElasticHashMap>,
-    snapshot: Vec<Py<PyAny>>,
-    expected_gen: u64,
-    pos: usize,
-}
-
-#[pymethods]
-impl PyElasticItemIter {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        if self.map.borrow(py).generation != self.expected_gen {
-            return Err(PyRuntimeError::new_err(
-                "dictionary changed size during iteration",
-            ));
-        }
-        if self.pos >= self.snapshot.len() {
-            return Ok(None);
-        }
-        let v = self.snapshot[self.pos].clone_ref(py);
-        self.pos += 1;
-        Ok(Some(v))
-    }
-}
-
-#[pyclass(name = "elastic_keys", module = "opthash")]
-struct PyElasticKeysView {
-    map: Py<PyElasticHashMap>,
-}
-
-#[pymethods]
-impl PyElasticKeysView {
-    fn __iter__(&self, py: Python<'_>) -> PyElasticKeyIter {
-        let m = self.map.borrow(py);
-        let snapshot = m.inner.iter().map(|(k, _)| k.obj.clone_ref(py)).collect();
-        PyElasticKeyIter {
-            map: self.map.clone_ref(py),
-            snapshot,
-            expected_gen: m.generation,
-            pos: 0,
-        }
-    }
-    fn __len__(&self, py: Python<'_>) -> usize {
-        self.map.borrow(py).inner.len()
-    }
-    fn __contains__(&self, key: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<bool> {
-        let m = self.map.borrow(py);
-        let k = HashedAny::from_bound(key)?;
-        Ok(m.inner.contains_key(&k))
-    }
-    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        let m = self.map.borrow(py);
-        let parts: PyResult<Vec<String>> = m
-            .inner
-            .iter()
-            .map(|(k, _)| Ok(k.obj.bind(py).repr()?.to_string()))
-            .collect();
-        Ok(format!("elastic_keys([{}])", parts?.join(", ")))
-    }
-    fn __eq__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
-        let m = self.map.borrow(py);
-        let Ok(other_len) = other.len() else {
-            return false;
-        };
-        if other_len != m.inner.len() {
-            return false;
-        }
-        for (k, _) in &m.inner {
-            if !other.contains(k.obj.bind(py)).unwrap_or(false) {
-                return false;
+        #[pymethods]
+        impl $ItemsView {
+            fn __iter__(&self, py: Python<'_>) -> PyResult<$ItemIter> {
+                let m = self.map.borrow(py);
+                let snapshot: PyResult<Vec<Py<PyAny>>> = m
+                    .inner
+                    .iter()
+                    .map(|(k, v)| {
+                        let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
+                        Ok(tup.into_any().unbind())
+                    })
+                    .collect();
+                Ok($ItemIter {
+                    map: self.map.clone_ref(py),
+                    snapshot: snapshot?,
+                    expected_gen: m.generation,
+                    pos: 0,
+                })
             }
-        }
-        true
-    }
-    fn __and__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
-        let result = PySet::empty(py)?;
-        let m = self.map.borrow(py);
-        for (k, _) in &m.inner {
-            let key_b = k.obj.bind(py);
-            if other.contains(key_b)? {
-                result.add(key_b)?;
+            fn __len__(&self, py: Python<'_>) -> usize {
+                self.map.borrow(py).inner.len()
             }
-        }
-        Ok(result.unbind())
-    }
-    fn __or__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
-        let result = PySet::empty(py)?;
-        {
-            let m = self.map.borrow(py);
-            for (k, _) in &m.inner {
-                result.add(k.obj.bind(py))?;
-            }
-        }
-        for item in other.try_iter()? {
-            result.add(item?)?;
-        }
-        Ok(result.unbind())
-    }
-    fn __sub__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
-        let result = PySet::empty(py)?;
-        let m = self.map.borrow(py);
-        for (k, _) in &m.inner {
-            let key_b = k.obj.bind(py);
-            if !other.contains(key_b)? {
-                result.add(key_b)?;
-            }
-        }
-        Ok(result.unbind())
-    }
-    fn __xor__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
-        let result = PySet::empty(py)?;
-        {
-            let m = self.map.borrow(py);
-            for (k, _) in &m.inner {
-                let key_b = k.obj.bind(py);
-                if !other.contains(key_b)? {
-                    result.add(key_b)?;
+            fn __contains__(&self, item: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<bool> {
+                let Ok(tup) = item.cast::<PyTuple>() else {
+                    return Ok(false);
+                };
+                if tup.len() != 2 {
+                    return Ok(false);
+                }
+                let k = tup.get_item(0)?;
+                let v = tup.get_item(1)?;
+                let m = self.map.borrow(py);
+                let h = HashedAny::from_bound(&k)?;
+                match m.inner.get(&h) {
+                    Some(stored_v) => Ok(stored_v.bind(py).eq(&v).unwrap_or(false)),
+                    None => Ok(false),
                 }
             }
-        }
-        let m = self.map.borrow(py);
-        for item in other.try_iter()? {
-            let item = item?;
-            let h = HashedAny::from_bound(&item)?;
-            if !m.inner.contains_key(&h) {
-                result.add(item)?;
+            fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+                let m = self.map.borrow(py);
+                let parts: PyResult<Vec<String>> = m
+                    .inner
+                    .iter()
+                    .map(|(k, v)| {
+                        let kr = k.obj.bind(py).repr()?.to_string();
+                        let vr = v.bind(py).repr()?.to_string();
+                        Ok(format!("({kr}, {vr})"))
+                    })
+                    .collect();
+                Ok(format!(
+                    concat!($items_view_name, "([{}])"),
+                    parts?.join(", ")
+                ))
             }
-        }
-        Ok(result.unbind())
-    }
-}
-
-#[pyclass(name = "elastic_values", module = "opthash")]
-struct PyElasticValuesView {
-    map: Py<PyElasticHashMap>,
-}
-
-#[pymethods]
-impl PyElasticValuesView {
-    fn __iter__(&self, py: Python<'_>) -> PyElasticValueIter {
-        let m = self.map.borrow(py);
-        let snapshot = m.inner.iter().map(|(_, v)| v.clone_ref(py)).collect();
-        PyElasticValueIter {
-            map: self.map.clone_ref(py),
-            snapshot,
-            expected_gen: m.generation,
-            pos: 0,
-        }
-    }
-    fn __len__(&self, py: Python<'_>) -> usize {
-        self.map.borrow(py).inner.len()
-    }
-    fn __contains__(&self, value: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
-        let m = self.map.borrow(py);
-        for (_, v) in &m.inner {
-            if v.bind(py).eq(value).unwrap_or(false) {
-                return true;
-            }
-        }
-        false
-    }
-    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        let m = self.map.borrow(py);
-        let parts: PyResult<Vec<String>> = m
-            .inner
-            .iter()
-            .map(|(_, v)| Ok(v.bind(py).repr()?.to_string()))
-            .collect();
-        Ok(format!("elastic_values([{}])", parts?.join(", ")))
-    }
-}
-
-#[pyclass(name = "elastic_items", module = "opthash")]
-struct PyElasticItemsView {
-    map: Py<PyElasticHashMap>,
-}
-
-#[pymethods]
-impl PyElasticItemsView {
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyElasticItemIter> {
-        let m = self.map.borrow(py);
-        let snapshot: PyResult<Vec<Py<PyAny>>> = m
-            .inner
-            .iter()
-            .map(|(k, v)| {
-                let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
-                Ok(tup.into_any().unbind())
-            })
-            .collect();
-        Ok(PyElasticItemIter {
-            map: self.map.clone_ref(py),
-            snapshot: snapshot?,
-            expected_gen: m.generation,
-            pos: 0,
-        })
-    }
-    fn __len__(&self, py: Python<'_>) -> usize {
-        self.map.borrow(py).inner.len()
-    }
-    fn __contains__(&self, item: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<bool> {
-        let Ok(tup) = item.cast::<PyTuple>() else {
-            return Ok(false);
-        };
-        if tup.len() != 2 {
-            return Ok(false);
-        }
-        let k = tup.get_item(0)?;
-        let v = tup.get_item(1)?;
-        let m = self.map.borrow(py);
-        let h = HashedAny::from_bound(&k)?;
-        match m.inner.get(&h) {
-            Some(stored_v) => Ok(stored_v.bind(py).eq(&v).unwrap_or(false)),
-            None => Ok(false),
-        }
-    }
-    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        let m = self.map.borrow(py);
-        let parts: PyResult<Vec<String>> = m
-            .inner
-            .iter()
-            .map(|(k, v)| {
-                let kr = k.obj.bind(py).repr()?.to_string();
-                let vr = v.bind(py).repr()?.to_string();
-                Ok(format!("({kr}, {vr})"))
-            })
-            .collect();
-        Ok(format!("elastic_items([{}])", parts?.join(", ")))
-    }
-    fn __eq__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
-        let m = self.map.borrow(py);
-        let Ok(other_len) = other.len() else {
-            return false;
-        };
-        if other_len != m.inner.len() {
-            return false;
-        }
-        for (k, v) in &m.inner {
-            let Ok(tup) = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)]) else {
-                return false;
-            };
-            if !other.contains(&tup).unwrap_or(false) {
-                return false;
-            }
-        }
-        true
-    }
-    fn __and__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
-        let result = PySet::empty(py)?;
-        let m = self.map.borrow(py);
-        for (k, v) in &m.inner {
-            let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
-            if other.contains(&tup)? {
-                result.add(tup)?;
-            }
-        }
-        Ok(result.unbind())
-    }
-    fn __or__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
-        let result = PySet::empty(py)?;
-        {
-            let m = self.map.borrow(py);
-            for (k, v) in &m.inner {
-                let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
-                result.add(tup)?;
-            }
-        }
-        for item in other.try_iter()? {
-            result.add(item?)?;
-        }
-        Ok(result.unbind())
-    }
-    fn __sub__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
-        let result = PySet::empty(py)?;
-        let m = self.map.borrow(py);
-        for (k, v) in &m.inner {
-            let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
-            if !other.contains(&tup)? {
-                result.add(tup)?;
-            }
-        }
-        Ok(result.unbind())
-    }
-}
-
-// =============================================================================
-// Funnel views + iterators (mirrors Elastic)
-// =============================================================================
-
-#[pyclass(name = "_FunnelKeyIter", module = "opthash")]
-struct PyFunnelKeyIter {
-    map: Py<PyFunnelHashMap>,
-    snapshot: Vec<Py<PyAny>>,
-    expected_gen: u64,
-    pos: usize,
-}
-
-#[pymethods]
-impl PyFunnelKeyIter {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        if self.map.borrow(py).generation != self.expected_gen {
-            return Err(PyRuntimeError::new_err(
-                "dictionary changed size during iteration",
-            ));
-        }
-        if self.pos >= self.snapshot.len() {
-            return Ok(None);
-        }
-        let v = self.snapshot[self.pos].clone_ref(py);
-        self.pos += 1;
-        Ok(Some(v))
-    }
-}
-
-#[pyclass(name = "_FunnelValueIter", module = "opthash")]
-struct PyFunnelValueIter {
-    map: Py<PyFunnelHashMap>,
-    snapshot: Vec<Py<PyAny>>,
-    expected_gen: u64,
-    pos: usize,
-}
-
-#[pymethods]
-impl PyFunnelValueIter {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        if self.map.borrow(py).generation != self.expected_gen {
-            return Err(PyRuntimeError::new_err(
-                "dictionary changed size during iteration",
-            ));
-        }
-        if self.pos >= self.snapshot.len() {
-            return Ok(None);
-        }
-        let v = self.snapshot[self.pos].clone_ref(py);
-        self.pos += 1;
-        Ok(Some(v))
-    }
-}
-
-#[pyclass(name = "_FunnelItemIter", module = "opthash")]
-struct PyFunnelItemIter {
-    map: Py<PyFunnelHashMap>,
-    snapshot: Vec<Py<PyAny>>,
-    expected_gen: u64,
-    pos: usize,
-}
-
-#[pymethods]
-impl PyFunnelItemIter {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        if self.map.borrow(py).generation != self.expected_gen {
-            return Err(PyRuntimeError::new_err(
-                "dictionary changed size during iteration",
-            ));
-        }
-        if self.pos >= self.snapshot.len() {
-            return Ok(None);
-        }
-        let v = self.snapshot[self.pos].clone_ref(py);
-        self.pos += 1;
-        Ok(Some(v))
-    }
-}
-
-#[pyclass(name = "funnel_keys", module = "opthash")]
-struct PyFunnelKeysView {
-    map: Py<PyFunnelHashMap>,
-}
-
-#[pymethods]
-impl PyFunnelKeysView {
-    fn __iter__(&self, py: Python<'_>) -> PyFunnelKeyIter {
-        let m = self.map.borrow(py);
-        let snapshot = m.inner.iter().map(|(k, _)| k.obj.clone_ref(py)).collect();
-        PyFunnelKeyIter {
-            map: self.map.clone_ref(py),
-            snapshot,
-            expected_gen: m.generation,
-            pos: 0,
-        }
-    }
-    fn __len__(&self, py: Python<'_>) -> usize {
-        self.map.borrow(py).inner.len()
-    }
-    fn __contains__(&self, key: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<bool> {
-        let m = self.map.borrow(py);
-        let k = HashedAny::from_bound(key)?;
-        Ok(m.inner.contains_key(&k))
-    }
-    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        let m = self.map.borrow(py);
-        let parts: PyResult<Vec<String>> = m
-            .inner
-            .iter()
-            .map(|(k, _)| Ok(k.obj.bind(py).repr()?.to_string()))
-            .collect();
-        Ok(format!("funnel_keys([{}])", parts?.join(", ")))
-    }
-    fn __eq__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
-        let m = self.map.borrow(py);
-        let Ok(other_len) = other.len() else {
-            return false;
-        };
-        if other_len != m.inner.len() {
-            return false;
-        }
-        for (k, _) in &m.inner {
-            if !other.contains(k.obj.bind(py)).unwrap_or(false) {
-                return false;
-            }
-        }
-        true
-    }
-    fn __and__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
-        let result = PySet::empty(py)?;
-        let m = self.map.borrow(py);
-        for (k, _) in &m.inner {
-            let key_b = k.obj.bind(py);
-            if other.contains(key_b)? {
-                result.add(key_b)?;
-            }
-        }
-        Ok(result.unbind())
-    }
-    fn __or__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
-        let result = PySet::empty(py)?;
-        {
-            let m = self.map.borrow(py);
-            for (k, _) in &m.inner {
-                result.add(k.obj.bind(py))?;
-            }
-        }
-        for item in other.try_iter()? {
-            result.add(item?)?;
-        }
-        Ok(result.unbind())
-    }
-    fn __sub__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
-        let result = PySet::empty(py)?;
-        let m = self.map.borrow(py);
-        for (k, _) in &m.inner {
-            let key_b = k.obj.bind(py);
-            if !other.contains(key_b)? {
-                result.add(key_b)?;
-            }
-        }
-        Ok(result.unbind())
-    }
-    fn __xor__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
-        let result = PySet::empty(py)?;
-        {
-            let m = self.map.borrow(py);
-            for (k, _) in &m.inner {
-                let key_b = k.obj.bind(py);
-                if !other.contains(key_b)? {
-                    result.add(key_b)?;
+            fn __eq__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
+                let m = self.map.borrow(py);
+                let Ok(other_len) = other.len() else {
+                    return false;
+                };
+                if other_len != m.inner.len() {
+                    return false;
                 }
+                for (k, v) in &m.inner {
+                    let Ok(tup) = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)]) else {
+                        return false;
+                    };
+                    if !other.contains(&tup).unwrap_or(false) {
+                        return false;
+                    }
+                }
+                true
+            }
+            fn __and__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
+                let result = PySet::empty(py)?;
+                let m = self.map.borrow(py);
+                for (k, v) in &m.inner {
+                    let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
+                    if other.contains(&tup)? {
+                        result.add(tup)?;
+                    }
+                }
+                Ok(result.unbind())
+            }
+            fn __or__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
+                let result = PySet::empty(py)?;
+                {
+                    let m = self.map.borrow(py);
+                    for (k, v) in &m.inner {
+                        let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
+                        result.add(tup)?;
+                    }
+                }
+                for item in other.try_iter()? {
+                    result.add(item?)?;
+                }
+                Ok(result.unbind())
+            }
+            fn __sub__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
+                let result = PySet::empty(py)?;
+                let m = self.map.borrow(py);
+                for (k, v) in &m.inner {
+                    let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
+                    if !other.contains(&tup)? {
+                        result.add(tup)?;
+                    }
+                }
+                Ok(result.unbind())
             }
         }
-        let m = self.map.borrow(py);
-        for item in other.try_iter()? {
-            let item = item?;
-            let h = HashedAny::from_bound(&item)?;
-            if !m.inner.contains_key(&h) {
-                result.add(item)?;
-            }
-        }
-        Ok(result.unbind())
-    }
+    };
 }
 
-#[pyclass(name = "funnel_values", module = "opthash")]
-struct PyFunnelValuesView {
-    map: Py<PyFunnelHashMap>,
+macro_rules! define_iter {
+    ($Iter:ident, $iter_name:literal, $PyMap:ident) => {
+        #[pyclass(name = $iter_name, module = "opthash")]
+        struct $Iter {
+            map: Py<$PyMap>,
+            snapshot: Vec<Py<PyAny>>,
+            expected_gen: u64,
+            pos: usize,
+        }
+
+        #[pymethods]
+        impl $Iter {
+            fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+                slf
+            }
+            fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+                if self.map.borrow(py).generation != self.expected_gen {
+                    return Err(PyRuntimeError::new_err(
+                        "dictionary changed size during iteration",
+                    ));
+                }
+                if self.pos >= self.snapshot.len() {
+                    return Ok(None);
+                }
+                let v = self.snapshot[self.pos].clone_ref(py);
+                self.pos += 1;
+                Ok(Some(v))
+            }
+        }
+    };
 }
 
-#[pymethods]
-impl PyFunnelValuesView {
-    fn __iter__(&self, py: Python<'_>) -> PyFunnelValueIter {
-        let m = self.map.borrow(py);
-        let snapshot = m.inner.iter().map(|(_, v)| v.clone_ref(py)).collect();
-        PyFunnelValueIter {
-            map: self.map.clone_ref(py),
-            snapshot,
-            expected_gen: m.generation,
-            pos: 0,
-        }
-    }
-    fn __len__(&self, py: Python<'_>) -> usize {
-        self.map.borrow(py).inner.len()
-    }
-    fn __contains__(&self, value: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
-        let m = self.map.borrow(py);
-        for (_, v) in &m.inner {
-            if v.bind(py).eq(value).unwrap_or(false) {
-                return true;
-            }
-        }
-        false
-    }
-    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        let m = self.map.borrow(py);
-        let parts: PyResult<Vec<String>> = m
-            .inner
-            .iter()
-            .map(|(_, v)| Ok(v.bind(py).repr()?.to_string()))
-            .collect();
-        Ok(format!("funnel_values([{}])", parts?.join(", ")))
-    }
+define_map_classes! {
+    py_map = PyElasticHashMap,
+    py_map_name = "ElasticHashMap",
+    inner = ElasticHashMap,
+    py_options = PyElasticOptions,
+    key_iter = PyElasticKeyIter,
+    key_iter_name = "_ElasticKeyIter",
+    value_iter = PyElasticValueIter,
+    value_iter_name = "_ElasticValueIter",
+    item_iter = PyElasticItemIter,
+    item_iter_name = "_ElasticItemIter",
+    keys_view = PyElasticKeysView,
+    keys_view_name = "elastic_keys",
+    values_view = PyElasticValuesView,
+    values_view_name = "elastic_values",
+    items_view = PyElasticItemsView,
+    items_view_name = "elastic_items",
 }
 
-#[pyclass(name = "funnel_items", module = "opthash")]
-struct PyFunnelItemsView {
-    map: Py<PyFunnelHashMap>,
-}
-
-#[pymethods]
-impl PyFunnelItemsView {
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyFunnelItemIter> {
-        let m = self.map.borrow(py);
-        let snapshot: PyResult<Vec<Py<PyAny>>> = m
-            .inner
-            .iter()
-            .map(|(k, v)| {
-                let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
-                Ok(tup.into_any().unbind())
-            })
-            .collect();
-        Ok(PyFunnelItemIter {
-            map: self.map.clone_ref(py),
-            snapshot: snapshot?,
-            expected_gen: m.generation,
-            pos: 0,
-        })
-    }
-    fn __len__(&self, py: Python<'_>) -> usize {
-        self.map.borrow(py).inner.len()
-    }
-    fn __contains__(&self, item: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<bool> {
-        let Ok(tup) = item.cast::<PyTuple>() else {
-            return Ok(false);
-        };
-        if tup.len() != 2 {
-            return Ok(false);
-        }
-        let k = tup.get_item(0)?;
-        let v = tup.get_item(1)?;
-        let m = self.map.borrow(py);
-        let h = HashedAny::from_bound(&k)?;
-        match m.inner.get(&h) {
-            Some(stored_v) => Ok(stored_v.bind(py).eq(&v).unwrap_or(false)),
-            None => Ok(false),
-        }
-    }
-    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        let m = self.map.borrow(py);
-        let parts: PyResult<Vec<String>> = m
-            .inner
-            .iter()
-            .map(|(k, v)| {
-                let kr = k.obj.bind(py).repr()?.to_string();
-                let vr = v.bind(py).repr()?.to_string();
-                Ok(format!("({kr}, {vr})"))
-            })
-            .collect();
-        Ok(format!("funnel_items([{}])", parts?.join(", ")))
-    }
-    fn __eq__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
-        let m = self.map.borrow(py);
-        let Ok(other_len) = other.len() else {
-            return false;
-        };
-        if other_len != m.inner.len() {
-            return false;
-        }
-        for (k, v) in &m.inner {
-            let Ok(tup) = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)]) else {
-                return false;
-            };
-            if !other.contains(&tup).unwrap_or(false) {
-                return false;
-            }
-        }
-        true
-    }
-    fn __and__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
-        let result = PySet::empty(py)?;
-        let m = self.map.borrow(py);
-        for (k, v) in &m.inner {
-            let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
-            if other.contains(&tup)? {
-                result.add(tup)?;
-            }
-        }
-        Ok(result.unbind())
-    }
-    fn __or__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
-        let result = PySet::empty(py)?;
-        {
-            let m = self.map.borrow(py);
-            for (k, v) in &m.inner {
-                let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
-                result.add(tup)?;
-            }
-        }
-        for item in other.try_iter()? {
-            result.add(item?)?;
-        }
-        Ok(result.unbind())
-    }
-    fn __sub__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PySet>> {
-        let result = PySet::empty(py)?;
-        let m = self.map.borrow(py);
-        for (k, v) in &m.inner {
-            let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
-            if !other.contains(&tup)? {
-                result.add(tup)?;
-            }
-        }
-        Ok(result.unbind())
-    }
+define_map_classes! {
+    py_map = PyFunnelHashMap,
+    py_map_name = "FunnelHashMap",
+    inner = FunnelHashMap,
+    py_options = PyFunnelOptions,
+    key_iter = PyFunnelKeyIter,
+    key_iter_name = "_FunnelKeyIter",
+    value_iter = PyFunnelValueIter,
+    value_iter_name = "_FunnelValueIter",
+    item_iter = PyFunnelItemIter,
+    item_iter_name = "_FunnelItemIter",
+    keys_view = PyFunnelKeysView,
+    keys_view_name = "funnel_keys",
+    values_view = PyFunnelValuesView,
+    values_view_name = "funnel_values",
+    items_view = PyFunnelItemsView,
+    items_view_name = "funnel_items",
 }
 
 #[pymodule]
