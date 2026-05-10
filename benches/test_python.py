@@ -247,3 +247,38 @@ def test_fromkeys(benchmark, factory, keys):
         _ = cls.fromkeys(keys, 0)
 
     benchmark(run)
+
+
+@pytest.mark.benchmark(group="update_same")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_update_same(benchmark, factory, keys, miss_keys):
+    cls = factory(0).__class__
+    a = factory(N)
+    for k in keys:
+        a[k] = 0
+    b = cls()
+    for k in miss_keys:
+        b[k] = 1
+
+    def run():
+        m = cls(a)
+        m.update(b)
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="eq_same")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_eq_same(benchmark, factory, keys):
+    cls = factory(0).__class__
+    a = factory(N)
+    for k in keys:
+        a[k] = 0
+    b = cls()
+    for k in keys:
+        b[k] = 0
+
+    def run():
+        _ = a == b
+
+    benchmark(run)

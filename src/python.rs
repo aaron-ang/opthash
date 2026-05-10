@@ -417,10 +417,18 @@ macro_rules! define_map_classes {
             ) -> PyResult<()> {
                 let mut touched = false;
                 if let Some(other) = other {
-                    if let Ok(dict) = other.cast::<PyDict>() {
+                    if let Ok(other_map) = other.cast::<Self>() {
+                        let py = other.py();
+                        let borrowed = other_map.borrow();
+                        for (k, v) in &borrowed.inner {
+                            self.inner.insert(k.clone_with_py(py), v.clone_ref(py));
+                            touched = true;
+                        }
+                    } else if let Ok(dict) = other.cast::<PyDict>() {
                         for (k, v) in dict.iter() {
                             let key = HashedAny::from_bound(&k)?;
                             self.inner.insert(key, v.unbind());
+                            touched = true;
                         }
                     } else if other.hasattr("keys")? {
                         let keys = other.call_method0("keys")?;
@@ -429,6 +437,7 @@ macro_rules! define_map_classes {
                             let v = other.get_item(&k)?;
                             let key = HashedAny::from_bound(&k)?;
                             self.inner.insert(key, v.unbind());
+                            touched = true;
                         }
                     } else {
                         for item in other.try_iter()? {
@@ -445,18 +454,16 @@ macro_rules! define_map_classes {
                             let v = item.get_item(1)?;
                             let key = HashedAny::from_bound(&k)?;
                             self.inner.insert(key, v.unbind());
+                            touched = true;
                         }
                     }
-                    touched = true;
                 }
-                if let Some(kwargs) = kwargs
-                    && !kwargs.is_empty()
-                {
+                if let Some(kwargs) = kwargs {
                     for (k, v) in kwargs.iter() {
                         let key = HashedAny::from_bound(&k)?;
                         self.inner.insert(key, v.unbind());
+                        touched = true;
                     }
-                    touched = true;
                 }
                 if touched {
                     self.bump();
@@ -524,6 +531,23 @@ macro_rules! define_map_classes {
             }
 
             fn __eq__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
+                if let Ok(other_map) = other.cast::<Self>() {
+                    let other_inner = &other_map.borrow().inner;
+                    if self.inner.len() != other_inner.len() {
+                        return false;
+                    }
+                    for (k, v) in &self.inner {
+                        match other_inner.get(k) {
+                            Some(ov) => {
+                                if !v.bind(py).eq(ov.bind(py)).unwrap_or(false) {
+                                    return false;
+                                }
+                            }
+                            None => return false,
+                        }
+                    }
+                    return true;
+                }
                 if let Ok(d) = other.cast::<PyDict>() {
                     if d.len() != self.inner.len() {
                         return false;
