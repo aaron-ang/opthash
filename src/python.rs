@@ -523,6 +523,23 @@ macro_rules! define_map_classes {
             }
 
             fn __eq__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
+                if let Ok(d) = other.cast::<PyDict>() {
+                    if d.len() != self.inner.len() {
+                        return false;
+                    }
+                    for (k, v) in &self.inner {
+                        let key_b = k.obj.bind(py);
+                        match d.get_item(key_b) {
+                            Ok(Some(other_v)) => {
+                                if !v.bind(py).eq(&other_v).unwrap_or(false) {
+                                    return false;
+                                }
+                            }
+                            _ => return false,
+                        }
+                    }
+                    return true;
+                }
                 if !other.hasattr("keys").unwrap_or(false) {
                     return false;
                 }

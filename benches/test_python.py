@@ -224,3 +224,17 @@ def test_runion(benchmark, factory, keys, miss_keys):
         _ = other | m
 
     benchmark(run)
+
+
+@pytest.mark.benchmark(group="eq_dict")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_eq_dict(benchmark, factory, keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+    other = {k: 0 for k in keys}
+
+    def run():
+        _ = m == other
+
+    benchmark(run)
