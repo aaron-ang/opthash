@@ -1,3 +1,5 @@
+#![allow(clippy::cast_ptr_alignment)]
+
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{
     uint8x16_t, vceqq_u8, vdupq_n_u8, vget_lane_u64, vld1q_u8, vorrq_u8, vreinterpret_u64_u8,
