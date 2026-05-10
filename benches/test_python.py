@@ -196,3 +196,31 @@ def test_items_contains_hit(benchmark, factory, keys):
             _ = p in view
 
     benchmark(run)
+
+
+@pytest.mark.benchmark(group="union")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_union(benchmark, factory, keys, miss_keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+    other = {k: 1 for k in miss_keys}
+
+    def run():
+        _ = m | other
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="runion")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_runion(benchmark, factory, keys, miss_keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+    other = {k: 1 for k in miss_keys}
+
+    def run():
+        _ = other | m
+
+    benchmark(run)

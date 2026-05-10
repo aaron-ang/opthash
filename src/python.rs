@@ -545,14 +545,24 @@ macro_rules! define_map_classes {
             }
 
             fn __or__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
-                let mut new = self.copy(py);
+                let other_hint = other.len().unwrap_or(0);
+                let cap = self.inner.len().saturating_add(other_hint);
+                let mut new = Self {
+                    inner: $Inner::with_capacity(cap),
+                    generation: 0,
+                };
+                for (k, v) in &self.inner {
+                    new.inner.insert(k.clone_with_py(py), v.clone_ref(py));
+                }
                 new.update(Some(other), None)?;
                 Ok(new)
             }
 
             fn __ror__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
+                let other_hint = other.len().unwrap_or(0);
+                let cap = self.inner.len().saturating_add(other_hint);
                 let mut new = Self {
-                    inner: $Inner::with_capacity(0),
+                    inner: $Inner::with_capacity(cap),
                     generation: 0,
                 };
                 new.update(Some(other), None)?;
