@@ -286,8 +286,9 @@ macro_rules! define_map_classes {
                 value: Option<Py<PyAny>>,
                 py: Python<'_>,
             ) -> PyResult<Self> {
+                let cap = iterable.len().unwrap_or(0);
                 let mut me = Self {
-                    inner: $Inner::with_capacity(0),
+                    inner: $Inner::with_capacity(cap),
                     generation: 0,
                 };
                 let val = value.unwrap_or_else(|| py.None());
@@ -416,20 +417,37 @@ macro_rules! define_map_classes {
             ) -> PyResult<()> {
                 let mut touched = false;
                 if let Some(other) = other {
-                    if let Ok(dict) = other.cast::<PyDict>() {
+                    if let Ok(other_map) = other.cast::<Self>() {
+                        let py = other.py();
+                        let borrowed = other_map.borrow();
+                        self.inner.reserve(borrowed.inner.len());
+                        for (k, v) in &borrowed.inner {
+                            self.inner.insert(k.clone_with_py(py), v.clone_ref(py));
+                            touched = true;
+                        }
+                    } else if let Ok(dict) = other.cast::<PyDict>() {
+                        self.inner.reserve(dict.len());
                         for (k, v) in dict.iter() {
                             let key = HashedAny::from_bound(&k)?;
                             self.inner.insert(key, v.unbind());
+                            touched = true;
                         }
                     } else if other.hasattr("keys")? {
+                        if let Ok(hint) = other.len() {
+                            self.inner.reserve(hint);
+                        }
                         let keys = other.call_method0("keys")?;
                         for k in keys.try_iter()? {
                             let k = k?;
                             let v = other.get_item(&k)?;
                             let key = HashedAny::from_bound(&k)?;
                             self.inner.insert(key, v.unbind());
+                            touched = true;
                         }
                     } else {
+                        if let Ok(hint) = other.len() {
+                            self.inner.reserve(hint);
+                        }
                         for item in other.try_iter()? {
                             let item = item?;
                             let len = item.len().map_err(|_| {
@@ -444,18 +462,17 @@ macro_rules! define_map_classes {
                             let v = item.get_item(1)?;
                             let key = HashedAny::from_bound(&k)?;
                             self.inner.insert(key, v.unbind());
+                            touched = true;
                         }
                     }
-                    touched = true;
                 }
-                if let Some(kwargs) = kwargs
-                    && !kwargs.is_empty()
-                {
+                if let Some(kwargs) = kwargs {
+                    self.inner.reserve(kwargs.len());
                     for (k, v) in kwargs.iter() {
                         let key = HashedAny::from_bound(&k)?;
                         self.inner.insert(key, v.unbind());
+                        touched = true;
                     }
-                    touched = true;
                 }
                 if touched {
                     self.bump();
@@ -500,10 +517,11 @@ macro_rules! define_map_classes {
                 default: Option<Py<PyAny>>,
                 py: Python<'_>,
             ) -> PyResult<Py<PyAny>> {
-                let k = HashedAny::from_bound(key)?;
-                if let Some(v) = self.inner.get(&k) {
+                let probe = ProbeKey::from_bound(key)?;
+                if let Some(v) = self.inner.get(probe.as_key()) {
                     return Ok(v.clone_ref(py));
                 }
+                let k = HashedAny::from_bound(key)?;
                 let value = default.unwrap_or_else(|| py.None());
                 self.inner.insert(k, value.clone_ref(py));
                 self.bump();
@@ -522,6 +540,40 @@ macro_rules! define_map_classes {
             }
 
             fn __eq__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> bool {
+                if let Ok(other_map) = other.cast::<Self>() {
+                    let other_inner = &other_map.borrow().inner;
+                    if self.inner.len() != other_inner.len() {
+                        return false;
+                    }
+                    for (k, v) in &self.inner {
+                        match other_inner.get(k) {
+                            Some(ov) => {
+                                if !v.bind(py).eq(ov.bind(py)).unwrap_or(false) {
+                                    return false;
+                                }
+                            }
+                            None => return false,
+                        }
+                    }
+                    return true;
+                }
+                if let Ok(d) = other.cast::<PyDict>() {
+                    if d.len() != self.inner.len() {
+                        return false;
+                    }
+                    for (k, v) in &self.inner {
+                        let key_b = k.obj.bind(py);
+                        match d.get_item(key_b) {
+                            Ok(Some(other_v)) => {
+                                if !v.bind(py).eq(&other_v).unwrap_or(false) {
+                                    return false;
+                                }
+                            }
+                            _ => return false,
+                        }
+                    }
+                    return true;
+                }
                 if !other.hasattr("keys").unwrap_or(false) {
                     return false;
                 }
@@ -544,14 +596,24 @@ macro_rules! define_map_classes {
             }
 
             fn __or__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
-                let mut new = self.copy(py);
+                let other_hint = other.len().unwrap_or(0);
+                let cap = self.inner.len().saturating_add(other_hint);
+                let mut new = Self {
+                    inner: $Inner::with_capacity(cap),
+                    generation: 0,
+                };
+                for (k, v) in &self.inner {
+                    new.inner.insert(k.clone_with_py(py), v.clone_ref(py));
+                }
                 new.update(Some(other), None)?;
                 Ok(new)
             }
 
             fn __ror__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
+                let other_hint = other.len().unwrap_or(0);
+                let cap = self.inner.len().saturating_add(other_hint);
                 let mut new = Self {
-                    inner: $Inner::with_capacity(0),
+                    inner: $Inner::with_capacity(cap),
                     generation: 0,
                 };
                 new.update(Some(other), None)?;
@@ -593,8 +655,8 @@ macro_rules! define_map_classes {
             }
             fn __contains__(&self, key: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<bool> {
                 let m = self.map.borrow(py);
-                let k = HashedAny::from_bound(key)?;
-                Ok(m.inner.contains_key(&k))
+                let probe = ProbeKey::from_bound(key)?;
+                Ok(m.inner.contains_key(probe.as_key()))
             }
             fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
                 let m = self.map.borrow(py);
@@ -672,8 +734,8 @@ macro_rules! define_map_classes {
                 let m = self.map.borrow(py);
                 for item in other.try_iter()? {
                     let item = item?;
-                    let h = HashedAny::from_bound(&item)?;
-                    if !m.inner.contains_key(&h) {
+                    let probe = ProbeKey::from_bound(&item)?;
+                    if !m.inner.contains_key(probe.as_key()) {
                         result.add(item)?;
                     }
                 }
@@ -761,8 +823,8 @@ macro_rules! define_map_classes {
                 let k = tup.get_item(0)?;
                 let v = tup.get_item(1)?;
                 let m = self.map.borrow(py);
-                let h = HashedAny::from_bound(&k)?;
-                match m.inner.get(&h) {
+                let probe = ProbeKey::from_bound(&k)?;
+                match m.inner.get(probe.as_key()) {
                     Some(stored_v) => Ok(stored_v.bind(py).eq(&v).unwrap_or(false)),
                     None => Ok(false),
                 }

@@ -224,6 +224,20 @@ where
         self.capacity
     }
 
+    /// Grow capacity so at least `additional` more inserts fit without
+    /// triggering an internal resize. No-op if already large enough.
+    pub fn reserve(&mut self, additional: usize) {
+        let needed = self.len.saturating_add(additional);
+        if needed <= self.max_insertions {
+            return;
+        }
+        let mut new_capacity = self.capacity.max(INITIAL_CAPACITY);
+        while max_insertions(new_capacity, self.reserve_fraction) < needed {
+            new_capacity = new_capacity.saturating_mul(2);
+        }
+        self.resize(new_capacity);
+    }
+
     /// # Panics
     ///
     /// Panics if a resize succeeds but no free slot can be found for the new key.

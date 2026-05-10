@@ -15,11 +15,9 @@ import opthash
 
 
 N = 10_000
-SEED = 0
+SEED = 42
 
 
-# All three factories grow from zero. dict() doesn't accept a capacity hint, so
-# pre-allocating opthash maps would give them an unfair head-start.
 def _factory_dict(_n: int):
     return dict()
 
@@ -121,5 +119,223 @@ def test_delete(benchmark, factory, keys):
             m[k] = 0
         for k in keys:
             del m[k]
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="setdefault_hit")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_setdefault_hit(benchmark, factory, keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+
+    def run():
+        for k in keys:
+            _ = m.setdefault(k, 1)
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="setdefault_miss")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_setdefault_miss(benchmark, factory, keys, miss_keys):
+    def run():
+        m = factory(N)
+        for k in keys:
+            m[k] = 0
+        for k in miss_keys:
+            _ = m.setdefault(k, 1)
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="keys_contains_hit")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_keys_contains_hit(benchmark, factory, keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+    view = m.keys()
+
+    def run():
+        for k in keys:
+            _ = k in view
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="keys_contains_miss")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_keys_contains_miss(benchmark, factory, keys, miss_keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+    view = m.keys()
+
+    def run():
+        for k in miss_keys:
+            _ = k in view
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="items_contains_hit")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_items_contains_hit(benchmark, factory, keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+    view = m.items()
+    pairs = [(k, 0) for k in keys]
+
+    def run():
+        for p in pairs:
+            _ = p in view
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="union")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_union(benchmark, factory, keys, miss_keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+    other = {k: 1 for k in miss_keys}
+
+    def run():
+        _ = m | other
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="runion")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_runion(benchmark, factory, keys, miss_keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+    other = {k: 1 for k in miss_keys}
+
+    def run():
+        _ = other | m
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="eq_dict")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_eq_dict(benchmark, factory, keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+    other = {k: 0 for k in keys}
+
+    def run():
+        _ = m == other
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="fromkeys")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_fromkeys(benchmark, factory, keys):
+    cls = factory(0).__class__
+
+    def run():
+        _ = cls.fromkeys(keys, 0)
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="update_same")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_update_same(benchmark, factory, keys, miss_keys):
+    cls = factory(0).__class__
+    a = factory(N)
+    for k in keys:
+        a[k] = 0
+    b = cls()
+    for k in miss_keys:
+        b[k] = 1
+
+    def run():
+        m = cls(a)
+        m.update(b)
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="eq_same")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_eq_same(benchmark, factory, keys):
+    cls = factory(0).__class__
+    a = factory(N)
+    for k in keys:
+        a[k] = 0
+    b = cls()
+    for k in keys:
+        b[k] = 0
+
+    def run():
+        _ = a == b
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="update_dict")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_update_dict(benchmark, factory, keys, miss_keys):
+    other = {k: 1 for k in miss_keys}
+
+    def run():
+        m = factory(N)
+        for k in keys:
+            m[k] = 0
+        m.update(other)
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="values_contains_hit")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_values_contains_hit(benchmark, factory, keys):
+    m = factory(N)
+    sentinel = object()
+    for k in keys:
+        m[k] = sentinel
+    view = m.values()
+
+    def run():
+        _ = sentinel in view
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="values_contains_miss")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_values_contains_miss(benchmark, factory, keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+    view = m.values()
+    target = object()
+
+    def run():
+        _ = target in view
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="copy")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_copy(benchmark, factory, keys):
+    m = factory(N)
+    for k in keys:
+        m[k] = 0
+
+    def run():
+        _ = m.copy()
 
     benchmark(run)
