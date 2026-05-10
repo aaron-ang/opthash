@@ -2,26 +2,53 @@ exclude: ^(assets/|paper/)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
-      - id: trailing-whitespace
-      - id: end-of-file-fixer
-      - id: check-yaml
-      - id: check-toml
-      - id: check-merge-conflict
       - id: check-added-large-files
+      - id: check-ast
+      - id: check-case-conflict
+      - id: check-illegal-windows-names
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-toml
+      - id: check-vcs-permalinks
+      - id: check-yaml
+      - id: debug-statements
+      - id: destroyed-symlinks
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: forbid-new-submodules
+      - id: forbid-submodules
+      - id: mixed-line-ending
+        args: [--fix=auto]
+      - id: trailing-whitespace
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.0
+    rev: v0.15.12
     hooks:
+      - id: ruff-check
+        args: [--fix]
       - id: ruff-format
-        types_or: [python, pyi]
 
   - repo: local
     hooks:
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-features -- -W clippy::pedantic -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
       - id: cargo-fmt
-        name: cargo fmt --check
+        name: cargo fmt
         entry: cargo fmt --check
         language: system
         types: [rust]
+        pass_filenames: false
+
+      - id: mypy-stub
+        name: mypy stub
+        entry: uvx mypy --strict opthash/opthash/__init__.pyi
+        language: system
+        types: [pyi]
         pass_filenames: false
