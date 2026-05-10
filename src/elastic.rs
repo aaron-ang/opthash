@@ -6,7 +6,7 @@ use crate::common::simd::ProbeOps;
 
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
-    control::{ControlByte, ControlOps},
+    control::{CTRL_TOMBSTONE, ControlByte, ControlOps},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
         advance_wrapping_index, ceil_three_quarters, fastmod_magic, fastmod_u32,
@@ -254,10 +254,14 @@ where
             .expect("no free slot found after resize");
 
         let level = &mut self.levels[level_idx];
+        let prev_ctrl = level.table.control_at(slot_idx);
         level
             .table
             .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
         level.len += 1;
+        if prev_ctrl == CTRL_TOMBSTONE {
+            level.tombstones -= 1;
+        }
         if level_idx > self.max_populated_level {
             self.max_populated_level = level_idx;
         }
@@ -457,6 +461,19 @@ where
             return None;
         }
 
+        if let Some(pair) = self.choose_slot_targeted(key_hash) {
+            return Some(pair);
+        }
+
+        for li in 0..self.levels.len() {
+            if let Some(slot_idx) = self.first_free_uniform(key_hash, li) {
+                return Some((li, slot_idx));
+            }
+        }
+        None
+    }
+
+    fn choose_slot_targeted(&self, key_hash: u64) -> Option<(usize, usize)> {
         if self.current_batch_index == 0 {
             return self
                 .first_free_uniform(key_hash, 0)
