@@ -11,7 +11,7 @@ use pyo3::types::{PyDict, PySet, PyString, PyTuple, PyType};
 use crate::funnel::MAX_FUNNEL_RESERVE_FRACTION;
 use crate::{ElasticHashMap, ElasticOptions, FunnelHashMap, FunnelOptions};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 #[repr(u8)]
 enum HashKind {
     Str,
@@ -234,14 +234,18 @@ impl PyElasticHashMap {
 #[pymethods]
 impl PyElasticHashMap {
     #[new]
-    #[pyo3(signature = (other = None, *, capacity = 0))]
-    fn new(other: Option<&Bound<'_, PyAny>>, capacity: usize) -> PyResult<Self> {
+    #[pyo3(signature = (other = None, *, capacity = 0, **kwargs))]
+    fn new(
+        other: Option<&Bound<'_, PyAny>>,
+        capacity: usize,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
         let mut me = Self {
             inner: ElasticHashMap::with_capacity(capacity),
             generation: 0,
         };
-        if let Some(other) = other {
-            me.update(other)?;
+        if other.is_some() || kwargs.is_some() {
+            me.update(other, kwargs)?;
         }
         Ok(me)
     }
@@ -252,6 +256,39 @@ impl PyElasticHashMap {
             inner: ElasticHashMap::with_options(options.inner),
             generation: 0,
         }
+    }
+
+    #[classmethod]
+    #[pyo3(signature = (iterable, value = None))]
+    fn fromkeys(
+        _cls: &Bound<'_, PyType>,
+        iterable: &Bound<'_, PyAny>,
+        value: Option<Py<PyAny>>,
+        py: Python<'_>,
+    ) -> PyResult<Self> {
+        let mut me = Self {
+            inner: ElasticHashMap::with_capacity(0),
+            generation: 0,
+        };
+        let val = value.unwrap_or_else(|| py.None());
+        for k in iterable.try_iter()? {
+            let k = k?;
+            let key = HashedAny::from_bound(&k)?;
+            me.inner.insert(key, val.clone_ref(py));
+        }
+        me.bump();
+        Ok(me)
+    }
+
+    #[classmethod]
+    fn __class_getitem__<'py>(
+        cls: &Bound<'py, PyType>,
+        item: &Bound<'py, PyAny>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        py.import("types")?
+            .getattr("GenericAlias")?
+            .call1((cls, item))
     }
 
     fn __len__(&self) -> usize {
@@ -347,42 +384,58 @@ impl PyElasticHashMap {
         PyElasticItemsView { map: slf.unbind() }
     }
 
-    fn update(&mut self, other: &Bound<'_, PyAny>) -> PyResult<()> {
-        if let Ok(dict) = other.cast::<PyDict>() {
-            for (k, v) in dict.iter() {
+    #[pyo3(signature = (other = None, **kwargs))]
+    fn update(
+        &mut self,
+        other: Option<&Bound<'_, PyAny>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        let mut touched = false;
+        if let Some(other) = other {
+            if let Ok(dict) = other.cast::<PyDict>() {
+                for (k, v) in dict.iter() {
+                    let key = HashedAny::from_bound(&k)?;
+                    self.inner.insert(key, v.unbind());
+                }
+            } else if other.hasattr("keys")? {
+                let keys = other.call_method0("keys")?;
+                for k in keys.try_iter()? {
+                    let k = k?;
+                    let v = other.get_item(&k)?;
+                    let key = HashedAny::from_bound(&k)?;
+                    self.inner.insert(key, v.unbind());
+                }
+            } else {
+                for item in other.try_iter()? {
+                    let item = item?;
+                    let len = item.len().map_err(|_| {
+                        PyValueError::new_err("update sequence elements must be 2-tuples")
+                    })?;
+                    if len != 2 {
+                        return Err(PyValueError::new_err(
+                            "update sequence elements must be 2-tuples",
+                        ));
+                    }
+                    let k = item.get_item(0)?;
+                    let v = item.get_item(1)?;
+                    let key = HashedAny::from_bound(&k)?;
+                    self.inner.insert(key, v.unbind());
+                }
+            }
+            touched = true;
+        }
+        if let Some(kwargs) = kwargs
+            && !kwargs.is_empty()
+        {
+            for (k, v) in kwargs.iter() {
                 let key = HashedAny::from_bound(&k)?;
                 self.inner.insert(key, v.unbind());
             }
+            touched = true;
+        }
+        if touched {
             self.bump();
-            return Ok(());
         }
-        if other.hasattr("keys")? {
-            let keys = other.call_method0("keys")?;
-            for k in keys.try_iter()? {
-                let k = k?;
-                let v = other.get_item(&k)?;
-                let key = HashedAny::from_bound(&k)?;
-                self.inner.insert(key, v.unbind());
-            }
-            self.bump();
-            return Ok(());
-        }
-        for item in other.try_iter()? {
-            let item = item?;
-            let len = item
-                .len()
-                .map_err(|_| PyValueError::new_err("update sequence elements must be 2-tuples"))?;
-            if len != 2 {
-                return Err(PyValueError::new_err(
-                    "update sequence elements must be 2-tuples",
-                ));
-            }
-            let k = item.get_item(0)?;
-            let v = item.get_item(1)?;
-            let key = HashedAny::from_bound(&k)?;
-            self.inner.insert(key, v.unbind());
-        }
-        self.bump();
         Ok(())
     }
 
@@ -464,8 +517,25 @@ impl PyElasticHashMap {
 
     fn __or__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
         let mut new = self.copy(py);
-        new.update(other)?;
+        new.update(Some(other), None)?;
         Ok(new)
+    }
+
+    fn __ror__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
+        let mut new = Self {
+            inner: ElasticHashMap::with_capacity(0),
+            generation: 0,
+        };
+        new.update(Some(other), None)?;
+        for (k, v) in &self.inner {
+            new.inner.insert(k.clone_with_py(py), v.clone_ref(py));
+        }
+        new.bump();
+        Ok(new)
+    }
+
+    fn __ior__(&mut self, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.update(Some(other), None)
     }
 }
 
@@ -485,14 +555,18 @@ impl PyFunnelHashMap {
 #[pymethods]
 impl PyFunnelHashMap {
     #[new]
-    #[pyo3(signature = (other = None, *, capacity = 0))]
-    fn new(other: Option<&Bound<'_, PyAny>>, capacity: usize) -> PyResult<Self> {
+    #[pyo3(signature = (other = None, *, capacity = 0, **kwargs))]
+    fn new(
+        other: Option<&Bound<'_, PyAny>>,
+        capacity: usize,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
         let mut me = Self {
             inner: FunnelHashMap::with_capacity(capacity),
             generation: 0,
         };
-        if let Some(other) = other {
-            me.update(other)?;
+        if other.is_some() || kwargs.is_some() {
+            me.update(other, kwargs)?;
         }
         Ok(me)
     }
@@ -503,6 +577,39 @@ impl PyFunnelHashMap {
             inner: FunnelHashMap::with_options(options.inner),
             generation: 0,
         }
+    }
+
+    #[classmethod]
+    #[pyo3(signature = (iterable, value = None))]
+    fn fromkeys(
+        _cls: &Bound<'_, PyType>,
+        iterable: &Bound<'_, PyAny>,
+        value: Option<Py<PyAny>>,
+        py: Python<'_>,
+    ) -> PyResult<Self> {
+        let mut me = Self {
+            inner: FunnelHashMap::with_capacity(0),
+            generation: 0,
+        };
+        let val = value.unwrap_or_else(|| py.None());
+        for k in iterable.try_iter()? {
+            let k = k?;
+            let key = HashedAny::from_bound(&k)?;
+            me.inner.insert(key, val.clone_ref(py));
+        }
+        me.bump();
+        Ok(me)
+    }
+
+    #[classmethod]
+    fn __class_getitem__<'py>(
+        cls: &Bound<'py, PyType>,
+        item: &Bound<'py, PyAny>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        py.import("types")?
+            .getattr("GenericAlias")?
+            .call1((cls, item))
     }
 
     fn __len__(&self) -> usize {
@@ -598,42 +705,58 @@ impl PyFunnelHashMap {
         PyFunnelItemsView { map: slf.unbind() }
     }
 
-    fn update(&mut self, other: &Bound<'_, PyAny>) -> PyResult<()> {
-        if let Ok(dict) = other.cast::<PyDict>() {
-            for (k, v) in dict.iter() {
+    #[pyo3(signature = (other = None, **kwargs))]
+    fn update(
+        &mut self,
+        other: Option<&Bound<'_, PyAny>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        let mut touched = false;
+        if let Some(other) = other {
+            if let Ok(dict) = other.cast::<PyDict>() {
+                for (k, v) in dict.iter() {
+                    let key = HashedAny::from_bound(&k)?;
+                    self.inner.insert(key, v.unbind());
+                }
+            } else if other.hasattr("keys")? {
+                let keys = other.call_method0("keys")?;
+                for k in keys.try_iter()? {
+                    let k = k?;
+                    let v = other.get_item(&k)?;
+                    let key = HashedAny::from_bound(&k)?;
+                    self.inner.insert(key, v.unbind());
+                }
+            } else {
+                for item in other.try_iter()? {
+                    let item = item?;
+                    let len = item.len().map_err(|_| {
+                        PyValueError::new_err("update sequence elements must be 2-tuples")
+                    })?;
+                    if len != 2 {
+                        return Err(PyValueError::new_err(
+                            "update sequence elements must be 2-tuples",
+                        ));
+                    }
+                    let k = item.get_item(0)?;
+                    let v = item.get_item(1)?;
+                    let key = HashedAny::from_bound(&k)?;
+                    self.inner.insert(key, v.unbind());
+                }
+            }
+            touched = true;
+        }
+        if let Some(kwargs) = kwargs
+            && !kwargs.is_empty()
+        {
+            for (k, v) in kwargs.iter() {
                 let key = HashedAny::from_bound(&k)?;
                 self.inner.insert(key, v.unbind());
             }
+            touched = true;
+        }
+        if touched {
             self.bump();
-            return Ok(());
         }
-        if other.hasattr("keys")? {
-            let keys = other.call_method0("keys")?;
-            for k in keys.try_iter()? {
-                let k = k?;
-                let v = other.get_item(&k)?;
-                let key = HashedAny::from_bound(&k)?;
-                self.inner.insert(key, v.unbind());
-            }
-            self.bump();
-            return Ok(());
-        }
-        for item in other.try_iter()? {
-            let item = item?;
-            let len = item
-                .len()
-                .map_err(|_| PyValueError::new_err("update sequence elements must be 2-tuples"))?;
-            if len != 2 {
-                return Err(PyValueError::new_err(
-                    "update sequence elements must be 2-tuples",
-                ));
-            }
-            let k = item.get_item(0)?;
-            let v = item.get_item(1)?;
-            let key = HashedAny::from_bound(&k)?;
-            self.inner.insert(key, v.unbind());
-        }
-        self.bump();
         Ok(())
     }
 
@@ -715,8 +838,25 @@ impl PyFunnelHashMap {
 
     fn __or__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
         let mut new = self.copy(py);
-        new.update(other)?;
+        new.update(Some(other), None)?;
         Ok(new)
+    }
+
+    fn __ror__(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
+        let mut new = Self {
+            inner: FunnelHashMap::with_capacity(0),
+            generation: 0,
+        };
+        new.update(Some(other), None)?;
+        for (k, v) in &self.inner {
+            new.inner.insert(k.clone_with_py(py), v.clone_ref(py));
+        }
+        new.bump();
+        Ok(new)
+    }
+
+    fn __ior__(&mut self, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.update(Some(other), None)
     }
 }
 
