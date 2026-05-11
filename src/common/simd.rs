@@ -35,12 +35,12 @@ pub(crate) trait ControlByte {
 impl ControlByte for u8 {
     #[inline]
     fn is_occupied(&self) -> bool {
-        *self != CTRL_EMPTY && *self != CTRL_TOMBSTONE
+        (*self & FINGERPRINT_MASK) != 0
     }
 
     #[inline]
     fn is_free(&self) -> bool {
-        *self == CTRL_EMPTY || *self == CTRL_TOMBSTONE
+        (*self & FINGERPRINT_MASK) == 0
     }
 }
 
