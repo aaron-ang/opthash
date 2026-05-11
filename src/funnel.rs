@@ -924,7 +924,7 @@ where
     }
 
     fn first_free_in_level_bucket(key_hash: u64, level: &BucketLevel<K, V>) -> Option<usize> {
-        if level.capacity() == 0 || level.len >= level.capacity() || level.bucket_count == 0 {
+        if level.len >= level.capacity() || level.bucket_count == 0 {
             return None;
         }
 
@@ -942,7 +942,7 @@ where
 
     fn first_free_in_special_primary(&self, key_hash: u64) -> Option<usize> {
         let primary = &self.special.primary;
-        if primary.table.capacity() == 0 || primary.len >= primary.table.capacity() {
+        if primary.len >= primary.table.capacity() {
             return None;
         }
 
@@ -962,7 +962,7 @@ where
 
     fn first_free_in_special_fallback(&self, key_hash: u64) -> Option<usize> {
         let fallback = &self.special.fallback;
-        if fallback.capacity() == 0 || fallback.len >= fallback.capacity() {
+        if fallback.len >= fallback.capacity() {
             return None;
         }
 
@@ -1115,7 +1115,7 @@ where
         Q: Eq + ?Sized,
     {
         let primary = &self.special.primary;
-        if primary.table.capacity() == 0 || primary.len == 0 {
+        if primary.len == 0 {
             return LookupStep::Continue;
         }
 
@@ -1222,7 +1222,7 @@ where
         Q: Eq + ?Sized,
     {
         let fallback = &self.special.fallback;
-        if fallback.capacity() == 0 || fallback.len == 0 {
+        if fallback.len == 0 {
             return None;
         }
 

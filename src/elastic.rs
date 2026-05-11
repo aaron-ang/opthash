@@ -675,7 +675,7 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        if level.capacity() == 0 || level.len == 0 {
+        if level.len == 0 {
             return None;
         }
 
@@ -717,7 +717,7 @@ where
         max_groups: usize,
     ) -> Option<usize> {
         let level = &self.levels[level_idx];
-        if level.capacity() == 0 || level.len >= level.capacity() {
+        if level.len >= level.capacity() {
             return None;
         }
 
@@ -741,7 +741,7 @@ where
     /// `None` only if the level is completely full of OCCUPIED bytes.
     fn first_free_uniform(&self, key_hash: u64, level_idx: usize) -> Option<usize> {
         let level = &self.levels[level_idx];
-        if level.capacity() == 0 || level.len >= level.capacity() {
+        if level.len >= level.capacity() {
             return None;
         }
 
