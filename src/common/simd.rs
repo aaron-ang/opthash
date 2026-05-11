@@ -2,14 +2,14 @@
 
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{
-    uint8x16_t, vceqq_u8, vdupq_n_u8, vget_lane_u64, vld1q_u8, vorrq_u8, vreinterpret_u64_u8,
+    uint8x16_t, vandq_u8, vceqq_u8, vdupq_n_u8, vget_lane_u64, vld1q_u8, vreinterpret_u64_u8,
     vreinterpretq_u16_u8, vshrn_n_u16,
 };
 #[cfg(target_arch = "x86_64")]
 use {
     core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch},
     std::arch::x86_64::{
-        __m128i, __m256i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128,
+        __m128i, __m256i, _mm_and_si128, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8,
         _mm_set1_epi8, _mm_setzero_si128, _mm256_cmpeq_epi8, _mm256_loadu_si256,
         _mm256_movemask_epi8, _mm256_set1_epi8,
     },
@@ -35,12 +35,12 @@ pub(crate) trait ControlByte {
 impl ControlByte for u8 {
     #[inline]
     fn is_occupied(&self) -> bool {
-        *self != CTRL_EMPTY && *self != CTRL_TOMBSTONE
+        (*self & FINGERPRINT_MASK) != 0
     }
 
     #[inline]
     fn is_free(&self) -> bool {
-        *self == CTRL_EMPTY || *self == CTRL_TOMBSTONE
+        (*self & FINGERPRINT_MASK) == 0
     }
 }
 
@@ -51,14 +51,13 @@ impl ControlByte for u8 {
 pub(crate) struct ControlOps;
 
 impl ControlOps {
-    /// # Panics
-    ///
-    /// Panics if the masked 7-bit fingerprint cannot be represented as `u8`.
     #[inline]
     #[must_use]
     pub(crate) fn control_fingerprint(hash: u64) -> u8 {
-        let high = u8::try_from((hash >> FINGERPRINT_SHIFT) & u64::from(FINGERPRINT_MASK))
-            .expect("7-bit fingerprint fits in u8");
+        // Masking with FINGERPRINT_MASK (0x7F) bounds the value to [0, 127],
+        // so the truncating `as u8` cast is lossless.
+        #[allow(clippy::cast_possible_truncation)]
+        let high = ((hash >> FINGERPRINT_SHIFT) & u64::from(FINGERPRINT_MASK)) as u8;
         high.max(1)
     }
 
@@ -166,17 +165,7 @@ fn match_fingerprint_group_u32(ptr: *const u8, target: u8) -> u32 {
             (_mm_movemask_epi8(cmp) as u32) & 0xFFFF
         }
     }
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        // Compress the nibble mask into 1 bit per slot.
-        let mask = eq_mask_16_neon(ptr, target);
-        let mut out: u32 = 0;
-        for slot in mask {
-            out |= 1u32 << slot;
-        }
-        out
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "x86_64"))]
     {
         let mut m = 0u32;
         for i in 0..CONTROL_GROUP_SIZE {
@@ -230,9 +219,7 @@ impl ProbeOps {
     pub(crate) fn advance_wrapping_index(index: usize, step: usize, len: usize) -> usize {
         // step < len is guaranteed by build_group_steps, so index + step < 2*len.
         // A conditional subtract avoids the expensive division that modulo requires.
-        if len == 0 {
-            return 0;
-        }
+        debug_assert!(len > 0, "advance_wrapping_index requires len > 0");
         let r = index + step;
         if r >= len { r - len } else { r }
     }
@@ -311,7 +298,6 @@ pub(crate) unsafe fn free_mask_16(ptr: *const u8) -> BitMask {
     }
 }
 
-
 /// # Safety
 ///
 /// `ptr` must be valid to read 32 bytes.
@@ -379,9 +365,8 @@ unsafe fn eq_mask_16_neon(ptr: *const u8, target: u8) -> BitMask {
 unsafe fn free_mask_16_neon(ptr: *const u8) -> BitMask {
     unsafe {
         let bytes = vld1q_u8(ptr);
-        let empty_cmp = vceqq_u8(bytes, vdupq_n_u8(CTRL_EMPTY));
-        let tombstone_cmp = vceqq_u8(bytes, vdupq_n_u8(CTRL_TOMBSTONE));
-        let free_cmp = vorrq_u8(empty_cmp, tombstone_cmp);
+        let masked = vandq_u8(bytes, vdupq_n_u8(FINGERPRINT_MASK));
+        let free_cmp = vceqq_u8(masked, vdupq_n_u8(0));
         nibble_mask_from_cmp(free_cmp)
     }
 }
@@ -415,9 +400,8 @@ unsafe fn eq_mask_16_sse2(ptr: *const u8, target: u8) -> BitMask {
 unsafe fn free_mask_16_sse2(ptr: *const u8) -> BitMask {
     unsafe {
         let data = _mm_loadu_si128(ptr.cast::<__m128i>());
-        let empty = _mm_cmpeq_epi8(data, _mm_setzero_si128());
-        let tombstone = _mm_cmpeq_epi8(data, _mm_set1_epi8(CTRL_TOMBSTONE as i8));
-        let free = _mm_or_si128(empty, tombstone);
+        let masked = _mm_and_si128(data, _mm_set1_epi8(FINGERPRINT_MASK as i8));
+        let free = _mm_cmpeq_epi8(masked, _mm_setzero_si128());
         #[allow(clippy::cast_possible_truncation)]
         {
             BitMask(_mm_movemask_epi8(free) as u16)
