@@ -311,7 +311,6 @@ pub(crate) unsafe fn free_mask_16(ptr: *const u8) -> BitMask {
     }
 }
 
-
 /// # Safety
 ///
 /// `ptr` must be valid to read 32 bytes.
