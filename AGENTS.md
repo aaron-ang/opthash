@@ -34,6 +34,18 @@ Criterion auto-compares against the previous run. **Always read results from the
 
 Example path: `target/criterion/get_hit_throughput/elastic/change/estimates.json`
 
+#### Low-noise runs
+
+`scripts/bench.sh` wraps `cargo bench` with `taskset -c $CORE` + `setarch -R` (no privileges needed). Run with `sudo` to additionally pin governor=performance, disable Intel turbo, and run at SCHED_FIFO/99 — the script drops back to `$SUDO_USER` for the cargo invocation so build artifacts stay user-owned. Workflow:
+
+```bash
+scripts/bench.sh                            # save baseline as "ref"
+# … apply change …
+BASELINE=ref scripts/bench.sh               # compare against the pinned baseline
+```
+
+Re-pin `ref` whenever the harness env changes (sudo vs not, core pin) — Criterion compares wall-clock timings, so a baseline saved at boost frequency is meaningless once turbo is disabled. Pass override flags after `--`, e.g. `BASELINE=ref scripts/bench.sh -- --measurement-time 10 --sample-size 200`.
+
 ### Tail-latency harness
 
 - **`cargo bench --bench latency`** — per-operation latency distributions (p50/p90/p99/p999/p9999/max) via `hdrhistogram`. Hard-coded matrix (edit the consts at the top of `benches/latency.rs` to change): sizes 10K/100K/1M/10M × ops get-hit/get-miss/insert × all four maps × 1M samples × 10K warmup. `insert` pre-fills to `size − samples` before measuring so tail percentiles reflect insert cost near the target load, not into an empty map.
