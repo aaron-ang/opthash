@@ -165,17 +165,7 @@ fn match_fingerprint_group_u32(ptr: *const u8, target: u8) -> u32 {
             (_mm_movemask_epi8(cmp) as u32) & 0xFFFF
         }
     }
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        // Compress the nibble mask into 1 bit per slot.
-        let mask = eq_mask_16_neon(ptr, target);
-        let mut out: u32 = 0;
-        for slot in mask {
-            out |= 1u32 << slot;
-        }
-        out
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "x86_64"))]
     {
         let mut m = 0u32;
         for i in 0..CONTROL_GROUP_SIZE {
