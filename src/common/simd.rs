@@ -311,37 +311,6 @@ pub(crate) unsafe fn free_mask_16(ptr: *const u8) -> BitMask {
     }
 }
 
-/// Returns `(match_mask, free_mask)` from a single control-byte load.
-///
-/// # Safety
-///
-/// `ptr` must be valid to read `CONTROL_GROUP_SIZE` bytes.
-#[must_use]
-pub(crate) unsafe fn match_and_free_masks_16(ptr: *const u8, target: u8) -> (BitMask, BitMask) {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        match_and_free_masks_16_neon(ptr, target)
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        match_and_free_masks_16_sse2(ptr, target)
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        let mut match_mask: u16 = 0;
-        let mut free_mask: u16 = 0;
-        for i in 0..CONTROL_GROUP_SIZE {
-            let b = unsafe { *ptr.add(i) };
-            if b == target {
-                match_mask |= 1u16 << i;
-            }
-            if b == CTRL_EMPTY || b == CTRL_TOMBSTONE {
-                free_mask |= 1u16 << i;
-            }
-        }
-        (BitMask(match_mask), BitMask(free_mask))
-    }
-}
 
 /// # Safety
 ///
@@ -417,22 +386,6 @@ unsafe fn free_mask_16_neon(ptr: *const u8) -> BitMask {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline]
-unsafe fn match_and_free_masks_16_neon(ptr: *const u8, target: u8) -> (BitMask, BitMask) {
-    unsafe {
-        let bytes = vld1q_u8(ptr);
-        let match_cmp = vceqq_u8(bytes, vdupq_n_u8(target));
-        let empty_cmp = vceqq_u8(bytes, vdupq_n_u8(CTRL_EMPTY));
-        let tombstone_cmp = vceqq_u8(bytes, vdupq_n_u8(CTRL_TOMBSTONE));
-        let free_cmp = vorrq_u8(empty_cmp, tombstone_cmp);
-        (
-            nibble_mask_from_cmp(match_cmp),
-            nibble_mask_from_cmp(free_cmp),
-        )
-    }
-}
-
 #[allow(
     clippy::cast_possible_wrap,
     clippy::cast_ptr_alignment,
@@ -469,28 +422,6 @@ unsafe fn free_mask_16_sse2(ptr: *const u8) -> BitMask {
         {
             BitMask(_mm_movemask_epi8(free) as u16)
         }
-    }
-}
-
-#[allow(
-    clippy::cast_possible_wrap,
-    clippy::cast_ptr_alignment,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation
-)]
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn match_and_free_masks_16_sse2(ptr: *const u8, target: u8) -> (BitMask, BitMask) {
-    unsafe {
-        let data = _mm_loadu_si128(ptr.cast::<__m128i>());
-        let match_cmp = _mm_cmpeq_epi8(data, _mm_set1_epi8(target as i8));
-        let empty = _mm_cmpeq_epi8(data, _mm_setzero_si128());
-        let tombstone = _mm_cmpeq_epi8(data, _mm_set1_epi8(CTRL_TOMBSTONE as i8));
-        let free = _mm_or_si128(empty, tombstone);
-        (
-            BitMask(_mm_movemask_epi8(match_cmp) as u16),
-            BitMask(_mm_movemask_epi8(free) as u16),
-        )
     }
 }
 

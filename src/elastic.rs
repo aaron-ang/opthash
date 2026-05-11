@@ -6,7 +6,7 @@ use crate::common::simd::ProbeOps;
 
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
-    control::{CTRL_TOMBSTONE, ControlByte, ControlOps},
+    control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
         advance_wrapping_index, ceil_three_quarters, fastmod_magic, fastmod_u32,
@@ -683,12 +683,9 @@ where
         let group_count = level.table.group_count();
         let mut group_idx = group_start;
 
-        let tombstone_free = level.tombstones == 0;
         let capacity = level.capacity();
         for _ in 0..group_count {
-            let (match_mask, free_mask) = level
-                .table
-                .group_match_and_free_mask(group_idx, key_fingerprint);
+            let match_mask = level.table.group_match_mask(group_idx, key_fingerprint);
             for relative_idx in match_mask {
                 let slot_idx = group_idx * GROUP_SIZE + relative_idx;
                 let entry = unsafe { level.table.get_ref(slot_idx) };
@@ -697,8 +694,8 @@ where
                 }
             }
 
-            if tombstone_free
-                && let Some(off) = free_mask.lowest()
+            let empty_mask = level.table.group_match_mask(group_idx, CTRL_EMPTY);
+            if let Some(off) = empty_mask.lowest()
                 && group_idx * GROUP_SIZE + off < capacity
             {
                 return None;

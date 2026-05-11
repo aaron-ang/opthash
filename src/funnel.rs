@@ -6,7 +6,7 @@ use crate::common::simd::{ProbeOps, prefetch_read};
 
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
-    control::{ControlByte, ControlOps},
+    control::{CTRL_EMPTY, ControlByte, ControlOps},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
         advance_wrapping_index, ceil_to_usize, fastmod_magic, fastmod_u32, floor_to_usize,
@@ -1026,14 +1026,14 @@ where
             }
         }
 
-        // StopSearch: bucket has a free slot AND level never had a tombstone
-        // → no key ever overflowed past here.
-        if level.tombstones == 0
-            && level
-                .table
-                .group_free_mask(group_idx)
-                .truncate_to(level.bucket_size)
-                .any()
+        // StopSearch: bucket has an EMPTY byte → no key ever overflowed past
+        // here. Tombstones in the bucket don't disable termination since the
+        // empty byte still proves the probe chain terminated naturally.
+        if level
+            .table
+            .group_match_mask(group_idx, CTRL_EMPTY)
+            .truncate_to(level.bucket_size)
+            .any()
         {
             return LookupStep::StopSearch;
         }
@@ -1091,7 +1091,12 @@ where
             .lowest()
             .map(|o| bucket_range.start + o);
 
-        let step = if level.tombstones == 0 && free_candidate.is_some() {
+        let step = if level
+            .table
+            .group_match_mask(group_idx, CTRL_EMPTY)
+            .truncate_to(level.bucket_size)
+            .any()
+        {
             LookupStep::StopSearch
         } else {
             LookupStep::Continue
