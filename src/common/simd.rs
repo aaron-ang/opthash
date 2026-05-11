@@ -219,7 +219,7 @@ impl ProbeOps {
     pub(crate) fn advance_wrapping_index(index: usize, step: usize, len: usize) -> usize {
         // step < len is guaranteed by build_group_steps, so index + step < 2*len.
         // A conditional subtract avoids the expensive division that modulo requires.
-        // Callers guard `len > 0` (probe loops short-circuit on empty levels).
+        debug_assert!(len > 0, "advance_wrapping_index requires len > 0");
         let r = index + step;
         if r >= len { r - len } else { r }
     }
