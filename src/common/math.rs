@@ -69,11 +69,8 @@ const GOLDEN_RATIO_U64: u64 = 0x9E37_79B9_7F4A_7C15;
 /// bucket distributions across levels. Used by both elastic and funnel.
 #[inline]
 pub(crate) fn level_salt(level_idx: usize) -> u64 {
-    GOLDEN_RATIO_U64.wrapping_mul(
-        u64::try_from(level_idx)
-            .expect("level index fits in u64")
-            .wrapping_add(1),
-    )
+    // usize fits in u64 on every Rust target (max 64-bit pointer width).
+    GOLDEN_RATIO_U64.wrapping_mul((level_idx as u64).wrapping_add(1))
 }
 
 /// Lemire fastmod: precompute magic `M = ceil(2^64 / d)` once so that each
