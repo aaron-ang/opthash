@@ -41,3 +41,9 @@ publishing-environment = "pypi"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = [
+    "--benchmark-disable-gc",
+    "--benchmark-warmup=on",
+    "--benchmark-warmup-iterations=20",
+    "--benchmark-min-rounds=50",
+]
