@@ -51,14 +51,13 @@ impl ControlByte for u8 {
 pub(crate) struct ControlOps;
 
 impl ControlOps {
-    /// # Panics
-    ///
-    /// Panics if the masked 7-bit fingerprint cannot be represented as `u8`.
     #[inline]
     #[must_use]
     pub(crate) fn control_fingerprint(hash: u64) -> u8 {
-        let high = u8::try_from((hash >> FINGERPRINT_SHIFT) & u64::from(FINGERPRINT_MASK))
-            .expect("7-bit fingerprint fits in u8");
+        // Masking with FINGERPRINT_MASK (0x7F) bounds the value to [0, 127],
+        // so the truncating `as u8` cast is lossless.
+        #[allow(clippy::cast_possible_truncation)]
+        let high = ((hash >> FINGERPRINT_SHIFT) & u64::from(FINGERPRINT_MASK)) as u8;
         high.max(1)
     }
 
