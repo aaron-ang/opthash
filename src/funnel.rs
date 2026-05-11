@@ -17,11 +17,18 @@ use crate::common::{
 
 pub(crate) const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
 
+/// Construction-time tuning for `FunnelHashMap`.
 #[derive(Debug, Clone, Copy)]
 pub struct FunnelOptions {
-    pub capacity: usize,
-    pub reserve_fraction: f64,
-    pub primary_probe_limit: Option<usize>,
+    /// Target initial capacity. Funnel caps load factor at 1/8 by design;
+    /// useful capacity is `capacity * (1 - reserve_fraction)`.
+    capacity: usize,
+    /// Fraction kept free as headroom. Clamped to
+    /// `MAX_FUNNEL_RESERVE_FRACTION` (1/8).
+    reserve_fraction: f64,
+    /// Max groups probed in the special-array primary before falling back to
+    /// the fallback array. `None` derives from `reserve_fraction`.
+    primary_probe_limit: Option<usize>,
 }
 
 impl Default for FunnelOptions {
@@ -42,16 +49,45 @@ impl FunnelOptions {
             ..Self::default()
         }
     }
+
+    #[must_use]
+    pub fn capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity;
+        self
+    }
+
+    #[must_use]
+    pub fn reserve_fraction(mut self, reserve_fraction: f64) -> Self {
+        self.reserve_fraction = reserve_fraction;
+        self
+    }
+
+    #[must_use]
+    pub fn primary_probe_limit(mut self, primary_probe_limit: usize) -> Self {
+        self.primary_probe_limit = Some(primary_probe_limit);
+        self
+    }
 }
 
-#[derive(Debug)]
+/// One level in the funnel array. Each level is a fixed grid of buckets;
+/// inserts hash a key to one bucket and probe within that bucket only.
+/// If the bucket is full the insert spills to the next level (or the
+/// special array). Bucket-local probing keeps lookup cost bounded.
 struct BucketLevel<K, V> {
+    /// Structure of Arrays control bytes + entries.
     table: RawTable<Entry<K, V>>,
+    /// Live entry count.
     len: usize,
+    /// Deleted-slot count.
     tombstones: usize,
+    /// Slots per bucket.
     bucket_size: usize,
+    /// Number of buckets in this level.
     bucket_count: usize,
+    /// Per-level salt mixed into the key hash
+    /// so each level distributes differently.
     salt: u64,
+    /// Fastmod magic for `bucket_count`.
     bucket_count_magic: u64,
 }
 
@@ -79,6 +115,8 @@ impl<K, V> BucketLevel<K, V> {
         self.table.capacity()
     }
 
+    /// Hash → bucket via fastmod,
+    /// salted so each level distributes differently.
     #[inline]
     fn bucket_index(&self, key_hash: u64) -> usize {
         fastmod_u32(
@@ -88,6 +126,7 @@ impl<K, V> BucketLevel<K, V> {
         )
     }
 
+    /// Slot index range covering all entries in `bucket_idx`.
     #[inline]
     fn bucket_range(&self, bucket_idx: usize) -> std::ops::Range<usize> {
         let start = bucket_idx * self.bucket_size;
@@ -105,12 +144,18 @@ impl<K, V> Drop for BucketLevel<K, V> {
     }
 }
 
-#[derive(Debug)]
+/// Fallback table for keys that didn't fit in any bucket level.
+/// Open-addressed with double-hashing across SIMD groups (16 slots each).
 struct SpecialPrimary<K, V> {
+    /// Structure of Arrays control bytes + entries.
     table: RawTable<Entry<K, V>>,
+    /// Live entry count.
     len: usize,
+    /// Per-group packed fingerprint metadata for fast scans.
     group_summaries: Box<[u128]>,
+    /// Per-group tombstone count, bounds probe length.
     group_tombstones: Box<[usize]>,
+    /// Precomputed double-hashing step set.
     group_steps: Box<[usize]>,
 }
 
@@ -138,12 +183,21 @@ impl<K, V> Drop for SpecialPrimary<K, V> {
     }
 }
 
-#[derive(Debug)]
+/// Last-resort table for keys that exhaust the special primary's probe
+/// budget. Bucketed like `BucketLevel` but with larger buckets (`2 *
+/// primary_probe_limit`) so a key that's been pushed this far almost
+/// certainly fits.
 struct SpecialFallback<K, V> {
+    /// Structure of Arrays control bytes + entries.
     table: RawTable<Entry<K, V>>,
+    /// Live entry count.
     len: usize,
+    /// Deleted-slot count.
     tombstones: usize,
+    /// Slots per bucket. Larger than `BucketLevel` (`2 * primary_probe_limit`)
+    /// since this is the last-resort table.
     bucket_size: usize,
+    /// Number of buckets.
     bucket_count: usize,
 }
 
@@ -191,9 +245,13 @@ impl<K, V> Drop for SpecialFallback<K, V> {
     }
 }
 
-#[derive(Debug)]
+/// Combines the special primary (probed first) and the special fallback
+/// (when primary hits its probe limit). Together they catch keys that
+/// overflowed every bucket level.
 struct SpecialArray<K, V> {
+    /// Probed first; bounded by `primary_probe_limit`.
     primary: SpecialPrimary<K, V>,
+    /// Probed after primary hits its limit.
     fallback: SpecialFallback<K, V>,
 }
 
@@ -209,29 +267,52 @@ impl<K, V> SpecialArray<K, V> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where in the funnel structure a key/slot lives. Returned by lookups,
+/// consumed by inserts / removes to avoid recomputing the location.
+#[derive(Clone, Copy)]
 enum SlotLocation {
     Level { level_idx: usize, slot_idx: usize },
     SpecialPrimary { slot_idx: usize },
     SpecialFallback { slot_idx: usize },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Outcome of probing one bucket / group during lookup.
+/// - `Found(slot_idx)`: key matched at slot.
+/// - `Continue`: bucket has tombstones; keep probing for the key elsewhere.
+/// - `StopSearch`: bucket has free space and no tombstones — key cannot
+///   exist further along this hash chain, abort the search.
 enum LookupStep {
     Found(usize),
     Continue,
     StopSearch,
 }
 
+/// Open-addressed hash map using funnel hashing.
+///
+/// Capacity is split between a stack of bucket-grouped `levels` (each level
+/// half the size of the previous) and a `special` array catching overflow.
+/// Inserts try level 0 first, then descend to deeper levels, then to
+/// `special.primary`, then `special.fallback`. Lookups follow the same
+/// order. The funnel structure trades a small probe budget per level for
+/// hard worst-case guarantees on lookup cost.
 pub struct FunnelHashMap<K, V> {
+    /// Bucket-grouped levels, each half the size of the previous.
     levels: Vec<BucketLevel<K, V>>,
+    /// Overflow-catching tables (primary + fallback).
     special: SpecialArray<K, V>,
+    /// Total live entries across levels + special.
     len: usize,
+    /// Total slot count.
     capacity: usize,
+    /// Insert count that triggers `resize(2x)`.
     max_insertions: usize,
+    /// Slot reserve fraction. See `FunnelOptions`.
     reserve_fraction: f64,
+    /// Cap on groups probed in the special primary before fallback.
     primary_probe_limit: usize,
+    /// Highest level index ever written; bounds the lookup probe loop.
     max_populated_level: usize,
+    /// Hash builder. Cloned across resizes to preserve probe sequences.
     hash_builder: DefaultHashBuilder,
 }
 
@@ -269,11 +350,27 @@ where
     }
 
     #[must_use]
+    pub fn with_hasher(hash_builder: DefaultHashBuilder) -> Self {
+        Self::with_options_and_hasher(FunnelOptions::default(), hash_builder)
+    }
+
+    #[must_use]
+    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: DefaultHashBuilder) -> Self {
+        Self::with_options_and_hasher(FunnelOptions::with_capacity(capacity), hash_builder)
+    }
+
+    #[must_use]
     pub fn with_options(options: FunnelOptions) -> Self {
         Self::with_options_and_hasher(options, DefaultHashBuilder::default())
     }
 
-    fn with_options_and_hasher(options: FunnelOptions, hash_builder: DefaultHashBuilder) -> Self {
+    /// Full constructor. `resize` also calls this with the existing
+    /// `hash_builder` so all keys keep the same hash sequence across grows.
+    #[must_use]
+    pub fn with_options_and_hasher(
+        options: FunnelOptions,
+        hash_builder: DefaultHashBuilder,
+    ) -> Self {
         let reserve_fraction =
             sanitize_reserve_fraction(options.reserve_fraction).min(MAX_FUNNEL_RESERVE_FRACTION);
         let capacity = options.capacity;
@@ -579,6 +676,9 @@ where
         self.max_populated_level = 0;
     }
 
+    /// Drain all live entries (across levels + special), build a fresh map
+    /// at `new_capacity`, reinsert. Also serves as a no-grow rehash when
+    /// called with the current capacity.
     fn resize(&mut self, new_capacity: usize) {
         let mut entries = Vec::with_capacity(self.len);
 
@@ -683,6 +783,10 @@ where
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 
+    /// Search bucket levels for `key`. Returns `Ok(SlotLocation)` on hit, or
+    /// `Err(Some(insert_location))` with the first non-full bucket's
+    /// candidate slot if known (used by insert to skip a re-search).
+    /// `Err(None)` when no insert candidate was seen and the search exhausted.
     fn find_in_levels_with_candidate<Q>(
         &self,
         key: &Q,
@@ -752,6 +856,9 @@ where
     }
 
     #[inline]
+    /// Insert `key`/`value` into a candidate slot, growing first via
+    /// `resize` if `len >= max_insertions`. After resize, the candidate
+    /// becomes stale, so this re-locates the slot from scratch.
     fn insert_at_location_after_resize_check(
         &mut self,
         location: Option<SlotLocation>,
@@ -993,6 +1100,10 @@ where
         (step, free_candidate)
     }
 
+    /// Probe the special primary for `key` (lookup-only — no insert
+    /// candidate tracking). Bounded by `primary_probe_limit` groups; if
+    /// reached without a match and no tombstones seen, returns `StopSearch`
+    /// so the caller skips fallback.
     fn find_in_special_primary<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> LookupStep
     where
         K: Borrow<Q>,
@@ -1034,6 +1145,8 @@ where
         LookupStep::Continue
     }
 
+    /// Like `find_in_special_primary`, but also remembers the first
+    /// FREE-or-TOMBSTONE slot seen so insert can land there without a re-scan.
     fn find_in_special_primary_with_candidate<Q>(
         &self,
         key_hash: u64,
@@ -1091,6 +1204,8 @@ where
         (LookupStep::Continue, candidate)
     }
 
+    /// Probe the special fallback for `key`. Bucket-local search like
+    /// `BucketLevel`, but with larger buckets sized for primary spillover.
     fn find_in_special_fallback<Q>(
         &self,
         key_hash: u64,
@@ -1141,6 +1256,8 @@ where
         None
     }
 
+    /// Like `find_in_special_fallback`, but also tracks the first
+    /// FREE-or-TOMBSTONE slot for insert.
     fn find_in_special_fallback_with_candidate<Q>(
         &self,
         key_hash: u64,
@@ -1236,7 +1353,8 @@ where
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Three-phase iterator state: walk all bucket levels, then the special
+/// primary, then the special fallback.
 enum FunnelIterPhase {
     Levels,
     Primary,
@@ -1244,6 +1362,9 @@ enum FunnelIterPhase {
     Done,
 }
 
+/// Borrowing iterator over occupied entries.
+/// Visits each region in funnel order: bucket levels → special primary → special fallback.
+/// Skips FREE and TOMBSTONE control bytes.
 pub struct FunnelIter<'a, K, V> {
     levels: &'a [BucketLevel<K, V>],
     primary: &'a SpecialPrimary<K, V>,
@@ -1319,14 +1440,21 @@ where
     }
 }
 
+/// Number of bucket levels for a given reserve fraction. Tighter reserve →
+/// more levels (more probing budget per insert).
 fn compute_level_count(reserve_fraction: f64) -> usize {
     ceil_to_usize((4.0 * (1.0 / reserve_fraction).log2() + 10.0).max(1.0))
 }
 
+/// Per-bucket slot count. Wider buckets reduce overflow into deeper levels
+/// at the cost of more in-bucket probing.
 fn compute_bucket_width(reserve_fraction: f64) -> usize {
     ceil_to_usize((2.0 * (1.0 / reserve_fraction).log2()).max(1.0))
 }
 
+/// Carve out the special-array capacity from the total. Returns
+/// `(level_capacity, special_capacity)` such that levels get the bulk and
+/// special gets a fraction sized to absorb expected overflow.
 fn choose_special_capacity(
     total_capacity: usize,
     reserve_fraction: f64,

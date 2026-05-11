@@ -24,13 +24,13 @@ fn build_elastic_options(
                 "reserve_fraction must be in the open interval (0, 1)",
             ));
         }
-        opts.reserve_fraction = rf;
+        opts = opts.reserve_fraction(rf);
     }
     if let Some(ps) = probe_scale {
         if ps <= 0.0 {
             return Err(PyValueError::new_err("probe_scale must be positive"));
         }
-        opts.probe_scale = ps;
+        opts = opts.probe_scale(ps);
     }
     Ok(opts)
 }
@@ -48,7 +48,7 @@ fn build_funnel_options(
                  FunnelHashMap caps the load factor at 1/8 by design"
             )));
         }
-        opts.reserve_fraction = rf;
+        opts = opts.reserve_fraction(rf);
     }
     if let Some(limit) = primary_probe_limit {
         if limit == 0 {
@@ -56,11 +56,13 @@ fn build_funnel_options(
                 "primary_probe_limit must be positive",
             ));
         }
-        opts.primary_probe_limit = Some(limit);
+        opts = opts.primary_probe_limit(limit);
     }
     Ok(opts)
 }
 
+/// Tag for the cached object's Python type, used to short-circuit `__eq__`
+/// dispatch in `HashedAny::eq` for the str-vs-str common case.
 #[derive(Clone, Copy, PartialEq)]
 #[repr(u8)]
 enum HashKind {
@@ -68,13 +70,23 @@ enum HashKind {
     Other,
 }
 
+/// Owning hashable wrapper around a `Py<PyAny>` used as a map key.
+///
+/// Caches the hash (computed once via Python `__hash__`) so `Hash` becomes a
+/// `write_isize` instead of a Python call. Stores `HashKind` so `PartialEq`
+/// can take the str-bytes fast path without re-detecting the type.
 struct HashedAny {
+    /// Underlying Python object. Owns one refcount.
     obj: Py<PyAny>,
+    /// Cached `__hash__` result.
     hash: isize,
+    /// Python type tag for the str-bytes equality fast path.
     kind: HashKind,
 }
 
 impl HashedAny {
+    /// Build by computing `__hash__` once and bumping the object's refcount
+    /// (via `clone().unbind()`). Use for inserts that need to keep the key.
     fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let hash = ob.hash()?;
         let kind = unsafe {
@@ -91,6 +103,8 @@ impl HashedAny {
         })
     }
 
+    /// Refcount-bumping clone. Reuses the cached hash and kind so only the
+    /// `Py<PyAny>` clone-ref is paid.
     fn clone_with_py(&self, py: Python<'_>) -> Self {
         Self {
             obj: self.obj.clone_ref(py),
@@ -100,11 +114,21 @@ impl HashedAny {
     }
 }
 
+/// Borrow-only key wrapper for hash-table lookups.
+///
+/// Built by `ptr::read`-ing the input `Py<PyAny>` into a `ManuallyDrop` so no
+/// refcount bump occurs. The wrapped value is never dropped; the original
+/// `Bound`'s lifetime keeps the underlying object alive. Use when you only
+/// need to query the map (`get`, `contains_key`, `remove`) and won't keep the
+/// key around afterward.
 struct ProbeKey {
     inner: ManuallyDrop<HashedAny>,
 }
 
 impl ProbeKey {
+    /// # Safety
+    /// Caller must ensure `ob` outlives the returned `ProbeKey`. The probe
+    /// holds a non-owning copy of the underlying `PyObject` pointer.
     fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let hash = ob.hash()?;
         let kind = unsafe {
@@ -120,6 +144,7 @@ impl ProbeKey {
         })
     }
 
+    /// Borrow as `&HashedAny` for use with map APIs that take a borrowed key.
     fn as_key(&self) -> &HashedAny {
         &self.inner
     }
@@ -132,6 +157,9 @@ impl Hash for HashedAny {
 }
 
 impl PartialEq for HashedAny {
+    /// Equality with three short-circuits before falling back to Python rich
+    /// compare: hash mismatch, pointer identity, and a UTF-8 bytes compare
+    /// when both sides are `str` (skips `PyObject_RichCompareBool` dispatch).
     fn eq(&self, other: &Self) -> bool {
         if self.hash != other.hash {
             return false;
@@ -157,6 +185,10 @@ impl PartialEq for HashedAny {
 
 impl Eq for HashedAny {}
 
+/// Emits one full Python-facing map surface (map class + iterators + views)
+/// parameterized by backend type. Invoked once for `Elastic` and
+/// once for `Funnel` so behavior changes land in both maps simultaneously.
+/// `PyO3` can't express `#[pyclass]` over a generic, hence the macro.
 macro_rules! define_map_classes {
     (
         py_map = $PyMap:ident,
@@ -178,13 +210,19 @@ macro_rules! define_map_classes {
         items_view = $ItemsView:ident,
         items_view_name = $items_view_name:literal,
     ) => {
+        /// `PyO3` wrapper around the Rust hash map.
         #[pyclass(name = $py_map_name, module = "opthash")]
         struct $PyMap {
+            /// Underlying Rust hash map.
             inner: $Inner<HashedAny, Py<PyAny>>,
+            /// Mutation counter. Iterators snapshot this at construction and
+            /// raise `RuntimeError` on next `__next__` if it changes.
             generation: u64,
         }
 
         impl $PyMap {
+            /// Bump generation to invalidate any active iterator snapshots.
+            /// Call after every mutating operation.
             #[inline]
             fn bump(&mut self) {
                 self.generation = self.generation.wrapping_add(1);
@@ -248,6 +286,10 @@ macro_rules! define_map_classes {
                 Ok(me)
             }
 
+            /// Support `Cls[K, V]` subscript syntax at runtime by returning a
+            /// `types.GenericAlias` (same factory `CPython` uses for
+            /// `dict[str, int]` etc). Required for parity with the typing
+            /// stub that declares the class as `Generic[K, V]`.
             #[classmethod]
             fn __class_getitem__<'py>(
                 cls: &Bound<'py, PyType>,
@@ -356,6 +398,12 @@ macro_rules! define_map_classes {
                 $ItemsView { map: slf.unbind() }
             }
 
+            /// Mirror of `dict.update`. Branches in priority order: same-type
+            /// (downcast for direct inner-map access), `PyDict`, mapping with
+            /// `keys()`, then iterable of `(k, v)` tuples. Each branch
+            /// reserves up front when size is known. `bump()` only fires when
+            /// at least one insert occurred so empty `update()` doesn't
+            /// invalidate active iterators.
             #[pyo3(signature = (other = None, **kwargs))]
             fn update(
                 &mut self,
@@ -580,6 +628,9 @@ macro_rules! define_map_classes {
         define_iter!($ValueIter, $value_iter_name, $PyMap);
         define_iter!($ItemIter, $item_iter_name, $PyMap);
 
+        /// Live view over the map's keys (mirrors `dict.keys()`). Holds a
+        /// `Py<map>` so each operation borrows current map state — no
+        /// snapshotting at view construction.
         #[pyclass(name = $keys_view_name, module = "opthash")]
         struct $KeysView {
             map: Py<$PyMap>,
@@ -690,6 +741,7 @@ macro_rules! define_map_classes {
             }
         }
 
+        /// Live view over the map's values (mirrors `dict.values()`).
         #[pyclass(name = $values_view_name, module = "opthash")]
         struct $ValuesView {
             map: Py<$PyMap>,
@@ -733,6 +785,8 @@ macro_rules! define_map_classes {
             }
         }
 
+        /// Live view over the map's `(key, value)` pairs (mirrors
+        /// `dict.items()`). Set operations build fresh `(k, v)` `PyTuple`s.
         #[pyclass(name = $items_view_name, module = "opthash")]
         struct $ItemsView {
             map: Py<$PyMap>,
@@ -850,13 +904,24 @@ macro_rules! define_map_classes {
     };
 }
 
+/// Generates a single iterator pyclass.
+///
+/// `snapshot` holds the iter contents materialized eagerly at `__iter__`
+/// time. Trades memory for borrow-checker simplicity (no self-referencing
+/// borrow of the map). `expected_gen` is captured at iter construction;
+/// each `__next__` checks the map's current `generation` and raises
+/// `RuntimeError("dictionary changed size during iteration")` on mismatch.
 macro_rules! define_iter {
     ($Iter:ident, $iter_name:literal, $PyMap:ident) => {
         #[pyclass(name = $iter_name, module = "opthash")]
         struct $Iter {
+            /// Source map. Held to check generation per `__next__`.
             map: Py<$PyMap>,
+            /// Eagerly materialized iter contents (keys / values / items).
             snapshot: Vec<Py<PyAny>>,
+            /// Map's `generation` at iter construction.
             expected_gen: u64,
+            /// Next index into `snapshot`.
             pos: usize,
         }
 

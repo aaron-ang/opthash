@@ -12,7 +12,7 @@ use common::{
 };
 use hdrhistogram::Histogram;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum Op {
     GetHit,
     GetMiss,

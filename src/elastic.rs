@@ -17,11 +17,18 @@ use crate::common::{
 
 const DEFAULT_PROBE_SCALE: f64 = 16.0;
 
+/// Construction-time tuning for `ElasticHashMap`.
 #[derive(Debug, Clone, Copy)]
 pub struct ElasticOptions {
-    pub capacity: usize,
-    pub reserve_fraction: f64,
-    pub probe_scale: f64,
+    /// Target initial capacity. The map sizes its level partition so
+    /// `capacity * (1 - reserve_fraction)` inserts fit before the next resize.
+    capacity: usize,
+    /// Fraction of slots kept free as headroom. Lower means higher load
+    /// factor but more probing on collisions.
+    reserve_fraction: f64,
+    /// Multiplier on per-level probe budgets. Higher means more thorough
+    /// probing within a level before falling through to the next.
+    probe_scale: f64,
 }
 
 impl Default for ElasticOptions {
@@ -42,18 +49,52 @@ impl ElasticOptions {
             ..Self::default()
         }
     }
+
+    #[must_use]
+    pub fn capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity;
+        self
+    }
+
+    #[must_use]
+    pub fn reserve_fraction(mut self, reserve_fraction: f64) -> Self {
+        self.reserve_fraction = reserve_fraction;
+        self
+    }
+
+    #[must_use]
+    pub fn probe_scale(mut self, probe_scale: f64) -> Self {
+        self.probe_scale = probe_scale;
+        self
+    }
 }
 
-#[derive(Debug)]
+/// One level in elastic hashing's geometric partition.
+///
+/// Each level is an independent open-addressed table sized to roughly half
+/// the capacity of the previous level. Inserts cascade from level 0 outward
+/// per the active batch plan; lookups probe every populated level.
 struct Level<K, V> {
+    /// Structure of Arrays control bytes + entries.
     table: RawTable<Entry<K, V>>,
+    /// Live entry count.
     len: usize,
+    /// Deleted-slot count.
     tombstones: usize,
+    /// Cached `floor(reserve * cap / 2)` for the
+    /// `current_free_slots > threshold` branch in slot selection.
     half_reserve_slot_threshold: usize,
+    /// Per-(free-slot count) probe budget for limited probing.
+    /// Indexed by `free_slots()`.
     limited_probe_budgets: Box<[usize]>,
+    /// Precomputed double-hashing step set.
     group_steps: Box<[usize]>,
+    /// Per-level salt mixed into the key hash so each level probes a
+    /// different sequence.
     salt: u64,
+    /// Fastmod magic for `group_count`.
     group_count_magic: u64,
+    /// Fastmod magic for `group_steps.len()`.
     step_count_magic: u64,
 }
 
@@ -98,16 +139,23 @@ impl<K, V> Level<K, V> {
         self.table.capacity()
     }
 
+    /// Slots minus live entries. Includes tombstone slots since they're
+    /// reusable on insert (control byte FREE-or-TOMBSTONE).
     #[inline]
     fn free_slots(&self) -> usize {
         self.capacity().saturating_sub(self.len)
     }
 
+    /// Probe-group budget at the current fill level for limited (early-stop)
+    /// probing. Tighter as the level fills.
     #[inline]
     fn limited_group_budget(&self) -> usize {
         self.limited_probe_budgets[self.free_slots()]
     }
 
+    /// Triggers a no-grow rehash on remove when tombstones outnumber half
+    /// the slots. Keeps probe sequences from degrading after delete-heavy
+    /// workloads.
     #[inline]
     fn needs_cleanup(&self) -> bool {
         self.tombstones > self.capacity() / 2
@@ -124,17 +172,35 @@ impl<K, V> Drop for Level<K, V> {
     }
 }
 
+/// Open-addressed hash map using elastic hashing.
+///
+/// Splits capacity across geometrically shrinking `levels` and routes inserts
+/// through a `batch_plan`: early batches concentrate on level 0; later
+/// batches push toward deeper levels. Lookups probe every level whose
+/// `len > 0`. Unlike standard open addressing, expected probe count stays
+/// low even at high load.
 pub struct ElasticHashMap<K, V> {
+    /// Geometrically shrinking partition of capacity.
     levels: Vec<Level<K, V>>,
+    /// Total live entries.
     len: usize,
+    /// Total slot count across all levels.
     capacity: usize,
+    /// Insert count that triggers `resize(2x)`.
     max_insertions: usize,
+    /// Slot reserve fraction per level. See `ElasticOptions`.
     reserve_fraction: f64,
+    /// Probe-budget multiplier. See `ElasticOptions`.
     probe_scale: f64,
+    /// Per-batch insert quota; drives `current_batch_index` advancement.
     batch_plan: Vec<usize>,
+    /// Index into `batch_plan`. Selects which level pair new keys target.
     current_batch_index: usize,
+    /// Remaining inserts in the current batch before advancing.
     batch_remaining: usize,
+    /// Highest level index ever written; bounds the lookup probe loop.
     max_populated_level: usize,
+    /// Hash builder. Cloned across resizes to preserve probe sequences.
     hash_builder: DefaultHashBuilder,
 }
 
@@ -172,11 +238,27 @@ where
     }
 
     #[must_use]
+    pub fn with_hasher(hash_builder: DefaultHashBuilder) -> Self {
+        Self::with_options_and_hasher(ElasticOptions::default(), hash_builder)
+    }
+
+    #[must_use]
+    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: DefaultHashBuilder) -> Self {
+        Self::with_options_and_hasher(ElasticOptions::with_capacity(capacity), hash_builder)
+    }
+
+    #[must_use]
     pub fn with_options(options: ElasticOptions) -> Self {
         Self::with_options_and_hasher(options, DefaultHashBuilder::default())
     }
 
-    fn with_options_and_hasher(options: ElasticOptions, hash_builder: DefaultHashBuilder) -> Self {
+    /// Full constructor. `resize` also calls this with the existing
+    /// `hash_builder` so all keys keep the same hash sequence across grows.
+    #[must_use]
+    pub fn with_options_and_hasher(
+        options: ElasticOptions,
+        hash_builder: DefaultHashBuilder,
+    ) -> Self {
         let reserve_fraction = sanitize_reserve_fraction(options.reserve_fraction);
         let probe_scale = sanitize_probe_scale(options.probe_scale);
         let capacity = options.capacity;
@@ -376,6 +458,8 @@ where
     }
 }
 
+/// Borrowing iterator over occupied entries. Walks levels in order, scanning
+/// each level's slot array linearly. Skips FREE and TOMBSTONE control bytes.
 pub struct ElasticIter<'a, K, V> {
     levels: &'a [Level<K, V>],
     level_idx: usize,
@@ -419,6 +503,9 @@ impl<K, V> ElasticHashMap<K, V>
 where
     K: Eq + Hash,
 {
+    /// Drain all live entries into a temp Vec, build a fresh map at
+    /// `new_capacity`, reinsert. Passing the current capacity performs a
+    /// no-grow rehash that flushes accumulated tombstones.
     fn resize(&mut self, new_capacity: usize) {
         let mut entries = Vec::with_capacity(self.len);
 
@@ -462,6 +549,8 @@ where
         self.hash_builder.hash_one(key)
     }
 
+    /// Advance the batch state machine past any zero-quota batches so the
+    /// next insert routes to the correct level pair.
     #[inline]
     fn advance_batch_window(&mut self) {
         while self.batch_remaining == 0 && self.current_batch_index + 1 < self.batch_plan.len() {
@@ -470,6 +559,10 @@ where
         }
     }
 
+    /// Pick the (level, slot) pair to write a new key into. Tries the
+    /// batch-targeted level pair first (`choose_slot_targeted`); falls back
+    /// to a full sweep across all levels when the targeted slot is full
+    /// (e.g. tombstones in earlier levels are the only reusable slots).
     fn choose_slot_for_new_key(&mut self, key_hash: u64) -> Option<(usize, usize)> {
         if self.levels.is_empty() {
             return None;
@@ -487,6 +580,11 @@ where
         None
     }
 
+    /// Batch-driven slot selection. Reads `current_batch_index` to pick the
+    /// level pair `(li, li+1)`, then steers between them based on
+    /// `current_free_slots > half_reserve_threshold` and `next_free_slots`
+    /// thresholds. Per the elastic-hashing schedule, this is what keeps
+    /// expected probe count low at high load.
     fn choose_slot_targeted(&self, key_hash: u64) -> Option<(usize, usize)> {
         if self.current_batch_index == 0 {
             return self
@@ -538,6 +636,9 @@ where
             .map(|slot_idx| (level_idx + 1, slot_idx))
     }
 
+    /// Locate `key` across all populated levels. Returns `(level, slot)` on
+    /// hit. Bounded by `max_populated_level + 1` so empty trailing levels
+    /// don't get probed.
     fn find_slot_indices_with_hash<Q>(
         &self,
         key: &Q,
@@ -559,6 +660,10 @@ where
         None
     }
 
+    /// Probe one level for `key`. Walks groups via the level's double-hashing
+    /// step, SIMD-matches the fingerprint byte, then key-compares only the
+    /// matched slots. Stops on FREE byte (group has space) when no
+    /// tombstones exist.
     #[inline]
     fn find_in_level_by_probe<Q>(
         key_hash: u64,
@@ -605,6 +710,9 @@ where
         None
     }
 
+    /// Probe-bounded variant of `first_free_uniform`: scans at most
+    /// `max_groups` groups before giving up. Used by the elastic schedule
+    /// when `current_level` still has reserve headroom.
     fn first_free_limited(
         &self,
         key_hash: u64,
@@ -631,6 +739,9 @@ where
         None
     }
 
+    /// Linear scan over all groups in `level_idx` for the first FREE-or-
+    /// TOMBSTONE slot, following the level's double-hashing step. Returns
+    /// `None` only if the level is completely full of OCCUPIED bytes.
     fn first_free_uniform(&self, key_hash: u64, level_idx: usize) -> Option<usize> {
         let level = &self.levels[level_idx];
         if level.capacity() == 0 || level.len >= level.capacity() {
@@ -652,6 +763,9 @@ where
     }
 
     #[inline]
+    /// Compute `(group_start, group_step)` for double-hashing within
+    /// `level`. Mixes `key_hash` with the level's salt and rotates for the
+    /// step index so each level walks the group ring differently.
     fn group_probe_params(level: &Level<K, V>, key_hash: u64) -> (usize, usize) {
         let group_count = level.table.group_count();
         if group_count <= 1 {
@@ -673,6 +787,8 @@ where
         (group_start, step)
     }
 
+    /// After a remove, walk down `max_populated_level` past any now-empty
+    /// trailing levels so subsequent lookups don't probe them.
     fn shrink_max_populated_level(&mut self) {
         while self.max_populated_level > 0
             && self.levels[self.max_populated_level].len == 0
@@ -745,6 +861,9 @@ fn build_probe_budgets(
     budgets.into_boxed_slice()
 }
 
+/// Split `total_capacity` into geometrically halving level sizes.
+/// First level is `ceil(total / 2)`; each subsequent level halves until the
+/// remaining budget is exhausted. Returns `[]` for capacity 0.
 fn partition_levels(total_capacity: usize) -> Vec<usize> {
     if total_capacity == 0 {
         return Vec::new();
@@ -767,6 +886,10 @@ fn partition_levels(total_capacity: usize) -> Vec<usize> {
     sizes
 }
 
+/// Build the per-batch insertion quota that drives `current_batch_index`.
+/// Batch 0 fills level 0 to ~3/4 occupancy. Each subsequent batch tops up
+/// the previous level toward its reserve threshold while priming the next
+/// level. Total quota equals `max_insertions`.
 fn build_batch_plan(
     level_capacities: &[usize],
     reserve_fraction: f64,

@@ -13,7 +13,6 @@ pub(crate) const GROUP_SIZE: usize = 16;
 /// the first group is line-aligned and groups pack 4-per-line without splits.
 const CONTROL_ALIGN: usize = 64;
 
-#[derive(Debug)]
 pub(crate) struct Entry<K, V> {
     pub(crate) key: K,
     pub(crate) value: V,
@@ -118,7 +117,6 @@ impl<T> RawTable<T> {
         self.group_count
     }
 
-    /// Returns a raw pointer to the control bytes of group `group_idx`.
     #[inline]
     pub fn group_data_ptr(&self, group_idx: usize) -> *const u8 {
         unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) }

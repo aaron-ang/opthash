@@ -18,11 +18,11 @@ pub(crate) const BITMASK_STRIDE: u32 = 4;
 #[cfg(not(target_arch = "aarch64"))]
 pub(crate) const BITMASK_STRIDE: u32 = 1;
 
-#[derive(Clone, Copy, Debug)]
 pub(crate) struct BitMask(pub(crate) BitMaskWord);
 
 impl BitMask {
     #[inline]
+    /// True if any slot is set.
     pub(crate) fn any(self) -> bool {
         self.0 != 0
     }
@@ -60,6 +60,7 @@ impl Iterator for BitMask {
     type Item = usize;
 
     #[inline]
+    /// Yields the index of the lowest set slot, then clears it, until empty.
     fn next(&mut self) -> Option<usize> {
         if self.0 == 0 {
             return None;
