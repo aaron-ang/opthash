@@ -12,13 +12,9 @@ Rust bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `o
 
 ![Latency chart](../assets/benchmark-latency.svg)
 
-### Tail latency distributions (Rust)
+### Tail latency distribution (Rust)
 
-![Tail latency — get-hit](../assets/latency-tail-1000000-get-hit.svg)
-
-![Tail latency — get-miss](../assets/latency-tail-1000000-get-miss.svg)
-
-![Tail latency — insert](../assets/latency-tail-1000000-insert.svg)
+![Tail latency — get-hit @ 10M](../assets/latency-tail-10M-get-hit.svg)
 
 ### Python: opthash bindings vs builtin `dict`
 

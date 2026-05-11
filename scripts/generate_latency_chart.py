@@ -1,7 +1,7 @@
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullLocator
 
 from plot_common import (
@@ -23,33 +23,31 @@ OP_LABELS = {"get-hit": "Get Hit", "get-miss": "Get Miss", "insert": "Insert"}
 
 def plot_mean_latency_by_size(output_path: Path) -> None:
     """Criterion-mean per-lookup latency vs map size. Reads target/criterion/."""
-    sizes_found: list[str] = []
-    data: dict[str, list[float]] = {impl: [] for impl in IMPLEMENTATIONS}
+    labels: list[str] = []
+    means: dict[str, list[float]] = {impl: [] for impl in IMPLEMENTATIONS}
 
     for size_label in LATENCY_SIZES:
         group = f"get_hit_latency_{size_label}"
         try:
-            times = {
+            row = {
                 impl: load_criterion_mean_ns(group, impl) for impl in IMPLEMENTATIONS
             }
         except FileNotFoundError:
             continue
-        sizes_found.append(size_label)
-        for impl in IMPLEMENTATIONS:
-            data[impl].append(times[impl])
+        labels.append(size_label)
+        for impl, mean_ns in row.items():
+            means[impl].append(mean_ns)
 
-    if not sizes_found:
-        print("no criterion latency data found, skipping")
+    if not labels:
+        print("no Criterion latency data found, skipping")
         return
 
+    x = np.arange(len(labels))
     fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
-
-    x = np.arange(len(sizes_found))
-
     for impl in IMPLEMENTATIONS:
         ax.plot(
             x,
-            data[impl],
+            means[impl],
             marker=IMPL_MARKERS[impl],
             linewidth=2,
             markersize=7,
@@ -57,18 +55,16 @@ def plot_mean_latency_by_size(output_path: Path) -> None:
         )
 
     ax.set_xticks(x)
-    ax.set_xticklabels(sizes_found, fontsize=12)
+    ax.set_xticklabels(labels, fontsize=12)
     apply_axis_style(
         ax,
         title="Get-Hit Latency vs Map Size",
-        subtitle="Single get() call \u2014 lower is better",
+        subtitle="Mean per get() \u2014 lower is better",
         xlabel="Map size (entries)",
         ylabel="Latency per lookup (ns)",
         y_formatter=lambda v, _: f"{v:.0f}",
     )
-
     ax.legend(fontsize=12)
-
     save_svg(fig, output_path)
 
 
@@ -142,10 +138,9 @@ def plot_tail_cdf(size: int, op: str, output_path: Path) -> None:
     ax.yaxis.set_minor_locator(NullLocator())
     ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
 
-    size_label = f"{size:,}"
     apply_axis_style(
         ax,
-        title=f"Tail Latency \u2014 {OP_LABELS[op]} @ {size_label} entries",
+        title=f"Tail Latency \u2014 {OP_LABELS[op]} @ {_short_size(size)} entries",
         subtitle="Latency at percentile p (log axes) \u2014 lower is better",
         xlabel="Percentile",
         ylabel="Latency (ns, log scale)",
@@ -155,16 +150,22 @@ def plot_tail_cdf(size: int, op: str, output_path: Path) -> None:
     save_svg(fig, output_path)
 
 
-TAIL_CONFIGS: tuple[tuple[int, str], ...] = (
-    (1_000_000, "get-hit"),
-    (1_000_000, "get-miss"),
-    (1_000_000, "insert"),
-)
+TAIL_CONFIGS: tuple[tuple[int, str], ...] = ((10_000_000, "get-hit"),)
+
+
+def _short_size(size: int) -> str:
+    if size % 1_000_000 == 0:
+        return f"{size // 1_000_000}M"
+    if size % 1_000 == 0:
+        return f"{size // 1_000}K"
+    return str(size)
 
 
 def plot_all_tail_charts(assets_dir: Path) -> None:
     for size, op in TAIL_CONFIGS:
-        plot_tail_cdf(size, op, assets_dir / f"latency-tail-{size}-{op}.svg")
+        plot_tail_cdf(
+            size, op, assets_dir / f"latency-tail-{_short_size(size)}-{op}.svg"
+        )
 
 
 def main() -> None:

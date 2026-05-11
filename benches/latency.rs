@@ -7,31 +7,14 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use common::{
-    GOLDEN_RATIO_U64, VALUE_XOR_MIX, build_elastic_map, build_funnel_map, build_hashbrown_map,
-    build_std_map, key_at, make_pairs,
+    GOLDEN_RATIO_U64, build_elastic_map, build_funnel_map, build_hashbrown_map, build_std_map,
+    make_pairs,
 };
 use hdrhistogram::Histogram;
 
-#[derive(Clone, Copy)]
-enum Op {
-    GetHit,
-    GetMiss,
-    Insert,
-}
-
-impl Op {
-    fn name(self) -> &'static str {
-        match self {
-            Op::GetHit => "get-hit",
-            Op::GetMiss => "get-miss",
-            Op::Insert => "insert",
-        }
-    }
-}
-
 const MAPS: &[&str] = &["std", "hashbrown", "elastic", "funnel"];
-const OPS: &[Op] = &[Op::GetHit, Op::GetMiss, Op::Insert];
-const SIZES: &[usize] = &[10_000, 100_000, 1_000_000, 10_000_000];
+const SIZE: usize = 10_000_000;
+const OP: &str = "get-hit";
 const SAMPLES: usize = 1_000_000;
 const WARMUP: usize = 10_000;
 
@@ -109,101 +92,15 @@ fn run_get_hit(map: &str, size: usize, samples: usize, warmup: usize) -> Histogr
     }
 }
 
-fn run_get_miss(map: &str, size: usize, samples: usize, warmup: usize) -> Histogram<u64> {
-    let pairs = make_pairs(size);
-    let miss_keys: Vec<u64> = (0..size).map(|i| key_at(i + 100_000_000)).collect();
-    let n = miss_keys.len();
-    match map {
-        "std" => {
-            let m = build_std_map(&pairs);
-            measure(samples, warmup, |i| {
-                m.get(black_box(&miss_keys[scatter(i, n)])).copied()
-            })
-        }
-        "hashbrown" => {
-            let m = build_hashbrown_map(&pairs);
-            measure(samples, warmup, |i| {
-                m.get(black_box(&miss_keys[scatter(i, n)])).copied()
-            })
-        }
-        "elastic" => {
-            let m = build_elastic_map(&pairs);
-            measure(samples, warmup, |i| {
-                m.get(black_box(&miss_keys[scatter(i, n)])).copied()
-            })
-        }
-        "funnel" => {
-            let m = build_funnel_map(&pairs);
-            measure(samples, warmup, |i| {
-                m.get(black_box(&miss_keys[scatter(i, n)])).copied()
-            })
-        }
-        _ => unreachable!(),
-    }
-}
-
-fn run_insert(map: &str, size: usize, samples: usize, warmup: usize) -> Histogram<u64> {
-    let total = samples + warmup;
-    let prefill = size.saturating_sub(total);
-    let prefill_pairs = make_pairs(prefill);
-    let insert_keys: Vec<(u64, u64)> = (0..total)
-        .map(|i| {
-            let k = key_at(i + 200_000_000);
-            (k, k ^ VALUE_XOR_MIX)
-        })
-        .collect();
-    match map {
-        "std" => {
-            let mut m = build_std_map(&prefill_pairs);
-            measure(samples, warmup, |i| {
-                let (k, v) = insert_keys[i];
-                m.insert(k, v)
-            })
-        }
-        "hashbrown" => {
-            let mut m = build_hashbrown_map(&prefill_pairs);
-            measure(samples, warmup, |i| {
-                let (k, v) = insert_keys[i];
-                m.insert(k, v)
-            })
-        }
-        "elastic" => {
-            let mut m = build_elastic_map(&prefill_pairs);
-            measure(samples, warmup, |i| {
-                let (k, v) = insert_keys[i];
-                m.insert(k, v)
-            })
-        }
-        "funnel" => {
-            let mut m = build_funnel_map(&prefill_pairs);
-            measure(samples, warmup, |i| {
-                let (k, v) = insert_keys[i];
-                m.insert(k, v)
-            })
-        }
-        _ => unreachable!(),
-    }
-}
-
-fn run(map: &str, size: usize, op: Op, samples: usize, warmup: usize) -> Histogram<u64> {
-    match op {
-        Op::GetHit => run_get_hit(map, size, samples, warmup),
-        Op::GetMiss => run_get_miss(map, size, samples, warmup),
-        Op::Insert => run_insert(map, size, samples, warmup),
-    }
-}
-
 fn write_json(
     map: &str,
-    size: usize,
-    op: Op,
     h: &Histogram<u64>,
     overhead: u64,
     samples: usize,
 ) -> std::io::Result<PathBuf> {
-    let dir = PathBuf::from(format!("target/latency/{map}/{size}"));
+    let dir = PathBuf::from(format!("target/latency/{map}/{SIZE}"));
     fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.json", op.name()));
+    let path = dir.join(format!("{OP}.json"));
     let mut f = fs::File::create(&path)?;
 
     let p50 = h.value_at_quantile(0.50);
@@ -218,8 +115,8 @@ fn write_json(
 
     writeln!(f, "{{")?;
     writeln!(f, "  \"map\": \"{map}\",")?;
-    writeln!(f, "  \"size\": {size},")?;
-    writeln!(f, "  \"op\": \"{}\",", op.name())?;
+    writeln!(f, "  \"size\": {SIZE},")?;
+    writeln!(f, "  \"op\": \"{OP}\",")?;
     writeln!(f, "  \"samples\": {samples},")?;
     writeln!(f, "  \"clock_overhead_ns\": {overhead},")?;
     writeln!(f, "  \"percentiles\": {{")?;
@@ -268,28 +165,20 @@ fn main() {
     let overhead = measure_clock_overhead_ns();
     eprintln!("clock_overhead_ns ≈ {overhead}");
 
-    for &size in SIZES {
-        for &op in OPS {
-            for &m in MAPS {
-                eprint!(
-                    "running map={m} size={size} op={} samples={SAMPLES} ... ",
-                    op.name()
-                );
-                let t0 = Instant::now();
-                let h = run(m, size, op, SAMPLES, WARMUP);
-                let dur = t0.elapsed();
-                let path =
-                    write_json(m, size, op, &h, overhead, SAMPLES).expect("write latency json");
-                eprintln!(
-                    "done in {:.1}s | p50={}ns p99={}ns p999={}ns max={}ns → {}",
-                    dur.as_secs_f64(),
-                    h.value_at_quantile(0.50),
-                    h.value_at_quantile(0.99),
-                    h.value_at_quantile(0.999),
-                    h.max(),
-                    path.display()
-                );
-            }
-        }
+    for &m in MAPS {
+        eprint!("running map={m} size={SIZE} op={OP} samples={SAMPLES} ... ");
+        let t0 = Instant::now();
+        let h = run_get_hit(m, SIZE, SAMPLES, WARMUP);
+        let dur = t0.elapsed();
+        let path = write_json(m, &h, overhead, SAMPLES).expect("write latency json");
+        eprintln!(
+            "done in {:.1}s | p50={}ns p99={}ns p999={}ns max={}ns → {}",
+            dur.as_secs_f64(),
+            h.value_at_quantile(0.50),
+            h.value_at_quantile(0.99),
+            h.value_at_quantile(0.999),
+            h.max(),
+            path.display()
+        );
     }
 }
