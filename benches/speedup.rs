@@ -622,8 +622,8 @@ fn bench_multi_get_batch(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_get_many_mut(c: &mut Criterion) {
-    // Compares `get_many_mut::<_, N>` against N sequential `get_mut` calls.
+fn bench_get_disjoint_mut(c: &mut Criterion) {
+    // Compares `get_disjoint_mut::<_, N>` against N sequential `get_mut` calls.
     // Fixed N = 8, matching a typical batch-join hot path. Resolves N
     // disjoint keys per iteration, mutates each via the returned ref.
     const N: usize = 8;
@@ -641,7 +641,7 @@ fn bench_get_many_mut(c: &mut Criterion) {
         })
         .collect();
 
-    let mut group = c.benchmark_group("get_many_mut");
+    let mut group = c.benchmark_group("get_disjoint_mut");
     group.throughput(Throughput::Elements((key_tuples.len() * N) as u64));
 
     group.bench_function("elastic_naive_get_mut", |b| {
@@ -670,14 +670,14 @@ fn bench_get_many_mut(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("elastic_get_many_mut", |b| {
+    group.bench_function("elastic_get_disjoint_mut", |b| {
         let mut map = build_elastic_map(&pairs);
         b.iter(|| {
             for keys in &key_tuples {
                 let refs: [&u64; N] = [
                     &keys[0], &keys[1], &keys[2], &keys[3], &keys[4], &keys[5], &keys[6], &keys[7],
                 ];
-                if let Some(vs) = map.get_many_mut(refs) {
+                if let Some(vs) = map.get_disjoint_mut(refs) {
                     for v in vs {
                         *v = v.wrapping_add(1);
                     }
@@ -686,14 +686,14 @@ fn bench_get_many_mut(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("funnel_get_many_mut", |b| {
+    group.bench_function("funnel_get_disjoint_mut", |b| {
         let mut map = build_funnel_map(&pairs);
         b.iter(|| {
             for keys in &key_tuples {
                 let refs: [&u64; N] = [
                     &keys[0], &keys[1], &keys[2], &keys[3], &keys[4], &keys[5], &keys[6], &keys[7],
                 ];
-                if let Some(vs) = map.get_many_mut(refs) {
+                if let Some(vs) = map.get_disjoint_mut(refs) {
                     for v in vs {
                         *v = v.wrapping_add(1);
                     }
@@ -772,7 +772,7 @@ criterion_group!(
         bench_resize_heavy_throughput,
         bench_mixed_lookup_throughput,
         bench_multi_get_batch,
-        bench_get_many_mut,
+        bench_get_disjoint_mut,
         bench_get_hit_latency
 );
 criterion_main!(benches);

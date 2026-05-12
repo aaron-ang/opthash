@@ -479,7 +479,7 @@ where
 
     /// Returns `N` disjoint mutable references to the values for `keys`.
     ///
-    /// Matches the semantics of `std::collections::HashMap::get_many_mut`:
+    /// Matches the semantics of `std::collections::HashMap::get_disjoint_mut`:
     /// returns `None` if any key is missing, and panics if any two keys
     /// resolve to the same slot (alias safety). Probes run sequentially —
     /// mutable refs can only be materialized after every probe has resolved
@@ -490,7 +490,7 @@ where
     ///
     /// Panics if two input keys resolve to the same `(level, slot)` pair
     /// (i.e. they refer to the same entry).
-    pub fn get_many_mut<Q, const N: usize>(&mut self, keys: [&Q; N]) -> Option<[&mut V; N]>
+    pub fn get_disjoint_mut<Q, const N: usize>(&mut self, keys: [&Q; N]) -> Option<[&mut V; N]>
     where
         K: Borrow<Q> + Eq,
         Q: Hash + Eq + ?Sized,
@@ -509,7 +509,7 @@ where
             for j in (i + 1)..N {
                 assert!(
                     locations[i] != locations[j],
-                    "get_many_mut: duplicate keys resolve to the same entry",
+                    "get_disjoint_mut: duplicate keys resolve to the same entry",
                 );
             }
         }
@@ -1320,13 +1320,13 @@ mod tests {
     }
 
     #[test]
-    fn get_many_mut_returns_all_refs_on_hits() {
+    fn get_disjoint_mut_returns_all_refs_on_hits() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
         for i in 0..16 {
             map.insert(i, i * 10);
         }
 
-        let got = map.get_many_mut([&1, &3, &7, &15]).expect("all hits");
+        let got = map.get_disjoint_mut([&1, &3, &7, &15]).expect("all hits");
         assert_eq!(*got[0], 10);
         assert_eq!(*got[1], 30);
         assert_eq!(*got[2], 70);
@@ -1334,42 +1334,42 @@ mod tests {
     }
 
     #[test]
-    fn get_many_mut_returns_none_if_any_missing() {
+    fn get_disjoint_mut_returns_none_if_any_missing() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(32);
         for i in 0..8 {
             map.insert(i, i);
         }
 
-        assert!(map.get_many_mut([&0, &1, &99]).is_none());
+        assert!(map.get_disjoint_mut([&0, &1, &99]).is_none());
     }
 
     #[test]
     #[should_panic(expected = "duplicate keys")]
-    fn get_many_mut_panics_on_duplicate_keys() {
+    fn get_disjoint_mut_panics_on_duplicate_keys() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(32);
         map.insert(1, 100);
         map.insert(2, 200);
-        let _ = map.get_many_mut([&1, &1]);
+        let _ = map.get_disjoint_mut([&1, &1]);
     }
 
     #[test]
-    fn get_many_mut_zero_keys_is_some_empty() {
+    fn get_disjoint_mut_zero_keys_is_some_empty() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(16);
         map.insert(1, 1);
         let got: [&mut i32; 0] = map
-            .get_many_mut::<i32, 0>([])
+            .get_disjoint_mut::<i32, 0>([])
             .expect("zero-key returns Some");
         assert_eq!(got.len(), 0);
     }
 
     #[test]
-    fn get_many_mut_mutation_propagates() {
+    fn get_disjoint_mut_mutation_propagates() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(32);
         for i in 0..8 {
             map.insert(i, i);
         }
         {
-            let got = map.get_many_mut([&2, &5]).expect("hit");
+            let got = map.get_disjoint_mut([&2, &5]).expect("hit");
             *got[0] = 222;
             *got[1] = 555;
         }
