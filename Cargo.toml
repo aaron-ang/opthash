@@ -25,7 +25,14 @@ exclude = [
 crate-type = ["cdylib", "rlib"]
 
 [features]
-python = ["dep:pyo3"]
+# Per-slot 4-byte mini-hash sidecar. Drops fingerprint false-positive rate
+# from ~1/128 to ~1/2^32, gating expensive `K::eq` calls (e.g. Python
+# `HashedAny::eq` which crosses the GIL). Off by default — pure-Rust callers
+# with cheap-eq keys (`u64`, `i32`) don't pay the 4 B/slot memory tax or the
+# extra cache-line touch on every fingerprint match. Auto-enabled by the
+# `python` feature.
+mini-hash = []
+python = ["dep:pyo3", "mini-hash"]
 
 [dependencies]
 foldhash = "0.2"

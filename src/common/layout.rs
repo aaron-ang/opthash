@@ -13,7 +13,32 @@ pub(crate) const GROUP_SIZE: usize = 16;
 /// the first group is line-aligned and groups pack 4-per-line without splits.
 const CONTROL_ALIGN: usize = 64;
 
-/// Derive the per-slot 32-bit mini-hash from a full 64-bit key hash.
+// ---------------------------------------------------------------------------
+// Mini-hash sidecar — feature-gated
+// ---------------------------------------------------------------------------
+//
+// When `mini-hash` is enabled, every slot carries a 32-bit secondary hash
+// derived from the same full hash that produced its 7-bit control
+// fingerprint. After a SIMD fingerprint match, the mini-hash is consulted
+// before any `K::eq` call. This drops the fingerprint false-positive rate
+// from ~1/128 (7 bits) to ~1/2^32, which matters when `K::eq` is expensive
+// (Python `HashedAny::eq` crosses the GIL; an `Arc<str>` key chases two
+// pointers; etc.).
+//
+// When the feature is off, the sidecar slab is omitted from the layout (no
+// 4 B/slot memory tax), `MiniHash` collapses to `()`, and the gate is
+// erased from the lookup hot path via `mini_matches` returning `true`
+// unconditionally.
+
+/// Per-slot mini-hash type. `u32` when the `mini-hash` feature is on,
+/// otherwise a zero-size marker so callers don't need to `#[cfg]` every
+/// site that threads it through.
+#[cfg(feature = "mini-hash")]
+pub(crate) type MiniHash = u32;
+#[cfg(not(feature = "mini-hash"))]
+pub(crate) type MiniHash = ();
+
+/// Derive the per-slot mini-hash from a full 64-bit key hash.
 ///
 /// We take the low 32 bits. The 7-bit control fingerprint is the *top* 7
 /// bits (`hash >> 57`), so the two metadata channels are extracted from
@@ -24,32 +49,40 @@ const CONTROL_ALIGN: usize = 64;
 /// make the mini-hash low-quality. With `foldhash` (the default) this is
 /// fine; callers swapping in a custom `BuildHasher` should ensure it
 /// avalanches.
+#[cfg(feature = "mini-hash")]
 #[inline]
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn mini_hash(hash: u64) -> u32 {
+pub(crate) fn mini_hash(hash: u64) -> MiniHash {
     hash as u32
 }
+
+#[cfg(not(feature = "mini-hash"))]
+#[inline]
+#[must_use]
+#[allow(clippy::missing_const_for_fn)]
+pub(crate) fn mini_hash(_hash: u64) -> MiniHash {}
 
 pub(crate) struct Entry<K, V> {
     pub(crate) key: K,
     pub(crate) value: V,
 }
 
-/// A flat hash table: one allocation holds slots, control bytes, and a
-/// per-slot 32-bit mini-hash sidecar.
+/// A flat hash table: one allocation holds slots, control bytes, and (when
+/// the `mini-hash` feature is enabled) a per-slot 32-bit mini-hash sidecar.
 ///
 /// ```text
-/// [slots: capacity * sizeof(T)] [pad] [controls: group_count * 16 (64-aligned)] [pad] [mini_hashes: group_count * 16 * u32 (64-aligned)]
+/// mini-hash on:  [slots: capacity * sizeof(T)] [pad] [controls: group_count * 16 (64-aligned)] [pad] [mini-hashes: group_count * 16 * u32 (64-aligned)]
+/// mini-hash off: [slots: capacity * sizeof(T)] [pad] [controls: group_count * 16 (64-aligned)]
 /// ```
 ///
 /// `data_ptr` points to the start of the slots array; control bytes and
 /// mini-hashes live at fixed offsets, accessed via `ctrl_ptr()` /
-/// `mini_ptr()`. The mini-hash sidecar carries one `u32` per slot and is
-/// consulted after the SIMD fingerprint match, before any key compare. This
-/// drops the false-positive rate of the 7-bit fingerprint (~1/128) down to
-/// ~1/2^32, which matters when key equality is expensive (e.g. crossing the
-/// GIL for `HashedAny::eq`).
+/// `mini_ptr()`. The mini-hash sidecar (when present) carries one `u32`
+/// per slot and is consulted after the SIMD fingerprint match, before any
+/// key compare. This drops the false-positive rate of the 7-bit
+/// fingerprint (~1/128) down to ~1/2^32, which matters when key equality
+/// is expensive (e.g. crossing the GIL for `HashedAny::eq`).
 ///
 /// Note: the mini-hash for unoccupied slots (FREE or TOMBSTONE) is inert
 /// because the control-byte SIMD scan never matches those bytes, so callers
@@ -62,6 +95,7 @@ pub(crate) struct RawTable<T> {
     capacity: usize,
     group_count: usize,
     ctrl_offset: usize,
+    #[cfg(feature = "mini-hash")]
     mini_offset: usize,
     _marker: PhantomData<T>,
 }
@@ -84,7 +118,7 @@ impl<T> std::fmt::Debug for RawTable<T> {
 impl<T> Drop for RawTable<T> {
     fn drop(&mut self) {
         if self.capacity > 0 {
-            let (layout, _, _) = Self::unified_layout(self.capacity, self.group_count);
+            let layout = Self::unified_layout(self.capacity, self.group_count).0;
             unsafe { alloc::dealloc(self.data_ptr.as_ptr(), layout) };
         }
     }
@@ -111,6 +145,7 @@ impl<T> RawTable<T> {
                 capacity: 0,
                 group_count: 0,
                 ctrl_offset: 0,
+                #[cfg(feature = "mini-hash")]
                 mini_offset: 0,
                 _marker: PhantomData,
             };
@@ -118,7 +153,11 @@ impl<T> RawTable<T> {
 
         let padded_capacity = round_up_to_group(capacity);
         let group_count = padded_capacity / GROUP_SIZE;
-        let (layout, ctrl_offset, mini_offset) = Self::unified_layout(capacity, group_count);
+        let layout_info = Self::unified_layout(capacity, group_count);
+        let layout = layout_info.0;
+        let ctrl_offset = layout_info.1;
+        #[cfg(feature = "mini-hash")]
+        let mini_offset = layout_info.2;
 
         let raw = unsafe { alloc::alloc_zeroed(layout) };
         let data_ptr = NonNull::new(raw).unwrap_or_else(|| alloc::handle_alloc_error(layout));
@@ -128,12 +167,18 @@ impl<T> RawTable<T> {
             capacity,
             group_count,
             ctrl_offset,
+            #[cfg(feature = "mini-hash")]
             mini_offset,
             _marker: PhantomData,
         }
     }
 
-    /// Layout: `[slots (T-aligned)] [pad] [controls (64-aligned)] [pad] [mini-hashes (64-aligned)]`.
+    /// Layout:
+    /// - mini-hash on: `[slots] [pad] [controls (64-aligned)] [pad] [mini (64-aligned)]`
+    /// - mini-hash off: `[slots] [pad] [controls (64-aligned)]`
+    ///
+    /// Returns `(layout, ctrl_offset, mini_offset)`. `mini_offset` is `0`
+    /// when the feature is off.
     fn unified_layout(capacity: usize, group_count: usize) -> (Layout, usize, usize) {
         let slots_layout = Layout::array::<T>(capacity).expect("slots layout overflow");
         let controls_size = group_count
@@ -141,18 +186,26 @@ impl<T> RawTable<T> {
             .expect("controls layout overflow");
         let controls_layout = Layout::from_size_align(controls_size, CONTROL_ALIGN)
             .expect("controls layout overflow");
-        let mini_size = controls_size
-            .checked_mul(std::mem::size_of::<u32>())
-            .expect("mini-hash layout overflow");
-        let mini_layout =
-            Layout::from_size_align(mini_size, CONTROL_ALIGN).expect("mini-hash layout overflow");
         let (combined, ctrl_offset) = slots_layout
             .extend(controls_layout)
             .expect("layout extend overflow");
-        let (combined, mini_offset) = combined
-            .extend(mini_layout)
-            .expect("layout extend overflow");
-        (combined.pad_to_align(), ctrl_offset, mini_offset)
+
+        #[cfg(feature = "mini-hash")]
+        {
+            let mini_size = controls_size
+                .checked_mul(std::mem::size_of::<u32>())
+                .expect("mini-hash layout overflow");
+            let mini_layout = Layout::from_size_align(mini_size, CONTROL_ALIGN)
+                .expect("mini-hash layout overflow");
+            let (combined, mini_offset) = combined
+                .extend(mini_layout)
+                .expect("layout extend overflow");
+            (combined.pad_to_align(), ctrl_offset, mini_offset)
+        }
+        #[cfg(not(feature = "mini-hash"))]
+        {
+            (combined.pad_to_align(), ctrl_offset, 0)
+        }
     }
 
     #[inline]
@@ -165,6 +218,7 @@ impl<T> RawTable<T> {
         unsafe { self.data_ptr.as_ptr().add(self.ctrl_offset) }
     }
 
+    #[cfg(feature = "mini-hash")]
     #[inline]
     #[allow(clippy::cast_ptr_alignment)]
     fn mini_ptr(&self) -> *mut u32 {
@@ -181,6 +235,7 @@ impl<T> RawTable<T> {
     /// prior occupant). In release builds the read is safe because callers
     /// always reach this function via a SIMD fingerprint match on the
     /// control byte, which is mutually exclusive with FREE / TOMBSTONE.
+    #[cfg(feature = "mini-hash")]
     #[inline]
     pub(crate) fn mini_at(&self, idx: usize) -> u32 {
         debug_assert!(
@@ -193,9 +248,26 @@ impl<T> RawTable<T> {
     /// Write the per-slot mini-hash. `pub(crate)` so it stays an
     /// implementation detail of the table — callers go through
     /// `write_with_control`.
+    #[cfg(feature = "mini-hash")]
     #[inline]
     pub(crate) fn set_mini_hash(&mut self, idx: usize, mini: u32) {
         unsafe { *self.mini_ptr().add(idx) = mini };
+    }
+
+    /// Compare a candidate mini-hash against the slot's stored mini-hash.
+    /// Returns `true` unconditionally when the `mini-hash` feature is off
+    /// so the gate compiles out of the lookup hot path.
+    #[cfg(feature = "mini-hash")]
+    #[inline]
+    pub(crate) fn mini_matches(&self, idx: usize, key_mini: MiniHash) -> bool {
+        self.mini_at(idx) == key_mini
+    }
+
+    #[cfg(not(feature = "mini-hash"))]
+    #[inline]
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
+    pub(crate) fn mini_matches(&self, _idx: usize, _key_mini: MiniHash) -> bool {
+        true
     }
 
     #[inline]
@@ -223,11 +295,21 @@ impl<T> RawTable<T> {
         unsafe { self.slots_ptr().add(idx).write(value) };
     }
 
+    /// Write entry, control byte, and (when the feature is on) the mini-hash.
+    /// The `mini` argument is `()` when off — a zero-cost marker so callers
+    /// don't need to `#[cfg]` each site.
     #[inline]
-    pub fn write_with_control(&mut self, idx: usize, value: T, control: u8, mini: u32) {
+    pub fn write_with_control(&mut self, idx: usize, value: T, control: u8, mini: MiniHash) {
         self.write(idx, value);
         self.set_control(idx, control);
-        self.set_mini_hash(idx, mini);
+        #[cfg(feature = "mini-hash")]
+        {
+            self.set_mini_hash(idx, mini);
+        }
+        #[cfg(not(feature = "mini-hash"))]
+        {
+            let () = mini;
+        }
     }
 
     #[inline]

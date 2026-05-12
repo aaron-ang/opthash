@@ -7,7 +7,7 @@ use crate::common::simd::{ProbeOps, prefetch_read};
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
     control::{CTRL_EMPTY, ControlByte, ControlOps},
-    layout::{Entry, GROUP_SIZE, RawTable, mini_hash},
+    layout::{Entry, GROUP_SIZE, MiniHash, RawTable, mini_hash},
     math::{
         advance_wrapping_index, ceil_to_usize, fastmod_magic, fastmod_u32, floor_to_usize,
         level_salt, max_insertions, round_to_usize, round_up_to_group, sanitize_reserve_fraction,
@@ -793,7 +793,7 @@ where
         key: &Q,
         key_hash: u64,
         key_fingerprint: u8,
-        key_mini: u32,
+        key_mini: MiniHash,
     ) -> Result<SlotLocation, Option<SlotLocation>>
     where
         K: Borrow<Q>,
@@ -903,7 +903,7 @@ where
         key: K,
         value: V,
         key_fingerprint: u8,
-        key_mini: u32,
+        key_mini: MiniHash,
     ) {
         match location {
             SlotLocation::Level {
@@ -1022,7 +1022,7 @@ where
     fn find_in_level_bucket<Q>(
         key_hash: u64,
         key_fingerprint: u8,
-        key_mini: u32,
+        key_mini: MiniHash,
         key: &Q,
         level: &BucketLevel<K, V>,
     ) -> LookupStep
@@ -1046,7 +1046,7 @@ where
             .truncate_to(level.bucket_size)
         {
             let slot_idx = bucket_range.start + relative_idx;
-            if level.table.mini_at(slot_idx) != key_mini {
+            if !level.table.mini_matches(slot_idx, key_mini) {
                 continue;
             }
             let entry = unsafe { level.table.get_ref(slot_idx) };
@@ -1073,7 +1073,7 @@ where
     fn find_in_level_bucket_with_candidate<Q>(
         key_hash: u64,
         key_fingerprint: u8,
-        key_mini: u32,
+        key_mini: MiniHash,
         key: &Q,
         level: &BucketLevel<K, V>,
     ) -> (LookupStep, Option<usize>)
@@ -1101,7 +1101,7 @@ where
             .truncate_to(level.bucket_size)
         {
             let slot_idx = bucket_range.start + relative_idx;
-            if level.table.mini_at(slot_idx) != key_mini {
+            if !level.table.mini_matches(slot_idx, key_mini) {
                 continue;
             }
             let entry = unsafe { level.table.get_ref(slot_idx) };
@@ -1146,7 +1146,7 @@ where
         &self,
         key_hash: u64,
         key_fingerprint: u8,
-        key_mini: u32,
+        key_mini: MiniHash,
         key: &Q,
     ) -> LookupStep
     where
@@ -1168,7 +1168,7 @@ where
             if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
                 for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
                     let slot_idx = group_idx * GROUP_SIZE + relative_idx;
-                    if primary.table.mini_at(slot_idx) != key_mini {
+                    if !primary.table.mini_matches(slot_idx, key_mini) {
                         continue;
                     }
                     let entry = unsafe { primary.table.get_ref(slot_idx) };
@@ -1198,7 +1198,7 @@ where
         &self,
         key_hash: u64,
         key_fingerprint: u8,
-        key_mini: u32,
+        key_mini: MiniHash,
         key: &Q,
     ) -> (LookupStep, Option<usize>)
     where
@@ -1231,7 +1231,7 @@ where
             if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
                 for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
                     let slot_idx = group_idx * GROUP_SIZE + relative_idx;
-                    if primary.table.mini_at(slot_idx) != key_mini {
+                    if !primary.table.mini_matches(slot_idx, key_mini) {
                         continue;
                     }
                     let entry = unsafe { primary.table.get_ref(slot_idx) };
@@ -1261,7 +1261,7 @@ where
         &self,
         key_hash: u64,
         key_fingerprint: u8,
-        key_mini: u32,
+        key_mini: MiniHash,
         key: &Q,
     ) -> Option<usize>
     where
@@ -1297,7 +1297,7 @@ where
                 match_offset,
             ) {
                 let slot_idx = range.start + relative_idx;
-                if fallback.table.mini_at(slot_idx) == key_mini {
+                if fallback.table.mini_matches(slot_idx, key_mini) {
                     let entry = unsafe { fallback.table.get_ref(slot_idx) };
                     if entry.key.borrow() == key {
                         return Some(slot_idx);
@@ -1316,7 +1316,7 @@ where
         &self,
         key_hash: u64,
         key_fingerprint: u8,
-        key_mini: u32,
+        key_mini: MiniHash,
         key: &Q,
     ) -> (Option<usize>, Option<usize>)
     where

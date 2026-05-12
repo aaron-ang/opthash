@@ -7,7 +7,7 @@ use crate::common::simd::ProbeOps;
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
     control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps},
-    layout::{Entry, GROUP_SIZE, RawTable, mini_hash},
+    layout::{Entry, GROUP_SIZE, MiniHash, RawTable, mini_hash},
     math::{
         advance_wrapping_index, ceil_three_quarters, fastmod_magic, fastmod_u32,
         floor_half_reserve_slots, level_salt, max_insertions, sanitize_reserve_fraction,
@@ -670,7 +670,7 @@ where
     fn find_in_level_by_probe<Q>(
         key_hash: u64,
         key_fingerprint: u8,
-        key_mini: u32,
+        key_mini: MiniHash,
         key: &Q,
         level: &Level<K, V>,
     ) -> Option<usize>
@@ -691,7 +691,7 @@ where
             let match_mask = level.table.group_match_mask(group_idx, key_fingerprint);
             for relative_idx in match_mask {
                 let slot_idx = group_idx * GROUP_SIZE + relative_idx;
-                if level.table.mini_at(slot_idx) != key_mini {
+                if !level.table.mini_matches(slot_idx, key_mini) {
                     continue;
                 }
                 let entry = unsafe { level.table.get_ref(slot_idx) };
