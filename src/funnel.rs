@@ -7,7 +7,7 @@ use crate::common::simd::{ProbeOps, prefetch_read};
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
     control::{CTRL_EMPTY, ControlByte, ControlOps},
-    layout::{Entry, GROUP_SIZE, RawTable, mini_hash_from_full},
+    layout::{Entry, GROUP_SIZE, RawTable, mini_hash},
     math::{
         advance_wrapping_index, ceil_to_usize, fastmod_magic, fastmod_u32, floor_to_usize,
         level_salt, max_insertions, round_to_usize, round_up_to_group, sanitize_reserve_fraction,
@@ -452,7 +452,7 @@ where
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let key_hash = self.hash_key(&key);
         let key_fingerprint = ControlOps::control_fingerprint(key_hash);
-        let key_mini = mini_hash_from_full(key_hash);
+        let key_mini = mini_hash(key_hash);
 
         let level_candidate =
             match self.find_in_levels_with_candidate(&key, key_hash, key_fingerprint, key_mini) {
@@ -856,7 +856,7 @@ where
     fn insert_new_entry_unchecked(&mut self, key: K, value: V) {
         let key_hash = self.hash_key(&key);
         let key_fingerprint = ControlOps::control_fingerprint(key_hash);
-        let key_mini = mini_hash_from_full(key_hash);
+        let key_mini = mini_hash(key_hash);
         let location = self
             .choose_slot_for_new_key(key_hash)
             .expect("resized funnel map should have free slot");
@@ -891,7 +891,7 @@ where
             }
         };
 
-        let key_mini = mini_hash_from_full(key_hash);
+        let key_mini = mini_hash(key_hash);
         self.place_new_entry(final_location, key, value, key_fingerprint, key_mini);
         None
     }
@@ -1046,7 +1046,7 @@ where
             .truncate_to(level.bucket_size)
         {
             let slot_idx = bucket_range.start + relative_idx;
-            if level.table.mini_hash_at(slot_idx) != key_mini {
+            if level.table.mini_at(slot_idx) != key_mini {
                 continue;
             }
             let entry = unsafe { level.table.get_ref(slot_idx) };
@@ -1101,7 +1101,7 @@ where
             .truncate_to(level.bucket_size)
         {
             let slot_idx = bucket_range.start + relative_idx;
-            if level.table.mini_hash_at(slot_idx) != key_mini {
+            if level.table.mini_at(slot_idx) != key_mini {
                 continue;
             }
             let entry = unsafe { level.table.get_ref(slot_idx) };
@@ -1168,7 +1168,7 @@ where
             if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
                 for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
                     let slot_idx = group_idx * GROUP_SIZE + relative_idx;
-                    if primary.table.mini_hash_at(slot_idx) != key_mini {
+                    if primary.table.mini_at(slot_idx) != key_mini {
                         continue;
                     }
                     let entry = unsafe { primary.table.get_ref(slot_idx) };
@@ -1231,7 +1231,7 @@ where
             if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
                 for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
                     let slot_idx = group_idx * GROUP_SIZE + relative_idx;
-                    if primary.table.mini_hash_at(slot_idx) != key_mini {
+                    if primary.table.mini_at(slot_idx) != key_mini {
                         continue;
                     }
                     let entry = unsafe { primary.table.get_ref(slot_idx) };
@@ -1297,7 +1297,7 @@ where
                 match_offset,
             ) {
                 let slot_idx = range.start + relative_idx;
-                if fallback.table.mini_hash_at(slot_idx) == key_mini {
+                if fallback.table.mini_at(slot_idx) == key_mini {
                     let entry = unsafe { fallback.table.get_ref(slot_idx) };
                     if entry.key.borrow() == key {
                         return Some(slot_idx);
@@ -1370,7 +1370,7 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        let key_mini = mini_hash_from_full(key_hash);
+        let key_mini = mini_hash(key_hash);
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
             match Self::find_in_level_bucket(key_hash, key_fingerprint, key_mini, key, level) {

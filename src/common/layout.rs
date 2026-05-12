@@ -13,14 +13,21 @@ pub(crate) const GROUP_SIZE: usize = 16;
 /// the first group is line-aligned and groups pack 4-per-line without splits.
 const CONTROL_ALIGN: usize = 64;
 
-/// Derive the 32-bit sidecar value from a full 64-bit hash. Uses bits
-/// disjoint from the 7-bit control fingerprint (`hash >> 57`) so the two
-/// metadata channels collide independently.
+/// Derive the per-slot 32-bit mini-hash from a full 64-bit key hash.
+///
+/// We take the low 32 bits. The 7-bit control fingerprint is the *top* 7
+/// bits (`hash >> 57`), so the two metadata channels are extracted from
+/// disjoint bit positions of the same 64-bit word. Independence between
+/// fingerprint and mini-hash therefore relies on the hasher's avalanche
+/// (every output bit depends on every input bit) rather than a structural
+/// argument: a hasher that concentrates entropy in the high bits would
+/// make the mini-hash low-quality. With `foldhash` (the default) this is
+/// fine; callers swapping in a custom `BuildHasher` should ensure it
+/// avalanches.
 #[inline]
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn mini_hash_from_full(hash: u64) -> u32 {
-    // Take the low 32 bits — fully disjoint from the fingerprint's top 7 bits.
+pub(crate) fn mini_hash(hash: u64) -> u32 {
     hash as u32
 }
 
@@ -43,6 +50,13 @@ pub(crate) struct Entry<K, V> {
 /// drops the false-positive rate of the 7-bit fingerprint (~1/128) down to
 /// ~1/2^32, which matters when key equality is expensive (e.g. crossing the
 /// GIL for `HashedAny::eq`).
+///
+/// Note: the mini-hash for unoccupied slots (FREE or TOMBSTONE) is inert
+/// because the control-byte SIMD scan never matches those bytes, so callers
+/// never reach the mini-hash gate on them. Stale values left behind by
+/// `mark_tombstone` are therefore harmless; `mini_at` `debug_assert!`s the
+/// slot is occupied to catch any future caller that tries to short-circuit
+/// tombstone reuse on the sidecar.
 pub(crate) struct RawTable<T> {
     data_ptr: NonNull<u8>,
     capacity: usize,
@@ -159,15 +173,28 @@ impl<T> RawTable<T> {
         unsafe { self.data_ptr.as_ptr().add(self.mini_offset).cast::<u32>() }
     }
 
-    /// Per-slot 32-bit secondary hash used to short-circuit key compares after
-    /// a fingerprint match.
+    /// Per-slot 32-bit secondary hash used to short-circuit key compares
+    /// after a fingerprint match.
+    ///
+    /// Panics in debug builds if `idx` does not refer to an OCCUPIED slot
+    /// (free / tombstone slots may carry stale mini-hash values left by a
+    /// prior occupant). In release builds the read is safe because callers
+    /// always reach this function via a SIMD fingerprint match on the
+    /// control byte, which is mutually exclusive with FREE / TOMBSTONE.
     #[inline]
-    pub fn mini_hash_at(&self, idx: usize) -> u32 {
+    pub(crate) fn mini_at(&self, idx: usize) -> u32 {
+        debug_assert!(
+            super::control::ControlByte::is_occupied(&self.control_at(idx)),
+            "mini_at called on non-occupied slot {idx} (stale mini-hash)"
+        );
         unsafe { *self.mini_ptr().add(idx) }
     }
 
+    /// Write the per-slot mini-hash. `pub(crate)` so it stays an
+    /// implementation detail of the table — callers go through
+    /// `write_with_control`.
     #[inline]
-    pub fn set_mini_hash(&mut self, idx: usize, mini: u32) {
+    pub(crate) fn set_mini_hash(&mut self, idx: usize, mini: u32) {
         unsafe { *self.mini_ptr().add(idx) = mini };
     }
 
@@ -210,6 +237,9 @@ impl<T> RawTable<T> {
 
     #[inline]
     pub fn mark_tombstone(&mut self, idx: usize) {
+        // Note: the stored mini-hash is left stale. Inert because the
+        // control-byte SIMD scan never matches tombstones, so the gate is
+        // unreachable for this slot until it's reused.
         self.set_control(idx, super::control::CTRL_TOMBSTONE);
     }
 
