@@ -201,12 +201,20 @@ impl HashedAny {
         ((self.tagged.as_ptr() as usize) & !KIND_MASK) as *mut ffi::PyObject
     }
 
-    /// Decoded `HashKind` tag.
+    /// Decoded `HashKind` tag. Lists every `HashKind` discriminant
+    /// explicitly so adding a new variant requires an update here
+    /// instead of silently aliasing to `Other` via a catch-all.
+    /// Hot path — called twice per `PartialEq::eq` cross-type check.
     #[inline]
     fn kind(&self) -> HashKind {
         match (self.tagged.as_ptr() as usize) & KIND_MASK {
-            1 => HashKind::Str,
-            _ => HashKind::Other,
+            x if x == HashKind::Other as usize => HashKind::Other,
+            x if x == HashKind::Str as usize => HashKind::Str,
+            // SAFETY: `KIND_MASK == 0b1`, so the masked value is always 0
+            // or 1 — both arms above cover it. A future `HashKind` variant
+            // whose discriminant overlaps `KIND_MASK` must add its own arm
+            // (or widen the mask, which would re-invalidate this comment).
+            _ => unsafe { std::hint::unreachable_unchecked() },
         }
     }
 
