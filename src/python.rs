@@ -3,7 +3,9 @@
 
 use std::hash::{Hash, Hasher};
 use std::mem::ManuallyDrop;
+use std::ptr::NonNull;
 
+use pyo3::Borrowed;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -63,54 +65,158 @@ fn build_funnel_options(
 
 /// Tag for the cached object's Python type, used to short-circuit `__eq__`
 /// dispatch in `HashedAny::eq` for the str-vs-str common case.
+///
+/// Encoded as the low 3 bits of `HashedAny::tagged`. `CPython` objects are
+/// at least 8-byte aligned (`PyObject` starts with `Py_ssize_t ob_refcnt`),
+/// so the low 3 bits of a real `PyObject*` are always zero and free for us.
 #[derive(Clone, Copy, PartialEq)]
-#[repr(u8)]
+#[repr(usize)]
 enum HashKind {
-    Str,
-    Other,
+    Other = 0,
+    Str = 1,
 }
+
+/// Mask covering the bits where `HashKind` lives in `HashedAny::tagged`.
+const KIND_MASK: usize = 0b111;
 
 /// Owning hashable wrapper around a `Py<PyAny>` used as a map key.
 ///
 /// Caches the hash (computed once via Python `__hash__`) so `Hash` becomes a
-/// `write_isize` instead of a Python call. Stores `HashKind` so `PartialEq`
-/// can take the str-bytes fast path without re-detecting the type.
+/// `write_isize` instead of a Python call. The `HashKind` tag is packed into
+/// the low bits of the object pointer so `PartialEq` can take the str-bytes
+/// fast path without re-detecting the type — and the struct fits in 16 bytes
+/// rather than 24 (8B pointer + 8B hash, no separate kind byte + padding).
 struct HashedAny {
-    /// Underlying Python object. Owns one refcount.
-    obj: Py<PyAny>,
+    /// Object pointer with `HashKind` tag in the low 3 bits.
+    ///
+    /// Holds one owned reference to the underlying `PyObject` — `Drop` calls
+    /// `Py_DECREF` on the masked pointer. The tagged value is non-null
+    /// because a valid `PyObject*` is non-null and the tag bits are also
+    /// permitted to be zero (`HashKind::Other = 0`).
+    tagged: NonNull<ffi::PyObject>,
     /// Cached `__hash__` result.
     hash: isize,
-    /// Python type tag for the str-bytes equality fast path.
-    kind: HashKind,
 }
 
+// Safety: `HashedAny` owns a refcount on the underlying `PyObject`, mirroring
+// `Py<PyAny>`. The pointer is only dereferenced under the GIL.
+unsafe impl Send for HashedAny {}
+unsafe impl Sync for HashedAny {}
+
+// Compile-time check that the tag-packing trick achieves the 16-byte goal:
+// {NonNull<PyObject> = 8B} + {isize = 8B} with no padding. The whole point
+// of packing `HashKind` into the pointer's low bits is this size reduction
+// (from 24B with a separate `kind` byte + 7B padding).
+const _: () = assert!(std::mem::size_of::<HashedAny>() == 16);
+
 impl HashedAny {
-    /// Build by computing `__hash__` once and bumping the object's refcount
-    /// (via `clone().unbind()`). Use for inserts that need to keep the key.
-    fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let hash = ob.hash()?;
-        let kind = unsafe {
+    /// Pack a raw `PyObject*` together with its `HashKind` into a tagged
+    /// `NonNull`. The caller is responsible for the refcount being correct —
+    /// this routine performs no `Py_INCREF` / `Py_DECREF`.
+    ///
+    /// # Safety
+    /// `obj` must be non-null, and its low 3 bits must be zero (which `CPython`
+    /// guarantees for any real `PyObject*`).
+    #[inline]
+    unsafe fn pack(obj: *mut ffi::PyObject, kind: HashKind) -> NonNull<ffi::PyObject> {
+        debug_assert!(!obj.is_null());
+        debug_assert_eq!(obj as usize & KIND_MASK, 0);
+        // SAFETY: caller guarantees `obj` is non-null. ORing in the tag bits
+        // can only set bits, so the result is also non-null.
+        unsafe { NonNull::new_unchecked(((obj as usize) | (kind as usize)) as *mut ffi::PyObject) }
+    }
+
+    /// Detect the kind of `ob` for the str-bytes equality fast path.
+    #[inline]
+    fn detect_kind(ob: &Bound<'_, PyAny>) -> HashKind {
+        // SAFETY: `Bound` always holds a valid `PyObject*`.
+        unsafe {
             if ffi::Py_TYPE(ob.as_ptr()) == &raw mut ffi::PyUnicode_Type {
                 HashKind::Str
             } else {
                 HashKind::Other
             }
-        };
-        Ok(Self {
-            obj: ob.clone().unbind(),
-            hash,
-            kind,
-        })
+        }
+    }
+
+    /// Build by computing `__hash__` once and bumping the object's refcount
+    /// (the `clone()` on `Bound` is the `Py_INCREF`; we then steal that
+    /// strong reference into our tagged slot). Use for inserts that need to
+    /// keep the key.
+    fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let hash = ob.hash()?;
+        let kind = Self::detect_kind(ob);
+        // `clone()` bumps the refcount; `unbind()` converts `Bound -> Py`
+        // without touching the count. We then forget the `Py` (it would
+        // otherwise DECREF on drop) and take ownership of the raw pointer.
+        let owned: Py<PyAny> = ob.clone().unbind();
+        let raw = owned.as_ptr();
+        std::mem::forget(owned);
+        // SAFETY: `raw` came from a live `Py<PyAny>`, so it's a non-null
+        // PyObject pointer with zero low bits.
+        let tagged = unsafe { Self::pack(raw, kind) };
+        Ok(Self { tagged, hash })
     }
 
     /// Refcount-bumping clone. Reuses the cached hash and kind so only the
-    /// `Py<PyAny>` clone-ref is paid.
-    fn clone_with_py(&self, py: Python<'_>) -> Self {
+    /// `Py_INCREF` is paid.
+    fn clone_with_py(&self, _py: Python<'_>) -> Self {
+        // SAFETY: we hold one strong reference to `obj_ptr()`, so it remains
+        // valid for `Py_INCREF`. Calling under GIL (`_py`) is required.
+        unsafe { ffi::Py_INCREF(self.obj_ptr()) };
         Self {
-            obj: self.obj.clone_ref(py),
+            tagged: self.tagged,
             hash: self.hash,
-            kind: self.kind,
         }
+    }
+
+    /// Masked object pointer (tag bits stripped).
+    #[inline]
+    fn obj_ptr(&self) -> *mut ffi::PyObject {
+        ((self.tagged.as_ptr() as usize) & !KIND_MASK) as *mut ffi::PyObject
+    }
+
+    /// Decoded `HashKind` tag.
+    #[inline]
+    fn kind(&self) -> HashKind {
+        match (self.tagged.as_ptr() as usize) & KIND_MASK {
+            1 => HashKind::Str,
+            _ => HashKind::Other,
+        }
+    }
+
+    /// Borrow the underlying object as a `Borrowed<PyAny>` without bumping
+    /// refcount. Derefs to `&Bound<'py, PyAny>` for method calls.
+    #[inline]
+    fn obj_borrowed<'a, 'py>(&'a self, py: Python<'py>) -> Borrowed<'a, 'py, PyAny> {
+        // SAFETY: `obj_ptr()` returns the live, masked PyObject pointer we
+        // own a strong reference to. The borrow lifetime `'a` is tied to
+        // `&self`, so the pointer can't outlive our refcount.
+        unsafe { Borrowed::from_ptr(py, self.obj_ptr()) }
+    }
+
+    /// Return a fresh owned `Py<PyAny>` (bumps refcount).
+    #[inline]
+    fn obj_clone_ref(&self, py: Python<'_>) -> Py<PyAny> {
+        // SAFETY: we hold a strong reference, so the borrowed pointer is
+        // valid. `to_owned()` bumps the refcount, yielding a second valid
+        // strong reference packaged as `Bound`, which `unbind()` converts
+        // to a `Py` without further refcount changes.
+        unsafe { Borrowed::from_ptr(py, self.obj_ptr()) }
+            .to_owned()
+            .unbind()
+    }
+}
+
+impl Drop for HashedAny {
+    fn drop(&mut self) {
+        // CPython requires the GIL for refcount decrements (outside of the
+        // free-threaded build, where this is still safe). PyO3 attaches a
+        // GIL guard internally for `Py<T>::drop`; we do the same dance.
+        Python::attach(|_py| {
+            // SAFETY: we own one strong reference to the masked pointer.
+            unsafe { ffi::Py_DECREF(self.obj_ptr()) };
+        });
     }
 }
 
@@ -128,19 +234,15 @@ struct ProbeKey {
 impl ProbeKey {
     /// # Safety
     /// Caller must ensure `ob` outlives the returned `ProbeKey`. The probe
-    /// holds a non-owning copy of the underlying `PyObject` pointer.
+    /// holds a non-owning copy of the underlying `PyObject` pointer (with
+    /// the kind tag packed into the low bits, same as a normal `HashedAny`).
     fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let hash = ob.hash()?;
-        let kind = unsafe {
-            if ffi::Py_TYPE(ob.as_ptr()) == &raw mut ffi::PyUnicode_Type {
-                HashKind::Str
-            } else {
-                HashKind::Other
-            }
-        };
-        let obj = unsafe { std::ptr::read(ob.as_unbound()) };
+        let kind = HashedAny::detect_kind(ob);
+        // SAFETY: `ob.as_ptr()` is a valid, properly-aligned `PyObject*`.
+        let tagged = unsafe { HashedAny::pack(ob.as_ptr(), kind) };
         Ok(Self {
-            inner: ManuallyDrop::new(HashedAny { obj, hash, kind }),
+            inner: ManuallyDrop::new(HashedAny { tagged, hash }),
         })
     }
 
@@ -164,21 +266,23 @@ impl PartialEq for HashedAny {
         if self.hash != other.hash {
             return false;
         }
-        if self.obj.as_ptr() == other.obj.as_ptr() {
+        if self.obj_ptr() == other.obj_ptr() {
             return true;
         }
         Python::attach(|py| {
             // Direct UTF-8 compare bypasses PyObject_RichCompareBool dispatch.
-            if self.kind == HashKind::Str
-                && other.kind == HashKind::Str
-                && let Ok(sa) = self.obj.bind(py).cast::<PyString>()
-                && let Ok(sb) = other.obj.bind(py).cast::<PyString>()
+            if self.kind() == HashKind::Str
+                && other.kind() == HashKind::Str
+                && let Ok(sa) = self.obj_borrowed(py).cast::<PyString>()
+                && let Ok(sb) = other.obj_borrowed(py).cast::<PyString>()
                 && let Ok(x) = sa.to_str()
                 && let Ok(y) = sb.to_str()
             {
                 return x == y;
             }
-            self.obj.bind(py).eq(other.obj.bind(py)).unwrap_or(false)
+            self.obj_borrowed(py)
+                .eq(other.obj_borrowed(py))
+                .unwrap_or(false)
         })
     }
 }
@@ -375,7 +479,7 @@ macro_rules! define_map_classes {
             fn __iter__(slf: Bound<'_, Self>) -> $KeyIter {
                 let py = slf.py();
                 let m = slf.borrow();
-                let snapshot = m.inner.iter().map(|(k, _)| k.obj.clone_ref(py)).collect();
+                let snapshot = m.inner.iter().map(|(k, _)| k.obj_clone_ref(py)).collect();
                 let expected_gen = m.generation;
                 drop(m);
                 $KeyIter {
@@ -499,7 +603,7 @@ macro_rules! define_map_classes {
                     let (k, _) = self.inner.iter().next().expect("len > 0");
                     k.clone_with_py(py)
                 };
-                let key_obj = probe.obj.clone_ref(py);
+                let key_obj = probe.obj_clone_ref(py);
                 let value = self.inner.remove(&probe).expect("key from iter must exist");
                 self.bump();
                 PyTuple::new(py, [key_obj, value])
@@ -557,7 +661,7 @@ macro_rules! define_map_classes {
                         return false;
                     }
                     for (k, v) in &self.inner {
-                        let key_b = k.obj.bind(py);
+                        let key_b = k.obj_borrowed(py);
                         match d.get_item(key_b) {
                             Ok(Some(other_v)) => {
                                 if !v.bind(py).eq(&other_v).unwrap_or(false) {
@@ -579,7 +683,7 @@ macro_rules! define_map_classes {
                     return false;
                 }
                 for (k, v) in &self.inner {
-                    let key_b = k.obj.bind(py);
+                    let key_b = k.obj_borrowed(py);
                     let Ok(other_v) = other.get_item(key_b) else {
                         return false;
                     };
@@ -640,7 +744,7 @@ macro_rules! define_map_classes {
         impl $KeysView {
             fn __iter__(&self, py: Python<'_>) -> $KeyIter {
                 let m = self.map.borrow(py);
-                let snapshot = m.inner.iter().map(|(k, _)| k.obj.clone_ref(py)).collect();
+                let snapshot = m.inner.iter().map(|(k, _)| k.obj_clone_ref(py)).collect();
                 $KeyIter {
                     map: self.map.clone_ref(py),
                     snapshot,
@@ -661,7 +765,7 @@ macro_rules! define_map_classes {
                 let parts: PyResult<Vec<String>> = m
                     .inner
                     .iter()
-                    .map(|(k, _)| Ok(k.obj.bind(py).repr()?.to_string()))
+                    .map(|(k, _)| Ok(k.obj_borrowed(py).repr()?.to_string()))
                     .collect();
                 Ok(format!(
                     concat!($keys_view_name, "([{}])"),
@@ -677,7 +781,7 @@ macro_rules! define_map_classes {
                     return false;
                 }
                 for (k, _) in &m.inner {
-                    if !other.contains(k.obj.bind(py)).unwrap_or(false) {
+                    if !other.contains(k.obj_borrowed(py)).unwrap_or(false) {
                         return false;
                     }
                 }
@@ -687,7 +791,7 @@ macro_rules! define_map_classes {
                 let result = PySet::empty(py)?;
                 let m = self.map.borrow(py);
                 for (k, _) in &m.inner {
-                    let key_b = k.obj.bind(py);
+                    let key_b = k.obj_borrowed(py);
                     if other.contains(key_b)? {
                         result.add(key_b)?;
                     }
@@ -699,7 +803,7 @@ macro_rules! define_map_classes {
                 {
                     let m = self.map.borrow(py);
                     for (k, _) in &m.inner {
-                        result.add(k.obj.bind(py))?;
+                        result.add(k.obj_borrowed(py))?;
                     }
                 }
                 for item in other.try_iter()? {
@@ -711,7 +815,7 @@ macro_rules! define_map_classes {
                 let result = PySet::empty(py)?;
                 let m = self.map.borrow(py);
                 for (k, _) in &m.inner {
-                    let key_b = k.obj.bind(py);
+                    let key_b = k.obj_borrowed(py);
                     if !other.contains(key_b)? {
                         result.add(key_b)?;
                     }
@@ -723,7 +827,7 @@ macro_rules! define_map_classes {
                 {
                     let m = self.map.borrow(py);
                     for (k, _) in &m.inner {
-                        let key_b = k.obj.bind(py);
+                        let key_b = k.obj_borrowed(py);
                         if !other.contains(key_b)? {
                             result.add(key_b)?;
                         }
@@ -800,7 +904,7 @@ macro_rules! define_map_classes {
                     .inner
                     .iter()
                     .map(|(k, v)| {
-                        let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
+                        let tup = PyTuple::new(py, [k.obj_clone_ref(py), v.clone_ref(py)])?;
                         Ok(tup.into_any().unbind())
                     })
                     .collect();
@@ -836,7 +940,7 @@ macro_rules! define_map_classes {
                     .inner
                     .iter()
                     .map(|(k, v)| {
-                        let kr = k.obj.bind(py).repr()?.to_string();
+                        let kr = k.obj_borrowed(py).repr()?.to_string();
                         let vr = v.bind(py).repr()?.to_string();
                         Ok(format!("({kr}, {vr})"))
                     })
@@ -855,7 +959,7 @@ macro_rules! define_map_classes {
                     return false;
                 }
                 for (k, v) in &m.inner {
-                    let Ok(tup) = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)]) else {
+                    let Ok(tup) = PyTuple::new(py, [k.obj_clone_ref(py), v.clone_ref(py)]) else {
                         return false;
                     };
                     if !other.contains(&tup).unwrap_or(false) {
@@ -868,7 +972,7 @@ macro_rules! define_map_classes {
                 let result = PySet::empty(py)?;
                 let m = self.map.borrow(py);
                 for (k, v) in &m.inner {
-                    let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
+                    let tup = PyTuple::new(py, [k.obj_clone_ref(py), v.clone_ref(py)])?;
                     if other.contains(&tup)? {
                         result.add(tup)?;
                     }
@@ -880,7 +984,7 @@ macro_rules! define_map_classes {
                 {
                     let m = self.map.borrow(py);
                     for (k, v) in &m.inner {
-                        let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
+                        let tup = PyTuple::new(py, [k.obj_clone_ref(py), v.clone_ref(py)])?;
                         result.add(tup)?;
                     }
                 }
@@ -893,7 +997,7 @@ macro_rules! define_map_classes {
                 let result = PySet::empty(py)?;
                 let m = self.map.borrow(py);
                 for (k, v) in &m.inner {
-                    let tup = PyTuple::new(py, [k.obj.clone_ref(py), v.clone_ref(py)])?;
+                    let tup = PyTuple::new(py, [k.obj_clone_ref(py), v.clone_ref(py)])?;
                     if !other.contains(&tup)? {
                         result.add(tup)?;
                     }
