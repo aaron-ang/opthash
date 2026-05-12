@@ -66,9 +66,12 @@ fn build_funnel_options(
 /// Tag for the cached object's Python type, used to short-circuit `__eq__`
 /// dispatch in `HashedAny::eq` for the str-vs-str common case.
 ///
-/// Encoded as the low 3 bits of `HashedAny::tagged`. `CPython` objects are
-/// at least 8-byte aligned (`PyObject` starts with `Py_ssize_t ob_refcnt`),
-/// so the low 3 bits of a real `PyObject*` are always zero and free for us.
+/// Encoded in the low bit of `HashedAny::tagged`. `CPython`'s `PyObject`
+/// starts with a `Py_ssize_t ob_refcnt`, which gives it natural alignment
+/// of at least `align_of::<usize>()` — 8B on 64-bit, 4B on 32-bit. Either
+/// way, the bottom bit of any real `PyObject*` is zero and free to reuse.
+/// Only 1 bit is reserved because `HashKind` has 2 variants; this keeps
+/// the trick portable across 32-bit and 64-bit Python.
 #[derive(Clone, Copy, PartialEq)]
 #[repr(usize)]
 enum HashKind {
@@ -77,7 +80,8 @@ enum HashKind {
 }
 
 /// Mask covering the bits where `HashKind` lives in `HashedAny::tagged`.
-const KIND_MASK: usize = 0b111;
+/// Single bit so the invariant holds on every `PyObject*` alignment ≥ 2B.
+const KIND_MASK: usize = 0b1;
 
 /// Owning hashable wrapper around a `Py<PyAny>` used as a map key.
 ///
@@ -87,7 +91,8 @@ const KIND_MASK: usize = 0b111;
 /// fast path without re-detecting the type — and the struct fits in 16 bytes
 /// rather than 24 (8B pointer + 8B hash, no separate kind byte + padding).
 struct HashedAny {
-    /// Object pointer with `HashKind` tag in the low 3 bits.
+    /// Object pointer with `HashKind` tag packed into bits covered by
+    /// `KIND_MASK` (currently the low bit).
     ///
     /// Holds one owned reference to the underlying `PyObject` — `Drop` calls
     /// `Py_DECREF` on the masked pointer. The tagged value is non-null
@@ -98,16 +103,26 @@ struct HashedAny {
     hash: isize,
 }
 
-// Safety: `HashedAny` owns a refcount on the underlying `PyObject`, mirroring
-// `Py<PyAny>`. The pointer is only dereferenced under the GIL.
+// SAFETY: `HashedAny` owns one strong reference to a `PyObject`, exactly the
+// same invariant `Py<PyAny>` carries — and `Py<PyAny>` is `Send + Sync`. The
+// `NonNull<ffi::PyObject>` we store is `!Send + !Sync` only because the raw
+// pointer alias is conservative; the *semantics* of the owned reference are
+// unchanged from `Py<PyAny>`:
+//   * `Py_INCREF` / `Py_DECREF` are atomic (always under the GIL on the
+//     classic build, lock-free atomics on the free-threaded build).
+//   * The pointee is never dereferenced without first calling
+//     `Python::attach` to acquire a `Python<'_>` token.
+// So sending/sharing a `HashedAny` between threads is no less safe than
+// sending/sharing the `Py<PyAny>` it replaced.
 unsafe impl Send for HashedAny {}
 unsafe impl Sync for HashedAny {}
 
-// Compile-time check that the tag-packing trick achieves the 16-byte goal:
-// {NonNull<PyObject> = 8B} + {isize = 8B} with no padding. The whole point
-// of packing `HashKind` into the pointer's low bits is this size reduction
-// (from 24B with a separate `kind` byte + 7B padding).
-const _: () = assert!(std::mem::size_of::<HashedAny>() == 16);
+// Compile-time check that the tag-packing trick keeps the struct compact:
+// {NonNull<PyObject>} + {isize}, no padding. On 64-bit that's 16B (vs 24B
+// for the old layout with a separate `kind` byte + 7B padding); on 32-bit
+// it's 8B. We assert `2 * size_of::<usize>()` so the bound stays correct
+// across `target_pointer_width`.
+const _: () = assert!(std::mem::size_of::<HashedAny>() == 2 * std::mem::size_of::<usize>());
 
 impl HashedAny {
     /// Pack a raw `PyObject*` together with its `HashKind` into a tagged
@@ -115,12 +130,22 @@ impl HashedAny {
     /// this routine performs no `Py_INCREF` / `Py_DECREF`.
     ///
     /// # Safety
-    /// `obj` must be non-null, and its low 3 bits must be zero (which `CPython`
-    /// guarantees for any real `PyObject*`).
+    /// `obj` must be non-null, and its low `KIND_MASK` bit must be zero
+    /// (`CPython` guarantees this for any real `PyObject*` since the struct
+    /// starts with a `Py_ssize_t` and thus has alignment ≥ 2B on every
+    /// supported platform).
     #[inline]
     unsafe fn pack(obj: *mut ffi::PyObject, kind: HashKind) -> NonNull<ffi::PyObject> {
-        debug_assert!(!obj.is_null());
-        debug_assert_eq!(obj as usize & KIND_MASK, 0);
+        assert!(!obj.is_null(), "PyObject pointer must be non-null");
+        // Runtime assert (not `debug_assert!`) so a future call site with a
+        // misaligned pointer fails loudly in release rather than silently
+        // corrupting the tagged value. `from_bound` / `ProbeKey::from_bound`
+        // run once per insert (cold path), so the one `cmp+jne` is negligible.
+        assert_eq!(
+            obj as usize & KIND_MASK,
+            0,
+            "PyObject* low bits must be zero for tag packing"
+        );
         // SAFETY: caller guarantees `obj` is non-null. ORing in the tag bits
         // can only set bits, so the result is also non-null.
         unsafe { NonNull::new_unchecked(((obj as usize) | (kind as usize)) as *mut ffi::PyObject) }
@@ -152,8 +177,8 @@ impl HashedAny {
         // and the GIL is held (it's tied to `Bound`'s lifetime). We take
         // ownership of the new strong reference into our tagged slot.
         unsafe { ffi::Py_INCREF(raw) };
-        // SAFETY: `raw` is a non-null PyObject pointer with zero low bits
-        // (CPython aligns `PyObject` to at least 8 bytes).
+        // SAFETY: `raw` is a non-null PyObject pointer whose low `KIND_MASK`
+        // bit is zero (`PyObject` alignment ≥ 2B on every supported target).
         let tagged = unsafe { Self::pack(raw, kind) };
         Ok(Self { tagged, hash })
     }
