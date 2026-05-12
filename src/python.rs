@@ -139,21 +139,21 @@ impl HashedAny {
         }
     }
 
-    /// Build by computing `__hash__` once and bumping the object's refcount
-    /// (the `clone()` on `Bound` is the `Py_INCREF`; we then steal that
-    /// strong reference into our tagged slot). Use for inserts that need to
-    /// keep the key.
+    /// Build by computing `__hash__` once and bumping the object's refcount.
+    /// We call `Py_INCREF` directly on the raw pointer instead of going
+    /// through `Bound::clone().unbind() + forget`, which would also produce
+    /// one strong reference but with extra moves of a `Py<PyAny>` smart
+    /// pointer the optimizer doesn't always elide.
     fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let hash = ob.hash()?;
         let kind = Self::detect_kind(ob);
-        // `clone()` bumps the refcount; `unbind()` converts `Bound -> Py`
-        // without touching the count. We then forget the `Py` (it would
-        // otherwise DECREF on drop) and take ownership of the raw pointer.
-        let owned: Py<PyAny> = ob.clone().unbind();
-        let raw = owned.as_ptr();
-        std::mem::forget(owned);
-        // SAFETY: `raw` came from a live `Py<PyAny>`, so it's a non-null
-        // PyObject pointer with zero low bits.
+        let raw = ob.as_ptr();
+        // SAFETY: `Bound` guarantees `raw` is a valid, non-null `PyObject*`
+        // and the GIL is held (it's tied to `Bound`'s lifetime). We take
+        // ownership of the new strong reference into our tagged slot.
+        unsafe { ffi::Py_INCREF(raw) };
+        // SAFETY: `raw` is a non-null PyObject pointer with zero low bits
+        // (CPython aligns `PyObject` to at least 8 bytes).
         let tagged = unsafe { Self::pack(raw, kind) };
         Ok(Self { tagged, hash })
     }
