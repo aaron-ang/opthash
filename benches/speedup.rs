@@ -588,6 +588,89 @@ fn bench_multi_get_batch(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_get_many_mut(c: &mut Criterion) {
+    // Compares `get_many_mut::<_, N>` against N sequential `get_mut` calls.
+    // Fixed N = 8, matching a typical batch-join hot path. Resolves N
+    // disjoint keys per iteration, mutates each via the returned ref.
+    const N: usize = 8;
+
+    let pairs = make_pairs(GET_MANY_MAP_SIZE);
+    // Pre-sample disjoint key tuples. Stride larger than N to ensure no
+    // intra-tuple duplicates.
+    let key_tuples: Vec<[u64; N]> = (0..(GET_MANY_TOTAL / N))
+        .map(|t| {
+            let mut arr = [0u64; N];
+            for i in 0..N {
+                arr[i] = pairs[(t * (N + 1) + i) % GET_MANY_MAP_SIZE].0;
+            }
+            arr
+        })
+        .collect();
+
+    let mut group = c.benchmark_group("get_many_mut");
+    group.throughput(Throughput::Elements((key_tuples.len() * N) as u64));
+
+    group.bench_function("elastic_naive_get_mut", |b| {
+        let mut map = build_elastic_map(&pairs);
+        b.iter(|| {
+            for keys in &key_tuples {
+                for k in keys {
+                    if let Some(v) = map.get_mut(black_box(k)) {
+                        *v = v.wrapping_add(1);
+                    }
+                }
+            }
+        });
+    });
+
+    group.bench_function("funnel_naive_get_mut", |b| {
+        let mut map = build_funnel_map(&pairs);
+        b.iter(|| {
+            for keys in &key_tuples {
+                for k in keys {
+                    if let Some(v) = map.get_mut(black_box(k)) {
+                        *v = v.wrapping_add(1);
+                    }
+                }
+            }
+        });
+    });
+
+    group.bench_function("elastic_get_many_mut", |b| {
+        let mut map = build_elastic_map(&pairs);
+        b.iter(|| {
+            for keys in &key_tuples {
+                let refs: [&u64; N] = [
+                    &keys[0], &keys[1], &keys[2], &keys[3], &keys[4], &keys[5], &keys[6], &keys[7],
+                ];
+                if let Some(vs) = map.get_many_mut(refs) {
+                    for v in vs {
+                        *v = v.wrapping_add(1);
+                    }
+                }
+            }
+        });
+    });
+
+    group.bench_function("funnel_get_many_mut", |b| {
+        let mut map = build_funnel_map(&pairs);
+        b.iter(|| {
+            for keys in &key_tuples {
+                let refs: [&u64; N] = [
+                    &keys[0], &keys[1], &keys[2], &keys[3], &keys[4], &keys[5], &keys[6], &keys[7],
+                ];
+                if let Some(vs) = map.get_many_mut(refs) {
+                    for v in vs {
+                        *v = v.wrapping_add(1);
+                    }
+                }
+            }
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_get_hit_latency(c: &mut Criterion) {
     for &size in LATENCY_SIZES {
         let pairs = make_pairs(size);
@@ -655,6 +738,7 @@ criterion_group!(
         bench_resize_heavy_throughput,
         bench_mixed_lookup_throughput,
         bench_multi_get_batch,
+        bench_get_many_mut,
         bench_get_hit_latency
 );
 criterion_main!(benches);

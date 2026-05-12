@@ -269,7 +269,7 @@ impl<K, V> SpecialArray<K, V> {
 
 /// Where in the funnel structure a key/slot lives. Returned by lookups,
 /// consumed by inserts / removes to avoid recomputing the location.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SlotLocation {
     Level { level_idx: usize, slot_idx: usize },
     SpecialPrimary { slot_idx: usize },
@@ -624,6 +624,71 @@ where
                 Some(unsafe { &mut self.special.fallback.table.get_mut(slot_idx).value })
             }
         }
+    }
+
+    /// Returns `N` disjoint mutable references to the values for `keys`.
+    ///
+    /// Matches the semantics of `std::collections::HashMap::get_many_mut`:
+    /// returns `None` if any key is missing, and panics if any two keys
+    /// resolve to the same slot. Probes run sequentially because mutable
+    /// refs can only be materialized after the alias check completes, so
+    /// the pipelined `multi_get` path does not apply here.
+    ///
+    /// # Panics
+    ///
+    /// Panics if two input keys resolve to the same physical slot
+    /// (i.e. they refer to the same entry).
+    pub fn get_many_mut<Q, const N: usize>(&mut self, keys: [&Q; N]) -> Option<[&mut V; N]>
+    where
+        K: Borrow<Q> + Eq,
+        Q: Hash + Eq + ?Sized,
+    {
+        // Resolve each key. Bail on first miss.
+        let mut locations: [SlotLocation; N] = [SlotLocation::SpecialPrimary { slot_idx: 0 }; N];
+        for (i, key) in keys.iter().enumerate() {
+            let key_hash = self.hash_key(*key);
+            let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+            locations[i] = self.find_slot_location_with_hash(*key, key_hash, key_fingerprint)?;
+        }
+
+        // O(N^2) alias check.
+        for i in 0..N {
+            for j in (i + 1)..N {
+                assert!(
+                    locations[i] != locations[j],
+                    "get_many_mut: duplicate keys resolve to the same entry",
+                );
+            }
+        }
+
+        // Materialize mutable refs into the result array. SAFETY: every
+        // resolved location is unique and points to an occupied slot. Raw
+        // pointers let us hand out disjoint borrows into `levels` /
+        // `special` without re-borrowing the slices each iteration.
+        let levels_ptr: *mut BucketLevel<K, V> = self.levels.as_mut_ptr();
+        let primary_ptr: *mut SpecialPrimary<K, V> = &raw mut self.special.primary;
+        let fallback_ptr: *mut SpecialFallback<K, V> = &raw mut self.special.fallback;
+        let mut out: core::mem::MaybeUninit<[&mut V; N]> = core::mem::MaybeUninit::uninit();
+        let out_ptr = out.as_mut_ptr().cast::<&mut V>();
+        for (i, loc) in locations.into_iter().enumerate() {
+            let value_ref: &mut V = match loc {
+                SlotLocation::Level {
+                    level_idx,
+                    slot_idx,
+                } => unsafe {
+                    let level = &mut *levels_ptr.add(level_idx);
+                    &mut level.table.get_mut(slot_idx).value
+                },
+                SlotLocation::SpecialPrimary { slot_idx } => unsafe {
+                    &mut (*primary_ptr).table.get_mut(slot_idx).value
+                },
+                SlotLocation::SpecialFallback { slot_idx } => unsafe {
+                    &mut (*fallback_ptr).table.get_mut(slot_idx).value
+                },
+            };
+            unsafe { out_ptr.add(i).write(value_ref) };
+        }
+        Some(unsafe { out.assume_init() })
     }
 
     pub fn contains_key<Q>(&self, key: &Q) -> bool
@@ -1914,5 +1979,63 @@ mod tests {
         let out = map.multi_get(&refs);
         assert_eq!(out.len(), 3);
         assert!(out.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn get_many_mut_returns_all_refs_on_hits() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
+        for i in 0..16 {
+            map.insert(i, i * 10);
+        }
+
+        let got = map.get_many_mut([&1, &3, &7, &15]).expect("all hits");
+        assert_eq!(*got[0], 10);
+        assert_eq!(*got[1], 30);
+        assert_eq!(*got[2], 70);
+        assert_eq!(*got[3], 150);
+    }
+
+    #[test]
+    fn get_many_mut_returns_none_if_any_missing() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(32);
+        for i in 0..8 {
+            map.insert(i, i);
+        }
+
+        assert!(map.get_many_mut([&0, &1, &99]).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate keys")]
+    fn get_many_mut_panics_on_duplicate_keys() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(32);
+        map.insert(1, 100);
+        map.insert(2, 200);
+        let _ = map.get_many_mut([&1, &1]);
+    }
+
+    #[test]
+    fn get_many_mut_zero_keys_is_some_empty() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(16);
+        map.insert(1, 1);
+        let got: [&mut i32; 0] = map
+            .get_many_mut::<i32, 0>([])
+            .expect("zero-key returns Some");
+        assert_eq!(got.len(), 0);
+    }
+
+    #[test]
+    fn get_many_mut_mutation_propagates() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(32);
+        for i in 0..8 {
+            map.insert(i, i);
+        }
+        {
+            let got = map.get_many_mut([&2, &5]).expect("hit");
+            *got[0] = 222;
+            *got[1] = 555;
+        }
+        assert_eq!(map.get(&2), Some(&222));
+        assert_eq!(map.get(&5), Some(&555));
     }
 }
