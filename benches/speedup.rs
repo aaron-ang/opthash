@@ -60,8 +60,8 @@ const DELETE_OP_COUNT: usize = 6_000;
 const RESIZE_INSERT_COUNT: usize = 8_000;
 const MIXED_LOOKUP_COUNT: usize = 100_000;
 
-// `multi_get` batched lookup: 10M-entry map, 1000-key bursts, repeated.
-const GET_MANY_MAP_SIZE: usize = 10_000_000;
+// `multi_get` batched lookup: 1M-entry map (spills L3), 1000-key bursts.
+const GET_MANY_MAP_SIZE: usize = 1_000_000;
 const GET_MANY_BATCH: usize = 1_000;
 const GET_MANY_TOTAL: usize = 100_000;
 
@@ -593,105 +593,6 @@ fn bench_multi_get_batch(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("elastic_multi_get", |b| {
-        let map = build_elastic_map(&pairs);
-        b.iter(|| {
-            for chunk in &chunks {
-                black_box(map.multi_get(chunk));
-            }
-        });
-    });
-
-    group.bench_function("funnel_multi_get", |b| {
-        let map = build_funnel_map(&pairs);
-        b.iter(|| {
-            for chunk in &chunks {
-                black_box(map.multi_get(chunk));
-            }
-        });
-    });
-
-    group.finish();
-}
-
-fn bench_get_disjoint_mut(c: &mut Criterion) {
-    // `get_disjoint_mut::<_, N>` vs. N sequential `get_mut`. N = 8 matches a
-    // typical batch-join hot path.
-    const N: usize = 8;
-
-    let pairs = make_pairs(GET_MANY_MAP_SIZE);
-    // Stride > N so no tuple aliases itself.
-    let key_tuples: Vec<[u64; N]> = (0..(GET_MANY_TOTAL / N))
-        .map(|t| {
-            let mut arr = [0u64; N];
-            for i in 0..N {
-                arr[i] = pairs[(t * (N + 1) + i) % GET_MANY_MAP_SIZE].0;
-            }
-            arr
-        })
-        .collect();
-
-    let mut group = c.benchmark_group("get_disjoint_mut");
-    group.throughput(Throughput::Elements((key_tuples.len() * N) as u64));
-
-    group.bench_function("elastic_naive_get_mut", |b| {
-        let mut map = build_elastic_map(&pairs);
-        b.iter(|| {
-            for keys in &key_tuples {
-                for k in keys {
-                    if let Some(v) = map.get_mut(black_box(k)) {
-                        *v = v.wrapping_add(1);
-                    }
-                }
-            }
-        });
-    });
-
-    group.bench_function("funnel_naive_get_mut", |b| {
-        let mut map = build_funnel_map(&pairs);
-        b.iter(|| {
-            for keys in &key_tuples {
-                for k in keys {
-                    if let Some(v) = map.get_mut(black_box(k)) {
-                        *v = v.wrapping_add(1);
-                    }
-                }
-            }
-        });
-    });
-
-    group.bench_function("elastic_get_disjoint_mut", |b| {
-        let mut map = build_elastic_map(&pairs);
-        b.iter(|| {
-            for keys in &key_tuples {
-                let refs: [&u64; N] = [
-                    &keys[0], &keys[1], &keys[2], &keys[3], &keys[4], &keys[5], &keys[6], &keys[7],
-                ];
-                if let Some(vs) = map.get_disjoint_mut(refs) {
-                    for v in vs {
-                        *v = v.wrapping_add(1);
-                    }
-                }
-            }
-        });
-    });
-
-    group.bench_function("funnel_get_disjoint_mut", |b| {
-        let mut map = build_funnel_map(&pairs);
-        b.iter(|| {
-            for keys in &key_tuples {
-                let refs: [&u64; N] = [
-                    &keys[0], &keys[1], &keys[2], &keys[3], &keys[4], &keys[5], &keys[6], &keys[7],
-                ];
-                if let Some(vs) = map.get_disjoint_mut(refs) {
-                    for v in vs {
-                        *v = v.wrapping_add(1);
-                    }
-                }
-            }
-        });
-    });
-
     group.finish();
 }
 
@@ -762,7 +663,6 @@ criterion_group!(
         bench_resize_heavy_throughput,
         bench_mixed_lookup_throughput,
         bench_multi_get_batch,
-        bench_get_disjoint_mut,
         bench_get_hit_latency
 );
 criterion_main!(benches);
