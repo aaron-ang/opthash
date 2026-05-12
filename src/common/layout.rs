@@ -378,3 +378,56 @@ impl<T> RawTable<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Layout invariant: under both feature configurations the control bytes
+    /// follow the slots region with 64-byte alignment, and (when the
+    /// mini-hash feature is on) the mini-hash slab follows the controls
+    /// with 64-byte alignment and is sized to exactly one u32 per slot.
+    #[test]
+    fn unified_layout_offsets_are_well_aligned() {
+        // Spot-check several capacities, including a partial last group.
+        for cap in [16usize, 17, 64, 128, 257, 1024] {
+            let group_count = round_up_to_group(cap) / GROUP_SIZE;
+            let (layout, ctrl_offset, mini_offset) =
+                RawTable::<u64>::unified_layout(cap, group_count);
+            assert!(ctrl_offset.is_multiple_of(CONTROL_ALIGN));
+            assert!(layout.size() >= ctrl_offset + group_count * GROUP_SIZE);
+            #[cfg(feature = "mini-hash")]
+            {
+                assert!(mini_offset.is_multiple_of(CONTROL_ALIGN));
+                let mini_size = group_count * GROUP_SIZE * std::mem::size_of::<u32>();
+                assert!(layout.size() >= mini_offset + mini_size);
+            }
+            #[cfg(not(feature = "mini-hash"))]
+            {
+                // mini_offset is unused when the feature is off; the
+                // unused binding is materialized by the return tuple.
+                assert_eq!(mini_offset, 0);
+            }
+        }
+    }
+
+    /// `mini_hash` extracts the low 32 bits; the 7-bit control fingerprint
+    /// extracts `hash >> 57`. The two are bit-disjoint by construction so a
+    /// hasher with full avalanche makes the channels independent.
+    #[cfg(feature = "mini-hash")]
+    #[test]
+    fn mini_hash_and_fingerprint_extract_disjoint_bits() {
+        use super::super::simd::ControlOps;
+        // Construct two distinct full hashes that share the top 7 bits but
+        // differ in the low 32. Their mini-hashes must differ; their
+        // fingerprints must match.
+        let h_a: u64 = 0xCAFEBABE_DEADBEEFu64;
+        let h_b: u64 = (h_a & 0xFE00_0000_0000_0000) | 0x0000_0000_1234_5678;
+        assert_eq!(
+            ControlOps::control_fingerprint(h_a),
+            ControlOps::control_fingerprint(h_b),
+            "constructed hashes must share fingerprint",
+        );
+        assert_ne!(mini_hash(h_a), mini_hash(h_b));
+    }
+}

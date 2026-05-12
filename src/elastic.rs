@@ -1156,4 +1156,103 @@ mod tests {
         let map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
         assert_eq!(map.iter().count(), 0);
     }
+
+    /// Forces a 7-bit fingerprint collision in the same probe group and
+    /// asserts the mini-hash gate prevents the colliding slot's `K::eq`
+    /// from firing. Without the gate, every fingerprint-matching slot in
+    /// the probe sequence calls `K::eq`; with the gate, only mini-hash
+    /// matches do. Removing the gate would still produce correct lookups
+    /// (because `K::eq` backstops it), so the existing test suite passes
+    /// with the gate stripped — this is the regression test that proves
+    /// the gate is doing work.
+    #[cfg(feature = "mini-hash")]
+    #[test]
+    fn mini_hash_gate_skips_eq_on_fingerprint_collision() {
+        use crate::common::DefaultHashBuilder;
+        use std::cell::Cell;
+        use std::hash::{Hash, Hasher};
+
+        thread_local! {
+            static EQ_COUNT: Cell<usize> = const { Cell::new(0) };
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        struct CountingKey(u64);
+
+        impl Hash for CountingKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.0.hash(state);
+            }
+        }
+
+        impl PartialEq for CountingKey {
+            fn eq(&self, other: &Self) -> bool {
+                EQ_COUNT.with(|c| c.set(c.get() + 1));
+                self.0 == other.0
+            }
+        }
+
+        impl Eq for CountingKey {}
+
+        let hasher = DefaultHashBuilder::default();
+        const TEST_CAPACITY: usize = 1024;
+        let mut map: ElasticHashMap<CountingKey, u64> =
+            ElasticHashMap::with_capacity_and_hasher(TEST_CAPACITY, hasher);
+
+        // Fill the map with enough keys that same-group fingerprint
+        // collisions exist with overwhelming probability. 800 keys means
+        // ~50 keys/group in level 0 alone → C(50,2)/128 ≈ 9.6 expected
+        // collisions per group, so a fp twin is essentially guaranteed
+        // across the level even under the worst hasher seed.
+        let n_seed = 800u64;
+        for i in 0..n_seed {
+            map.insert(CountingKey(i), i);
+        }
+
+        // Scan the actual storage for a fp twin with distinct mini-hash.
+        let mut found: Option<u64> = None;
+        'scan: for level in &map.levels {
+            let cap = level.table.capacity();
+            for group_start in (0..cap).step_by(GROUP_SIZE) {
+                let mut by_fp: std::collections::HashMap<u8, (u64, u32)> =
+                    std::collections::HashMap::new();
+                for slot_idx in group_start..(group_start + GROUP_SIZE).min(cap) {
+                    let ctrl = level.table.control_at(slot_idx);
+                    if !ctrl.is_occupied() {
+                        continue;
+                    }
+                    let entry = unsafe { level.table.get_ref(slot_idx) };
+                    let h = map.hash_key(&entry.key);
+                    let fp = ControlOps::control_fingerprint(h);
+                    let mini = mini_hash(h);
+                    if let Some(&(_prior_key, prior_mini)) = by_fp.get(&fp) {
+                        if prior_mini != mini {
+                            // entry.key is the second occupant in this
+                            // group with this fingerprint — when we look
+                            // it up, the lookup walks the group, finds
+                            // its own fp match plus the prior occupant's
+                            // fp match, and the gate must filter the
+                            // prior occupant out before `K::eq`.
+                            found = Some(entry.key.0);
+                            break 'scan;
+                        }
+                    } else {
+                        by_fp.insert(fp, (entry.key.0, mini));
+                    }
+                }
+            }
+        }
+        let target = found
+            .expect("no same-group fp collision after 800 inserts; increase seed count or rerun");
+
+        EQ_COUNT.with(|c| c.set(0));
+        assert_eq!(map.get(&CountingKey(target)), Some(&target));
+        let after = EQ_COUNT.with(Cell::get);
+        // With the gate: only `target`'s mini-hash matches → eq_count == 1.
+        // Without the gate: at least two slots fp-match → eq_count >= 2.
+        assert_eq!(
+            after, 1,
+            "elastic mini-hash gate failed to filter fp collision: eq_count={after}"
+        );
+    }
 }

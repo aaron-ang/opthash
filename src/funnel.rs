@@ -1878,4 +1878,91 @@ mod tests {
         let map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
         assert_eq!(map.iter().count(), 0);
     }
+
+    /// Funnel analogue of `mini_hash_gate_skips_eq_on_fingerprint_collision`
+    /// in `elastic.rs`. Inserts a large batch of keys into a small map and
+    /// scans the resulting layout for two slots that share a (level,
+    /// group, fingerprint) signature but differ on mini-hash. Then asserts
+    /// the mini-hash gate filters one of them out of `K::eq`.
+    #[cfg(feature = "mini-hash")]
+    #[test]
+    fn mini_hash_gate_skips_eq_on_fingerprint_collision() {
+        use crate::common::DefaultHashBuilder;
+        use std::cell::Cell;
+        use std::hash::{Hash, Hasher};
+
+        thread_local! {
+            static EQ_COUNT: Cell<usize> = const { Cell::new(0) };
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        struct CountingKey(u64);
+
+        impl Hash for CountingKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.0.hash(state);
+            }
+        }
+
+        impl PartialEq for CountingKey {
+            fn eq(&self, other: &Self) -> bool {
+                EQ_COUNT.with(|c| c.set(c.get() + 1));
+                self.0 == other.0
+            }
+        }
+
+        impl Eq for CountingKey {}
+
+        let hasher = DefaultHashBuilder::default();
+        const TEST_CAPACITY: usize = 4096;
+        let mut map: FunnelHashMap<CountingKey, u64> =
+            FunnelHashMap::with_capacity_and_hasher(TEST_CAPACITY, hasher);
+
+        // Pump enough keys in that, at the 7-bit fingerprint resolution,
+        // some pair must share (level, group, fp). 400 keys spread across
+        // funnel's bucket levels comfortably triggers the birthday paradox
+        // at fp=1/128 per group.
+        let n_seed = 400u64;
+        for i in 0..n_seed {
+            map.insert(CountingKey(i), i);
+        }
+
+        // Scan the actual storage for fingerprint twins.
+        let mut found: Option<u64> = None;
+        'scan: for level in &map.levels {
+            let cap = level.table.capacity();
+            for group_start in (0..cap).step_by(GROUP_SIZE) {
+                let mut by_fp: std::collections::HashMap<u8, (u64, u32)> =
+                    std::collections::HashMap::new();
+                for slot_idx in group_start..(group_start + GROUP_SIZE).min(cap) {
+                    let ctrl = level.table.control_at(slot_idx);
+                    if !ctrl.is_occupied() {
+                        continue;
+                    }
+                    let entry = unsafe { level.table.get_ref(slot_idx) };
+                    let h = map.hash_key(&entry.key);
+                    let fp = ControlOps::control_fingerprint(h);
+                    let mini = mini_hash(h);
+                    if let Some(&(_prior_key, prior_mini)) = by_fp.get(&fp) {
+                        if prior_mini != mini {
+                            found = Some(entry.key.0);
+                            break 'scan;
+                        }
+                    } else {
+                        by_fp.insert(fp, (entry.key.0, mini));
+                    }
+                }
+            }
+        }
+        let target =
+            found.expect("no same-group fp collision after 400 inserts — increase seed count");
+
+        EQ_COUNT.with(|c| c.set(0));
+        assert_eq!(map.get(&CountingKey(target)), Some(&target));
+        let after = EQ_COUNT.with(Cell::get);
+        assert_eq!(
+            after, 1,
+            "funnel mini-hash gate failed to filter fp collision: eq_count={after}"
+        );
+    }
 }
