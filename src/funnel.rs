@@ -563,7 +563,7 @@ where
 
         let hashes: Vec<u64> = keys.iter().map(|k| self.hash_key(*k)).collect();
 
-        let level0_opt = self.levels.first().filter(|l| l.bucket_count > 0);
+        let level0_opt = self.levels.first().filter(|l| l.len > 0);
 
         if let Some(level0) = level0_opt {
             for &h in hashes.iter().take(PIPELINE_DEPTH.min(n)) {
