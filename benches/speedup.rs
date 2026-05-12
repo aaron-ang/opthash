@@ -527,18 +527,10 @@ fn bench_mixed_lookup_throughput(c: &mut Criterion) {
 }
 
 fn bench_multi_get_batch(c: &mut Criterion) {
-    // Build pairs once, then query in `GET_MANY_BATCH`-sized bursts. Compares
-    // a naive `.get()` loop against the pipelined `multi_get_into`.
-    //
-    // Fairness: both arms walk the same `Vec<Vec<&u64>>` of chunk slices
-    // (same outer indirection) and both reuse a caller-owned scratch buffer
-    // for output so neither pays per-call allocation tax. The only delta
-    // between `*_naive` and `*_multi_get_into` is the pipelined prefetch in
-    // the batched method.
-    //
-    // The trailing `*_multi_get` arms exercise the alloc-returning wrapper
-    // so the per-call `Vec` cost remains visible for callers who don't pool
-    // the output.
+    // Naive `.get()` loop vs. pipelined `multi_get_into`. Both arms share
+    // the chunk slices and a caller-owned scratch buffer so the only delta
+    // is the prefetch. The `*_multi_get` arms keep the per-call alloc cost
+    // of the owning wrapper visible.
     let pairs = make_pairs(GET_MANY_MAP_SIZE);
     let query_keys: Vec<u64> = (0..GET_MANY_TOTAL)
         .map(|idx| pairs[idx % GET_MANY_MAP_SIZE].0)
@@ -623,14 +615,12 @@ fn bench_multi_get_batch(c: &mut Criterion) {
 }
 
 fn bench_get_disjoint_mut(c: &mut Criterion) {
-    // Compares `get_disjoint_mut::<_, N>` against N sequential `get_mut` calls.
-    // Fixed N = 8, matching a typical batch-join hot path. Resolves N
-    // disjoint keys per iteration, mutates each via the returned ref.
+    // `get_disjoint_mut::<_, N>` vs. N sequential `get_mut`. N = 8 matches a
+    // typical batch-join hot path.
     const N: usize = 8;
 
     let pairs = make_pairs(GET_MANY_MAP_SIZE);
-    // Pre-sample disjoint key tuples. Stride larger than N to ensure no
-    // intra-tuple duplicates.
+    // Stride > N so no tuple aliases itself.
     let key_tuples: Vec<[u64; N]> = (0..(GET_MANY_TOTAL / N))
         .map(|t| {
             let mut arr = [0u64; N];

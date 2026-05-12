@@ -545,19 +545,12 @@ where
         }
     }
 
-    /// Batched lookup: pipelines N keys by issuing prefetches for the
-    /// level-0 bucket `PIPELINE_DEPTH` iterations ahead of the resolution
-    /// loop. Overlaps independent DRAM/L3 misses.
+    /// Batched lookup that pipelines prefetches for the level-0 bucket to
+    /// overlap DRAM/L3 misses. Allocates the result vector; hot loops should
+    /// prefer [`Self::multi_get_into`].
     ///
-    /// Allocates a fresh `Vec<Option<&V>>` on every call. Callers that
-    /// re-issue batches in a hot loop should prefer
-    /// [`Self::multi_get_into`], which writes into a caller-owned buffer.
-    ///
-    /// # Prefetch scope
-    ///
-    /// Only the level-0 bucket group is prefetched. Miss-heavy batches that
-    /// probe into level >= 1 or fall through to the special arrays see no
-    /// prefetch benefit and may pay one speculative L1 fetch per key.
+    /// Only level 0 is prefetched: batches that fall through to deeper
+    /// levels or the special arrays see no prefetch benefit.
     pub fn multi_get<'a, Q>(&self, keys: &[&'a Q]) -> Vec<Option<&V>>
     where
         K: Borrow<Q>,
@@ -568,16 +561,15 @@ where
         out
     }
 
-    /// Sibling of [`Self::multi_get`] that writes results into `out`,
-    /// reusing its allocation across calls. `out` is `clear`ed first and
-    /// reserved to hold exactly `keys.len()` entries. Same pipelined
-    /// prefetch and same prefetch-scope caveats as `multi_get`.
+    /// Like [`Self::multi_get`], but writes into the caller-owned `out`
+    /// (cleared and re-reserved on entry) so repeated batches can reuse the
+    /// allocation.
     pub fn multi_get_into<'a, 'b, Q>(&'a self, keys: &[&'b Q], out: &mut Vec<Option<&'a V>>)
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized + 'b,
     {
-        // See ElasticHashMap::multi_get_into for depth tuning rationale.
+        // See `ElasticHashMap::multi_get_into` for depth-tuning rationale.
         const PIPELINE_DEPTH: usize = 8;
 
         let n = keys.len();
@@ -651,24 +643,18 @@ where
         }
     }
 
-    /// Returns `N` disjoint mutable references to the values for `keys`.
-    ///
-    /// Matches the semantics of `std::collections::HashMap::get_disjoint_mut`:
-    /// returns `None` if any key is missing, and panics if any two keys
-    /// resolve to the same slot. Probes run sequentially because mutable
-    /// refs can only be materialized after the alias check completes, so
-    /// the pipelined `multi_get` path does not apply here.
+    /// Returns `N` disjoint mutable references, mirroring
+    /// [`std::collections::HashMap::get_disjoint_mut`]: `None` if any key
+    /// misses, panic on aliasing.
     ///
     /// # Panics
     ///
-    /// Panics if two input keys resolve to the same physical slot
-    /// (i.e. they refer to the same entry).
+    /// If two input keys resolve to the same physical slot.
     pub fn get_disjoint_mut<Q, const N: usize>(&mut self, keys: [&Q; N]) -> Option<[&mut V; N]>
     where
         K: Borrow<Q> + Eq,
         Q: Hash + Eq + ?Sized,
     {
-        // Resolve each key. Bail on first miss.
         let mut locations: [SlotLocation; N] = [SlotLocation::SpecialPrimary { slot_idx: 0 }; N];
         for (i, key) in keys.iter().enumerate() {
             let key_hash = self.hash_key(*key);
@@ -676,7 +662,8 @@ where
             locations[i] = self.find_slot_location_with_hash(*key, key_hash, key_fingerprint)?;
         }
 
-        // O(N^2) alias check.
+        // O(N^2) alias check; cheaper than a HashSet for the small N
+        // (typically <= 16) std::get_disjoint_mut targets.
         for i in 0..N {
             for j in (i + 1)..N {
                 assert!(
@@ -686,10 +673,9 @@ where
             }
         }
 
-        // Materialize mutable refs into the result array. SAFETY: every
-        // resolved location is unique and points to an occupied slot. Raw
-        // pointers let us hand out disjoint borrows into `levels` /
-        // `special` without re-borrowing the slices each iteration.
+        // SAFETY: locations are unique (checked above) and point to occupied
+        // slots. Raw pointers let us hand out disjoint borrows into `levels`
+        // / `special` without reborrowing the slices each iteration.
         let levels_ptr: *mut BucketLevel<K, V> = self.levels.as_mut_ptr();
         let primary_ptr: *mut SpecialPrimary<K, V> = &raw mut self.special.primary;
         let fallback_ptr: *mut SpecialFallback<K, V> = &raw mut self.special.fallback;

@@ -380,22 +380,12 @@ where
         Some(unsafe { &self.levels[level_idx].table.get_ref(slot_idx).value })
     }
 
-    /// Batched lookup: pipelines N keys by issuing prefetches for the first
-    /// probe group `PIPELINE_DEPTH` iterations ahead of the resolution loop.
-    /// Overlaps independent DRAM/L3 misses to hide memory latency on
-    /// workloads like batch joins or set intersection.
+    /// Batched lookup that pipelines prefetches for the level-0 probe group
+    /// to overlap DRAM/L3 misses. Allocates the result vector; hot loops
+    /// should prefer [`Self::multi_get_into`].
     ///
-    /// Allocates a fresh `Vec<Option<&V>>` on every call. Callers that
-    /// re-issue batches in a hot loop should prefer
-    /// [`Self::multi_get_into`], which writes into a caller-owned buffer.
-    ///
-    /// # Prefetch scope
-    ///
-    /// Only the level-0 control-byte group is prefetched. For maps at low
-    /// load (where the bulk of hits land in level 0) this is the entire win.
-    /// Miss-heavy batches that probe into level >= 1 see no prefetch benefit
-    /// and may pay one extra L1 fetch per key for the speculative level-0
-    /// load.
+    /// Only level 0 is prefetched: miss-heavy batches that fall through to
+    /// deeper levels see no prefetch benefit.
     pub fn multi_get<'a, Q>(&self, keys: &[&'a Q]) -> Vec<Option<&V>>
     where
         K: Borrow<Q>,
@@ -406,23 +396,17 @@ where
         out
     }
 
-    /// Sibling of [`Self::multi_get`] that writes results into `out`,
-    /// reusing its allocation across calls. `out` is `clear`ed first and
-    /// reserved to hold exactly `keys.len()` entries. Same pipelined
-    /// prefetch and same prefetch-scope caveats as `multi_get`.
+    /// Like [`Self::multi_get`], but writes into the caller-owned `out`
+    /// (cleared and re-reserved on entry) so repeated batches can reuse the
+    /// allocation.
     pub fn multi_get_into<'a, 'b, Q>(&'a self, keys: &[&'b Q], out: &mut Vec<Option<&'a V>>)
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized + 'b,
     {
-        // Sliding-window prefetch depth. Tuned empirically against
-        // `bench_multi_get_batch` at 10M entries / 1000-key bursts. Depths
-        // 4, 8, 12 all saturate the prefetch win and are within run-to-run
-        // noise on elastic (~2.95-2.97 ms / 100K ops); depth 16 regresses
-        // by ~16 % (line-fill-buffer pressure). The smaller per-bucket
-        // funnel layout shows the same shape: 4 and 12 best (~1.62 ms),
-        // 16 worst. We pick 8 as a conservative midpoint that doesn't add
-        // register pressure on smaller microarchitectures.
+        // Depths 4/8/12 all saturate the prefetch win at 10M × 1000-key
+        // bursts; 16 regresses ~16% (line-fill-buffer pressure). 8 is the
+        // midpoint with the least register pressure.
         const PIPELINE_DEPTH: usize = 8;
 
         let n = keys.len();
@@ -437,7 +421,6 @@ where
 
         let level0_opt = self.levels.first().filter(|l| l.len > 0);
 
-        // Prime the pipeline.
         if let Some(level0) = level0_opt {
             for &h in hashes.iter().take(PIPELINE_DEPTH.min(n)) {
                 let (group_start, _) = Self::group_probe_params(level0, h);
@@ -446,7 +429,6 @@ where
         }
 
         for i in 0..n {
-            // Issue prefetch for slot `i + DEPTH` while resolving slot `i`.
             if let Some(level0) = level0_opt
                 && let Some(&h_ahead) = hashes.get(i + PIPELINE_DEPTH)
             {
@@ -477,25 +459,18 @@ where
         Some(unsafe { &mut self.levels[level_idx].table.get_mut(slot_idx).value })
     }
 
-    /// Returns `N` disjoint mutable references to the values for `keys`.
-    ///
-    /// Matches the semantics of `std::collections::HashMap::get_disjoint_mut`:
-    /// returns `None` if any key is missing, and panics if any two keys
-    /// resolve to the same slot (alias safety). Probes run sequentially —
-    /// mutable refs can only be materialized after every probe has resolved
-    /// and uniqueness has been verified, so the pipelined `multi_get` path
-    /// does not apply here.
+    /// Returns `N` disjoint mutable references, mirroring
+    /// [`std::collections::HashMap::get_disjoint_mut`]: `None` if any key
+    /// misses, panic on aliasing.
     ///
     /// # Panics
     ///
-    /// Panics if two input keys resolve to the same `(level, slot)` pair
-    /// (i.e. they refer to the same entry).
+    /// If two input keys resolve to the same `(level, slot)` pair.
     pub fn get_disjoint_mut<Q, const N: usize>(&mut self, keys: [&Q; N]) -> Option<[&mut V; N]>
     where
         K: Borrow<Q> + Eq,
         Q: Hash + Eq + ?Sized,
     {
-        // Resolve each key to a (level, slot) tuple. Bail on first miss.
         let mut locations: [(usize, usize); N] = [(0, 0); N];
         for (i, key) in keys.iter().enumerate() {
             let key_hash = self.hash_key(*key);
@@ -503,8 +478,8 @@ where
             locations[i] = self.find_slot_indices_with_hash(*key, key_hash, key_fingerprint)?;
         }
 
-        // O(N^2) alias check on resolved slots. For typical N <= 16 this is
-        // cheaper than allocating a HashSet, and matches std's approach.
+        // O(N^2) alias check; cheaper than a HashSet for the small N
+        // (typically <= 16) std::get_disjoint_mut targets.
         for i in 0..N {
             for j in (i + 1)..N {
                 assert!(
@@ -514,11 +489,9 @@ where
             }
         }
 
-        // Build the mutable-reference array. SAFETY: every location is
-        // unique (checked above) and points to an occupied slot (returned by
-        // `find_slot_indices_with_hash`). The raw pointer cast on `levels`
-        // lets us hand out disjoint borrows into the same Vec without
-        // re-borrowing the whole slice for each entry.
+        // SAFETY: locations are unique (checked above) and point to occupied
+        // slots. Raw pointer into `levels` lets us hand out disjoint borrows
+        // without reborrowing the slice each iteration.
         let levels_ptr: *mut Level<K, V> = self.levels.as_mut_ptr();
         let mut out: core::mem::MaybeUninit<[&mut V; N]> = core::mem::MaybeUninit::uninit();
         let out_ptr = out.as_mut_ptr().cast::<&mut V>();
@@ -1377,8 +1350,7 @@ mod tests {
         assert_eq!(map.get(&5), Some(&555));
     }
 
-    // PIPELINE_DEPTH = 8 inside multi_get_into; exercise the off-by-one
-    // boundary at exactly the prime-pipeline edge.
+    // Exercise off-by-one around PIPELINE_DEPTH = 8.
     #[test]
     fn multi_get_at_pipeline_depth_boundary() {
         let n: i32 = 32;
@@ -1398,9 +1370,6 @@ mod tests {
         }
     }
 
-    // Miss-heavy: the prefetch is level-0-only, so deeper-level / total-miss
-    // batches must still return correct results even though the prefetch
-    // pays no dividend.
     #[test]
     fn multi_get_miss_heavy_batch() {
         let n: i32 = 1_000;
@@ -1409,18 +1378,13 @@ mod tests {
             map.insert(i, i);
         }
 
-        // All keys miss.
         let miss_keys: Vec<i32> = ((n + 1_000)..(n + 2_000)).collect();
         let refs: Vec<&i32> = miss_keys.iter().collect();
         let out = map.multi_get(&refs);
         assert_eq!(out.len(), miss_keys.len());
-        assert!(
-            out.iter().all(Option::is_none),
-            "all-miss batch should return all None"
-        );
+        assert!(out.iter().all(Option::is_none));
     }
 
-    // Duplicate keys within a batch must yield matching `Some` entries.
     #[test]
     fn multi_get_duplicate_keys_in_batch_yield_same_value() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(32);
@@ -1437,7 +1401,6 @@ mod tests {
         assert_eq!(out[4].copied(), Some(700));
     }
 
-    // multi_get_into reuses the caller's buffer.
     #[test]
     fn multi_get_into_reuses_buffer_across_calls() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
@@ -1462,7 +1425,6 @@ mod tests {
             assert_eq!(v.copied(), Some(*k * 2));
         }
 
-        // Empty batch clears the buffer.
         map.multi_get_into::<i32>(&[], &mut out);
         assert!(out.is_empty());
     }
