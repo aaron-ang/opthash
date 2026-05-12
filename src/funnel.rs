@@ -548,17 +548,44 @@ where
     /// Batched lookup: pipelines N keys by issuing prefetches for the
     /// level-0 bucket `PIPELINE_DEPTH` iterations ahead of the resolution
     /// loop. Overlaps independent DRAM/L3 misses.
+    ///
+    /// Allocates a fresh `Vec<Option<&V>>` on every call. Callers that
+    /// re-issue batches in a hot loop should prefer
+    /// [`Self::multi_get_into`], which writes into a caller-owned buffer.
+    ///
+    /// # Prefetch scope
+    ///
+    /// Only the level-0 bucket group is prefetched. Miss-heavy batches that
+    /// probe into level >= 1 or fall through to the special arrays see no
+    /// prefetch benefit and may pay one speculative L1 fetch per key.
     pub fn multi_get<'a, Q>(&self, keys: &[&'a Q]) -> Vec<Option<&V>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized + 'a,
     {
-        // See ElasticHashMap::multi_get for depth tuning rationale.
+        let mut out = Vec::with_capacity(keys.len());
+        self.multi_get_into(keys, &mut out);
+        out
+    }
+
+    /// Sibling of [`Self::multi_get`] that writes results into `out`,
+    /// reusing its allocation across calls. `out` is `clear`ed first and
+    /// reserved to hold exactly `keys.len()` entries. Same pipelined
+    /// prefetch and same prefetch-scope caveats as `multi_get`.
+    pub fn multi_get_into<'a, 'b, Q>(&'a self, keys: &[&'b Q], out: &mut Vec<Option<&'a V>>)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized + 'b,
+    {
+        // See ElasticHashMap::multi_get_into for depth tuning rationale.
         const PIPELINE_DEPTH: usize = 8;
 
         let n = keys.len();
+        out.clear();
+        out.reserve(n);
         if self.len == 0 {
-            return vec![None; n];
+            out.extend(std::iter::repeat_n(None, n));
+            return;
         }
 
         let hashes: Vec<u64> = keys.iter().map(|k| self.hash_key(*k)).collect();
@@ -573,7 +600,6 @@ where
             }
         }
 
-        let mut out: Vec<Option<&V>> = Vec::with_capacity(n);
         for i in 0..n {
             if let Some(level0) = level0_opt
                 && let Some(&h_ahead) = hashes.get(i + PIPELINE_DEPTH)
@@ -601,7 +627,6 @@ where
                 });
             out.push(result);
         }
-        out
     }
 
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>

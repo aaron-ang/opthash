@@ -384,21 +384,51 @@ where
     /// probe group `PIPELINE_DEPTH` iterations ahead of the resolution loop.
     /// Overlaps independent DRAM/L3 misses to hide memory latency on
     /// workloads like batch joins or set intersection.
+    ///
+    /// Allocates a fresh `Vec<Option<&V>>` on every call. Callers that
+    /// re-issue batches in a hot loop should prefer
+    /// [`Self::multi_get_into`], which writes into a caller-owned buffer.
+    ///
+    /// # Prefetch scope
+    ///
+    /// Only the level-0 control-byte group is prefetched. For maps at low
+    /// load (where the bulk of hits land in level 0) this is the entire win.
+    /// Miss-heavy batches that probe into level >= 1 see no prefetch benefit
+    /// and may pay one extra L1 fetch per key for the speculative level-0
+    /// load.
     pub fn multi_get<'a, Q>(&self, keys: &[&'a Q]) -> Vec<Option<&V>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized + 'a,
     {
+        let mut out = Vec::with_capacity(keys.len());
+        self.multi_get_into(keys, &mut out);
+        out
+    }
+
+    /// Sibling of [`Self::multi_get`] that writes results into `out`,
+    /// reusing its allocation across calls. `out` is `clear`ed first and
+    /// reserved to hold exactly `keys.len()` entries. Same pipelined
+    /// prefetch and same prefetch-scope caveats as `multi_get`.
+    pub fn multi_get_into<'a, 'b, Q>(&'a self, keys: &[&'b Q], out: &mut Vec<Option<&'a V>>)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized + 'b,
+    {
         // Sliding-window prefetch depth. Tuned empirically against
         // `bench_multi_get_batch`: depths in {4, 8, 12, 16} produced
         // statistically indistinguishable throughput at 10M entries and
-        // 1000-key bursts, so we keep the value modest to limit
-        // line-fill-buffer pressure on smaller microarchitectures.
+        // 1000-key bursts. Kept modest to limit line-fill-buffer pressure
+        // on smaller microarchitectures. See PR #11 for per-depth Criterion
+        // deltas.
         const PIPELINE_DEPTH: usize = 8;
 
         let n = keys.len();
+        out.clear();
+        out.reserve(n);
         if self.len == 0 {
-            return vec![None; n];
+            out.extend(std::iter::repeat_n(None, n));
+            return;
         }
 
         let hashes: Vec<u64> = keys.iter().map(|k| self.hash_key(*k)).collect();
@@ -413,7 +443,6 @@ where
             }
         }
 
-        let mut out: Vec<Option<&V>> = Vec::with_capacity(n);
         for i in 0..n {
             // Issue prefetch for slot `i + DEPTH` while resolving slot `i`.
             if let Some(level0) = level0_opt
@@ -432,7 +461,6 @@ where
             );
             out.push(result);
         }
-        out
     }
 
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
