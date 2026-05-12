@@ -265,11 +265,19 @@ struct ProbeKey {
 }
 
 impl ProbeKey {
+    /// Build a non-owning probe wrapping `ob`'s raw `PyObject*` and cached
+    /// hash. No refcount bump — the returned `ProbeKey` borrows the object
+    /// from `ob` lexically.
+    ///
     /// # Safety
-    /// Caller must ensure `ob` outlives the returned `ProbeKey`. The probe
-    /// holds a non-owning copy of the underlying `PyObject` pointer (with
-    /// the kind tag packed into the low bits, same as a normal `HashedAny`).
-    fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+    /// `ob` must outlive the returned `ProbeKey`. The probe stores the raw
+    /// pointer (with the kind tag packed into the low bits) in a
+    /// `ManuallyDrop<HashedAny>` and never bumps or decrements the refcount,
+    /// so dropping the source `Bound` before the probe would leave the
+    /// inner pointer dangling. Marked `unsafe fn` because the function
+    /// signature cannot bind the probe's lifetime to `ob` — every call site
+    /// must visually confirm the source `Bound` is still in scope.
+    unsafe fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let hash = ob.hash()?;
         let kind = HashedAny::detect_kind(ob);
         // SAFETY: `ob.as_ptr()` is a valid, properly-aligned `PyObject*`.
@@ -448,12 +456,14 @@ macro_rules! define_map_classes {
             }
 
             fn __contains__(&self, key: &Bound<'_, PyAny>) -> PyResult<bool> {
-                let probe = ProbeKey::from_bound(key)?;
+                // SAFETY: `key` lives for the whole function and outlives `probe`.
+                let probe = unsafe { ProbeKey::from_bound(key) }?;
                 Ok(self.inner.contains_key(probe.as_key()))
             }
 
             fn __getitem__(&self, key: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-                let probe = ProbeKey::from_bound(key)?;
+                // SAFETY: `key` outlives `probe`.
+                let probe = unsafe { ProbeKey::from_bound(key) }?;
                 match self.inner.get(probe.as_key()) {
                     Some(v) => Ok(v.clone_ref(py)),
                     None => Err(PyKeyError::new_err(key.clone().unbind())),
@@ -472,7 +482,8 @@ macro_rules! define_map_classes {
             }
 
             fn __delitem__(&mut self, key: &Bound<'_, PyAny>) -> PyResult<()> {
-                let probe = ProbeKey::from_bound(key)?;
+                // SAFETY: `key` outlives `probe`.
+                let probe = unsafe { ProbeKey::from_bound(key) }?;
                 match self.inner.remove(probe.as_key()) {
                     Some(_) => {
                         self.bump();
@@ -489,7 +500,8 @@ macro_rules! define_map_classes {
                 default: Option<Py<PyAny>>,
                 py: Python<'_>,
             ) -> PyResult<Py<PyAny>> {
-                let probe = ProbeKey::from_bound(key)?;
+                // SAFETY: `key` outlives `probe`.
+                let probe = unsafe { ProbeKey::from_bound(key) }?;
                 Ok(match self.inner.get(probe.as_key()) {
                     Some(v) => v.clone_ref(py),
                     None => default.unwrap_or_else(|| py.None()),
@@ -618,7 +630,8 @@ macro_rules! define_map_classes {
                 key: &Bound<'_, PyAny>,
                 default: Option<Py<PyAny>>,
             ) -> PyResult<Py<PyAny>> {
-                let probe = ProbeKey::from_bound(key)?;
+                // SAFETY: `key` outlives `probe`.
+                let probe = unsafe { ProbeKey::from_bound(key) }?;
                 match self.inner.remove(probe.as_key()) {
                     Some(v) => {
                         self.bump();
@@ -649,7 +662,8 @@ macro_rules! define_map_classes {
                 default: Option<Py<PyAny>>,
                 py: Python<'_>,
             ) -> PyResult<Py<PyAny>> {
-                let probe = ProbeKey::from_bound(key)?;
+                // SAFETY: `key` outlives `probe`.
+                let probe = unsafe { ProbeKey::from_bound(key) }?;
                 if let Some(v) = self.inner.get(probe.as_key()) {
                     return Ok(v.clone_ref(py));
                 }
@@ -790,7 +804,8 @@ macro_rules! define_map_classes {
             }
             fn __contains__(&self, key: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<bool> {
                 let m = self.map.borrow(py);
-                let probe = ProbeKey::from_bound(key)?;
+                // SAFETY: `key` outlives `probe`.
+                let probe = unsafe { ProbeKey::from_bound(key) }?;
                 Ok(m.inner.contains_key(probe.as_key()))
             }
             fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
@@ -869,7 +884,9 @@ macro_rules! define_map_classes {
                 let m = self.map.borrow(py);
                 for item in other.try_iter()? {
                     let item = item?;
-                    let probe = ProbeKey::from_bound(&item)?;
+                    // SAFETY: `item` outlives `probe`; both go out of scope
+                    // at the end of this loop iteration.
+                    let probe = unsafe { ProbeKey::from_bound(&item) }?;
                     if !m.inner.contains_key(probe.as_key()) {
                         result.add(item)?;
                     }
@@ -961,7 +978,8 @@ macro_rules! define_map_classes {
                 let k = tup.get_item(0)?;
                 let v = tup.get_item(1)?;
                 let m = self.map.borrow(py);
-                let probe = ProbeKey::from_bound(&k)?;
+                // SAFETY: `k` outlives `probe`.
+                let probe = unsafe { ProbeKey::from_bound(&k) }?;
                 match m.inner.get(probe.as_key()) {
                     Some(stored_v) => Ok(stored_v.bind(py).eq(&v).unwrap_or(false)),
                     None => Ok(false),
