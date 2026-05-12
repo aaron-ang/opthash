@@ -527,44 +527,82 @@ fn bench_mixed_lookup_throughput(c: &mut Criterion) {
 }
 
 fn bench_multi_get_batch(c: &mut Criterion) {
-    // Build pairs once, then query in 1000-key bursts. Compares naive loop of
-    // `.get()` against `multi_get` which prefetches level-0 control bytes.
+    // Build pairs once, then query in `GET_MANY_BATCH`-sized bursts. Compares
+    // a naive `.get()` loop against the pipelined `multi_get_into`.
+    //
+    // Fairness: both arms walk the same `Vec<Vec<&u64>>` of chunk slices
+    // (same outer indirection) and both reuse a caller-owned scratch buffer
+    // for output so neither pays per-call allocation tax. The only delta
+    // between `*_naive` and `*_multi_get_into` is the pipelined prefetch in
+    // the batched method.
+    //
+    // The trailing `*_multi_get` arms exercise the alloc-returning wrapper
+    // so the per-call `Vec` cost remains visible for callers who don't pool
+    // the output.
     let pairs = make_pairs(GET_MANY_MAP_SIZE);
     let query_keys: Vec<u64> = (0..GET_MANY_TOTAL)
         .map(|idx| pairs[idx % GET_MANY_MAP_SIZE].0)
+        .collect();
+    let chunks: Vec<Vec<&u64>> = query_keys
+        .chunks(GET_MANY_BATCH)
+        .map(|chunk| chunk.iter().collect())
         .collect();
 
     let mut group = c.benchmark_group("multi_get_batch");
     group.throughput(Throughput::Elements(GET_MANY_TOTAL as u64));
 
-    // Naive: a flat loop of `.get()` over the same keys. Establishes the
-    // single-key baseline cost (which pays one cache miss per call).
     group.bench_function("elastic_naive", |b| {
         let map = build_elastic_map(&pairs);
+        let mut scratch: Vec<Option<&u64>> = Vec::with_capacity(GET_MANY_BATCH);
         b.iter(|| {
-            for key in &query_keys {
-                black_box(map.get(black_box(key)));
+            for chunk in &chunks {
+                scratch.clear();
+                for key in chunk {
+                    scratch.push(map.get(black_box(*key)));
+                }
+                black_box(&scratch);
             }
         });
     });
 
     group.bench_function("funnel_naive", |b| {
         let map = build_funnel_map(&pairs);
+        let mut scratch: Vec<Option<&u64>> = Vec::with_capacity(GET_MANY_BATCH);
         b.iter(|| {
-            for key in &query_keys {
-                black_box(map.get(black_box(key)));
+            for chunk in &chunks {
+                scratch.clear();
+                for key in chunk {
+                    scratch.push(map.get(black_box(*key)));
+                }
+                black_box(&scratch);
             }
         });
     });
 
-    // Batched: same total work, but issued in `GET_MANY_BATCH`-sized chunks
-    // so the prefetch in stage 1 of `multi_get` can hide DRAM latency.
+    group.bench_function("elastic_multi_get_into", |b| {
+        let map = build_elastic_map(&pairs);
+        let mut scratch: Vec<Option<&u64>> = Vec::with_capacity(GET_MANY_BATCH);
+        b.iter(|| {
+            for chunk in &chunks {
+                map.multi_get_into(chunk, &mut scratch);
+                black_box(&scratch);
+            }
+        });
+    });
+
+    group.bench_function("funnel_multi_get_into", |b| {
+        let map = build_funnel_map(&pairs);
+        let mut scratch: Vec<Option<&u64>> = Vec::with_capacity(GET_MANY_BATCH);
+        b.iter(|| {
+            for chunk in &chunks {
+                map.multi_get_into(chunk, &mut scratch);
+                black_box(&scratch);
+            }
+        });
+    });
+
     group.bench_function("elastic_multi_get", |b| {
         let map = build_elastic_map(&pairs);
-        let chunks: Vec<Vec<&u64>> = query_keys
-            .chunks(GET_MANY_BATCH)
-            .map(|chunk| chunk.iter().collect())
-            .collect();
         b.iter(|| {
             for chunk in &chunks {
                 black_box(map.multi_get(chunk));
@@ -574,10 +612,6 @@ fn bench_multi_get_batch(c: &mut Criterion) {
 
     group.bench_function("funnel_multi_get", |b| {
         let map = build_funnel_map(&pairs);
-        let chunks: Vec<Vec<&u64>> = query_keys
-            .chunks(GET_MANY_BATCH)
-            .map(|chunk| chunk.iter().collect())
-            .collect();
         b.iter(|| {
             for chunk in &chunks {
                 black_box(map.multi_get(chunk));
