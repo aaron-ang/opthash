@@ -78,6 +78,19 @@ impl<T> Drop for RawTable<T> {
 
 impl<T> RawTable<T> {
     pub fn new(capacity: usize) -> Self {
+        // ZSTs would make `Layout::array::<T>(capacity)` a no-op and let
+        // `capacity` (and thus `group_count`) grow without bound, which would
+        // then overflow the control / mini-hash sidecar layout math below.
+        // RawTable is only instantiated with `Entry<K, V>` and `u64` today; the
+        // assertion is constant-folded for those types and pins the invariant
+        // for any future callers.
+        const {
+            assert!(
+                std::mem::size_of::<T>() != 0,
+                "RawTable<T> requires a non-ZST T"
+            );
+        };
+
         if capacity == 0 {
             return Self {
                 data_ptr: NonNull::dangling(),
@@ -109,11 +122,13 @@ impl<T> RawTable<T> {
     /// Layout: `[slots (T-aligned)] [pad] [controls (64-aligned)] [pad] [mini-hashes (64-aligned)]`.
     fn unified_layout(capacity: usize, group_count: usize) -> (Layout, usize, usize) {
         let slots_layout = Layout::array::<T>(capacity).expect("slots layout overflow");
-        let controls_layout = Layout::from_size_align(group_count * GROUP_SIZE, CONTROL_ALIGN)
-            .expect("controls layout overflow");
-        let mini_size = group_count
+        let controls_size = group_count
             .checked_mul(GROUP_SIZE)
-            .and_then(|n| n.checked_mul(std::mem::size_of::<u32>()))
+            .expect("controls layout overflow");
+        let controls_layout = Layout::from_size_align(controls_size, CONTROL_ALIGN)
+            .expect("controls layout overflow");
+        let mini_size = controls_size
+            .checked_mul(std::mem::size_of::<u32>())
             .expect("mini-hash layout overflow");
         let mini_layout =
             Layout::from_size_align(mini_size, CONTROL_ALIGN).expect("mini-hash layout overflow");
