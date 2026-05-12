@@ -2073,7 +2073,7 @@ mod tests {
         }
 
         for batch_size in [7usize, 8, 9, 16, 17] {
-            let probe_keys: Vec<i32> = (0..(batch_size as i32)).collect();
+            let probe_keys: Vec<i32> = (0..i32::try_from(batch_size).expect("fits")).collect();
             let refs: Vec<&i32> = probe_keys.iter().collect();
             let batched = map.multi_get(&refs);
             assert_eq!(batched.len(), batch_size, "len at N={batch_size}");
