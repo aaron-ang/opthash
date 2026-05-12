@@ -7,7 +7,7 @@ use crate::common::simd::{ProbeOps, prefetch_read};
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
     control::{CTRL_EMPTY, ControlByte, ControlOps},
-    layout::{Entry, GROUP_SIZE, RawTable},
+    layout::{Entry, GROUP_SIZE, RawTable, mini_hash_from_full},
     math::{
         advance_wrapping_index, ceil_to_usize, fastmod_magic, fastmod_u32, floor_to_usize,
         level_salt, max_insertions, round_to_usize, round_up_to_group, sanitize_reserve_fraction,
@@ -452,9 +452,10 @@ where
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let key_hash = self.hash_key(&key);
         let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_mini = mini_hash_from_full(key_hash);
 
         let level_candidate =
-            match self.find_in_levels_with_candidate(&key, key_hash, key_fingerprint) {
+            match self.find_in_levels_with_candidate(&key, key_hash, key_fingerprint, key_mini) {
                 Ok(location) => return Some(self.replace_existing_value(location, value)),
                 Err(level_candidate) => level_candidate,
             };
@@ -473,7 +474,7 @@ where
         }
 
         let (primary_step, primary_candidate) =
-            self.find_in_special_primary_with_candidate(key_hash, key_fingerprint, &key);
+            self.find_in_special_primary_with_candidate(key_hash, key_fingerprint, key_mini, &key);
         match primary_step {
             LookupStep::Found(slot_idx) => {
                 return Some(
@@ -502,7 +503,7 @@ where
         }
 
         let (fallback_match, fallback_candidate) =
-            self.find_in_special_fallback_with_candidate(key_hash, key_fingerprint, &key);
+            self.find_in_special_fallback_with_candidate(key_hash, key_fingerprint, key_mini, &key);
         if let Some(slot_idx) = fallback_match {
             return Some(
                 self.replace_existing_value(SlotLocation::SpecialFallback { slot_idx }, value),
@@ -792,6 +793,7 @@ where
         key: &Q,
         key_hash: u64,
         key_fingerprint: u8,
+        key_mini: u32,
     ) -> Result<SlotLocation, Option<SlotLocation>>
     where
         K: Borrow<Q>,
@@ -801,8 +803,13 @@ where
         let mut candidate = None;
 
         for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
-            let (lookup_step, slot_candidate) =
-                Self::find_in_level_bucket_with_candidate(key_hash, key_fingerprint, key, level);
+            let (lookup_step, slot_candidate) = Self::find_in_level_bucket_with_candidate(
+                key_hash,
+                key_fingerprint,
+                key_mini,
+                key,
+                level,
+            );
             if candidate.is_none() {
                 candidate = slot_candidate.map(|slot_idx| SlotLocation::Level {
                     level_idx,
@@ -849,10 +856,11 @@ where
     fn insert_new_entry_unchecked(&mut self, key: K, value: V) {
         let key_hash = self.hash_key(&key);
         let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_mini = mini_hash_from_full(key_hash);
         let location = self
             .choose_slot_for_new_key(key_hash)
             .expect("resized funnel map should have free slot");
-        self.place_new_entry(location, key, value, key_fingerprint);
+        self.place_new_entry(location, key, value, key_fingerprint, key_mini);
     }
 
     #[inline]
@@ -883,21 +891,32 @@ where
             }
         };
 
-        self.place_new_entry(final_location, key, value, key_fingerprint);
+        let key_mini = mini_hash_from_full(key_hash);
+        self.place_new_entry(final_location, key, value, key_fingerprint, key_mini);
         None
     }
 
     #[inline]
-    fn place_new_entry(&mut self, location: SlotLocation, key: K, value: V, key_fingerprint: u8) {
+    fn place_new_entry(
+        &mut self,
+        location: SlotLocation,
+        key: K,
+        value: V,
+        key_fingerprint: u8,
+        key_mini: u32,
+    ) {
         match location {
             SlotLocation::Level {
                 level_idx,
                 slot_idx,
             } => {
                 let level = &mut self.levels[level_idx];
-                level
-                    .table
-                    .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
+                level.table.write_with_control(
+                    slot_idx,
+                    Entry { key, value },
+                    key_fingerprint,
+                    key_mini,
+                );
                 level.len += 1;
                 if level_idx > self.max_populated_level {
                     self.max_populated_level = level_idx;
@@ -906,17 +925,23 @@ where
             SlotLocation::SpecialPrimary { slot_idx } => {
                 let group_idx = slot_idx / GROUP_SIZE;
                 let primary = &mut self.special.primary;
-                primary
-                    .table
-                    .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
+                primary.table.write_with_control(
+                    slot_idx,
+                    Entry { key, value },
+                    key_fingerprint,
+                    key_mini,
+                );
                 primary.len += 1;
                 primary.group_summaries[group_idx] |= ControlOps::fingerprint_bit(key_fingerprint);
             }
             SlotLocation::SpecialFallback { slot_idx } => {
                 let fallback = &mut self.special.fallback;
-                fallback
-                    .table
-                    .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
+                fallback.table.write_with_control(
+                    slot_idx,
+                    Entry { key, value },
+                    key_fingerprint,
+                    key_mini,
+                );
                 fallback.len += 1;
             }
         }
@@ -997,6 +1022,7 @@ where
     fn find_in_level_bucket<Q>(
         key_hash: u64,
         key_fingerprint: u8,
+        key_mini: u32,
         key: &Q,
         level: &BucketLevel<K, V>,
     ) -> LookupStep
@@ -1013,13 +1039,16 @@ where
         debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
         let group_idx = bucket_range.start / GROUP_SIZE;
 
-        // SIMD fingerprint scan — same as _with_candidate.
+        // SIMD fingerprint scan, mini-hash gate, then key compare.
         for relative_idx in level
             .table
             .group_match_mask(group_idx, key_fingerprint)
             .truncate_to(level.bucket_size)
         {
             let slot_idx = bucket_range.start + relative_idx;
+            if level.table.mini_hash_at(slot_idx) != key_mini {
+                continue;
+            }
             let entry = unsafe { level.table.get_ref(slot_idx) };
             if entry.key.borrow() == key {
                 return LookupStep::Found(slot_idx);
@@ -1044,6 +1073,7 @@ where
     fn find_in_level_bucket_with_candidate<Q>(
         key_hash: u64,
         key_fingerprint: u8,
+        key_mini: u32,
         key: &Q,
         level: &BucketLevel<K, V>,
     ) -> (LookupStep, Option<usize>)
@@ -1064,13 +1094,16 @@ where
         debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
         let group_idx = bucket_range.start / GROUP_SIZE;
 
-        // SIMD fingerprint scan over the bucket's control bytes.
+        // SIMD fingerprint scan, mini-hash gate, then key compare.
         for relative_idx in level
             .table
             .group_match_mask(group_idx, key_fingerprint)
             .truncate_to(level.bucket_size)
         {
             let slot_idx = bucket_range.start + relative_idx;
+            if level.table.mini_hash_at(slot_idx) != key_mini {
+                continue;
+            }
             let entry = unsafe { level.table.get_ref(slot_idx) };
             if entry.key.borrow() == key {
                 let free_candidate = level
@@ -1109,7 +1142,13 @@ where
     /// candidate tracking). Bounded by `primary_probe_limit` groups; if
     /// reached without a match and no tombstones seen, returns `StopSearch`
     /// so the caller skips fallback.
-    fn find_in_special_primary<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> LookupStep
+    fn find_in_special_primary<Q>(
+        &self,
+        key_hash: u64,
+        key_fingerprint: u8,
+        key_mini: u32,
+        key: &Q,
+    ) -> LookupStep
     where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
@@ -1129,6 +1168,9 @@ where
             if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
                 for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
                     let slot_idx = group_idx * GROUP_SIZE + relative_idx;
+                    if primary.table.mini_hash_at(slot_idx) != key_mini {
+                        continue;
+                    }
                     let entry = unsafe { primary.table.get_ref(slot_idx) };
                     if entry.key.borrow() == key {
                         return LookupStep::Found(slot_idx);
@@ -1156,6 +1198,7 @@ where
         &self,
         key_hash: u64,
         key_fingerprint: u8,
+        key_mini: u32,
         key: &Q,
     ) -> (LookupStep, Option<usize>)
     where
@@ -1188,6 +1231,9 @@ where
             if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
                 for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
                     let slot_idx = group_idx * GROUP_SIZE + relative_idx;
+                    if primary.table.mini_hash_at(slot_idx) != key_mini {
+                        continue;
+                    }
                     let entry = unsafe { primary.table.get_ref(slot_idx) };
                     if entry.key.borrow() == key {
                         return (LookupStep::Found(slot_idx), candidate);
@@ -1215,6 +1261,7 @@ where
         &self,
         key_hash: u64,
         key_fingerprint: u8,
+        key_mini: u32,
         key: &Q,
     ) -> Option<usize>
     where
@@ -1250,9 +1297,11 @@ where
                 match_offset,
             ) {
                 let slot_idx = range.start + relative_idx;
-                let entry = unsafe { fallback.table.get_ref(slot_idx) };
-                if entry.key.borrow() == key {
-                    return Some(slot_idx);
+                if fallback.table.mini_hash_at(slot_idx) == key_mini {
+                    let entry = unsafe { fallback.table.get_ref(slot_idx) };
+                    if entry.key.borrow() == key {
+                        return Some(slot_idx);
+                    }
                 }
                 match_offset = relative_idx + 1;
             }
@@ -1267,6 +1316,7 @@ where
         &self,
         key_hash: u64,
         key_fingerprint: u8,
+        key_mini: u32,
         key: &Q,
     ) -> (Option<usize>, Option<usize>)
     where
@@ -1305,7 +1355,7 @@ where
         }
 
         (
-            self.find_in_special_fallback(key_hash, key_fingerprint, key),
+            self.find_in_special_fallback(key_hash, key_fingerprint, key_mini, key),
             candidate,
         )
     }
@@ -1320,9 +1370,10 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
+        let key_mini = mini_hash_from_full(key_hash);
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
-            match Self::find_in_level_bucket(key_hash, key_fingerprint, key, level) {
+            match Self::find_in_level_bucket(key_hash, key_fingerprint, key_mini, key, level) {
                 LookupStep::Found(slot_idx) => {
                     return Some(SlotLocation::Level {
                         level_idx,
@@ -1338,13 +1389,13 @@ where
             return None;
         }
 
-        match self.find_in_special_primary(key_hash, key_fingerprint, key) {
+        match self.find_in_special_primary(key_hash, key_fingerprint, key_mini, key) {
             LookupStep::Found(slot_idx) => return Some(SlotLocation::SpecialPrimary { slot_idx }),
             LookupStep::Continue => {}
             LookupStep::StopSearch => return None,
         }
 
-        self.find_in_special_fallback(key_hash, key_fingerprint, key)
+        self.find_in_special_fallback(key_hash, key_fingerprint, key_mini, key)
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 

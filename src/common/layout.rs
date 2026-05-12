@@ -13,24 +13,42 @@ pub(crate) const GROUP_SIZE: usize = 16;
 /// the first group is line-aligned and groups pack 4-per-line without splits.
 const CONTROL_ALIGN: usize = 64;
 
+/// Derive the 32-bit sidecar value from a full 64-bit hash. Uses bits
+/// disjoint from the 7-bit control fingerprint (`hash >> 57`) so the two
+/// metadata channels collide independently.
+#[inline]
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn mini_hash_from_full(hash: u64) -> u32 {
+    // Take the low 32 bits — fully disjoint from the fingerprint's top 7 bits.
+    hash as u32
+}
+
 pub(crate) struct Entry<K, V> {
     pub(crate) key: K,
     pub(crate) value: V,
 }
 
-/// A flat hash table: one allocation holds slots then control bytes.
+/// A flat hash table: one allocation holds slots, control bytes, and a
+/// per-slot 32-bit mini-hash sidecar.
 ///
 /// ```text
-/// [slots: capacity * sizeof(T)] [padding for 16-byte alignment] [controls: group_count * 16]
+/// [slots: capacity * sizeof(T)] [pad] [controls: group_count * 16 (64-aligned)] [pad] [mini_hashes: group_count * 16 * u32 (64-aligned)]
 /// ```
 ///
-/// `data_ptr` points to the start of the slots array. Control bytes live at
-/// a fixed offset after the slots, accessed via `ctrl_ptr()`.
+/// `data_ptr` points to the start of the slots array; control bytes and
+/// mini-hashes live at fixed offsets, accessed via `ctrl_ptr()` /
+/// `mini_ptr()`. The mini-hash sidecar carries one `u32` per slot and is
+/// consulted after the SIMD fingerprint match, before any key compare. This
+/// drops the false-positive rate of the 7-bit fingerprint (~1/128) down to
+/// ~1/2^32, which matters when key equality is expensive (e.g. crossing the
+/// GIL for `HashedAny::eq`).
 pub(crate) struct RawTable<T> {
     data_ptr: NonNull<u8>,
     capacity: usize,
     group_count: usize,
     ctrl_offset: usize,
+    mini_offset: usize,
     _marker: PhantomData<T>,
 }
 
@@ -52,7 +70,7 @@ impl<T> std::fmt::Debug for RawTable<T> {
 impl<T> Drop for RawTable<T> {
     fn drop(&mut self) {
         if self.capacity > 0 {
-            let (layout, _) = Self::unified_layout(self.capacity, self.group_count);
+            let (layout, _, _) = Self::unified_layout(self.capacity, self.group_count);
             unsafe { alloc::dealloc(self.data_ptr.as_ptr(), layout) };
         }
     }
@@ -66,13 +84,14 @@ impl<T> RawTable<T> {
                 capacity: 0,
                 group_count: 0,
                 ctrl_offset: 0,
+                mini_offset: 0,
                 _marker: PhantomData,
             };
         }
 
         let padded_capacity = round_up_to_group(capacity);
         let group_count = padded_capacity / GROUP_SIZE;
-        let (layout, ctrl_offset) = Self::unified_layout(capacity, group_count);
+        let (layout, ctrl_offset, mini_offset) = Self::unified_layout(capacity, group_count);
 
         let raw = unsafe { alloc::alloc_zeroed(layout) };
         let data_ptr = NonNull::new(raw).unwrap_or_else(|| alloc::handle_alloc_error(layout));
@@ -82,19 +101,29 @@ impl<T> RawTable<T> {
             capacity,
             group_count,
             ctrl_offset,
+            mini_offset,
             _marker: PhantomData,
         }
     }
 
-    /// Layout: `[slots (T-aligned)] [padding] [controls (64-aligned)]`.
-    fn unified_layout(capacity: usize, group_count: usize) -> (Layout, usize) {
+    /// Layout: `[slots (T-aligned)] [pad] [controls (64-aligned)] [pad] [mini-hashes (64-aligned)]`.
+    fn unified_layout(capacity: usize, group_count: usize) -> (Layout, usize, usize) {
         let slots_layout = Layout::array::<T>(capacity).expect("slots layout overflow");
         let controls_layout = Layout::from_size_align(group_count * GROUP_SIZE, CONTROL_ALIGN)
             .expect("controls layout overflow");
+        let mini_size = group_count
+            .checked_mul(GROUP_SIZE)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<u32>()))
+            .expect("mini-hash layout overflow");
+        let mini_layout =
+            Layout::from_size_align(mini_size, CONTROL_ALIGN).expect("mini-hash layout overflow");
         let (combined, ctrl_offset) = slots_layout
             .extend(controls_layout)
             .expect("layout extend overflow");
-        (combined.pad_to_align(), ctrl_offset)
+        let (combined, mini_offset) = combined
+            .extend(mini_layout)
+            .expect("layout extend overflow");
+        (combined.pad_to_align(), ctrl_offset, mini_offset)
     }
 
     #[inline]
@@ -105,6 +134,26 @@ impl<T> RawTable<T> {
     #[inline]
     fn ctrl_ptr(&self) -> *mut u8 {
         unsafe { self.data_ptr.as_ptr().add(self.ctrl_offset) }
+    }
+
+    #[inline]
+    #[allow(clippy::cast_ptr_alignment)]
+    fn mini_ptr(&self) -> *mut u32 {
+        // mini_offset is aligned to CONTROL_ALIGN (64), so the cast to *mut u32
+        // is sound.
+        unsafe { self.data_ptr.as_ptr().add(self.mini_offset).cast::<u32>() }
+    }
+
+    /// Per-slot 32-bit secondary hash used to short-circuit key compares after
+    /// a fingerprint match.
+    #[inline]
+    pub fn mini_hash_at(&self, idx: usize) -> u32 {
+        unsafe { *self.mini_ptr().add(idx) }
+    }
+
+    #[inline]
+    pub fn set_mini_hash(&mut self, idx: usize, mini: u32) {
+        unsafe { *self.mini_ptr().add(idx) = mini };
     }
 
     #[inline]
@@ -133,9 +182,10 @@ impl<T> RawTable<T> {
     }
 
     #[inline]
-    pub fn write_with_control(&mut self, idx: usize, value: T, control: u8) {
+    pub fn write_with_control(&mut self, idx: usize, value: T, control: u8, mini: u32) {
         self.write(idx, value);
         self.set_control(idx, control);
+        self.set_mini_hash(idx, mini);
     }
 
     #[inline]

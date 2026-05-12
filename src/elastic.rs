@@ -7,7 +7,7 @@ use crate::common::simd::ProbeOps;
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
     control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps},
-    layout::{Entry, GROUP_SIZE, RawTable},
+    layout::{Entry, GROUP_SIZE, RawTable, mini_hash_from_full},
     math::{
         advance_wrapping_index, ceil_three_quarters, fastmod_magic, fastmod_u32,
         floor_half_reserve_slots, level_salt, max_insertions, sanitize_reserve_fraction,
@@ -351,9 +351,10 @@ where
 
         let level = &mut self.levels[level_idx];
         let prev_ctrl = level.table.control_at(slot_idx);
+        let key_mini = mini_hash_from_full(key_hash);
         level
             .table
-            .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
+            .write_with_control(slot_idx, Entry { key, value }, key_fingerprint, key_mini);
         level.len += 1;
         if prev_ctrl == CTRL_TOMBSTONE {
             level.tombstones -= 1;
@@ -649,10 +650,11 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
+        let key_mini = mini_hash_from_full(key_hash);
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
             if let Some(slot_idx) =
-                Self::find_in_level_by_probe(key_hash, key_fingerprint, key, level)
+                Self::find_in_level_by_probe(key_hash, key_fingerprint, key_mini, key, level)
             {
                 return Some((level_idx, slot_idx));
             }
@@ -661,13 +663,14 @@ where
     }
 
     /// Probe one level for `key`. Walks groups via the level's double-hashing
-    /// step, SIMD-matches the fingerprint byte, then key-compares only the
-    /// matched slots. Stops on FREE byte (group has space) when no
-    /// tombstones exist.
+    /// step, SIMD-matches the fingerprint byte, gates each candidate on the
+    /// 32-bit mini-hash sidecar, then key-compares only the survivors. Stops
+    /// on FREE byte (group has space) when no tombstones exist.
     #[inline]
     fn find_in_level_by_probe<Q>(
         key_hash: u64,
         key_fingerprint: u8,
+        key_mini: u32,
         key: &Q,
         level: &Level<K, V>,
     ) -> Option<usize>
@@ -688,6 +691,9 @@ where
             let match_mask = level.table.group_match_mask(group_idx, key_fingerprint);
             for relative_idx in match_mask {
                 let slot_idx = group_idx * GROUP_SIZE + relative_idx;
+                if level.table.mini_hash_at(slot_idx) != key_mini {
+                    continue;
+                }
                 let entry = unsafe { level.table.get_ref(slot_idx) };
                 if entry.key.borrow() == key {
                     return Some(slot_idx);
