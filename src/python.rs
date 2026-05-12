@@ -63,15 +63,9 @@ fn build_funnel_options(
     Ok(opts)
 }
 
-/// Tag for the cached object's Python type, used to short-circuit `__eq__`
-/// dispatch in `HashedAny::eq` for the str-vs-str common case.
-///
-/// Encoded in the low bit of `HashedAny::tagged`. `CPython`'s `PyObject`
-/// starts with a `Py_ssize_t ob_refcnt`, which gives it natural alignment
-/// of at least `align_of::<usize>()` — 8B on 64-bit, 4B on 32-bit. Either
-/// way, the bottom bit of any real `PyObject*` is zero and free to reuse.
-/// Only 1 bit is reserved because `HashKind` has 2 variants; this keeps
-/// the trick portable across 32-bit and 64-bit Python.
+/// Python type tag, packed into the low bit of `HashedAny::tagged` to
+/// short-circuit the str-vs-str fast path in `HashedAny::eq`. Only 1 bit is
+/// used so the trick works on both 32- and 64-bit `PyObject*` alignment.
 #[derive(Clone, Copy, PartialEq)]
 #[repr(usize)]
 enum HashKind {
@@ -79,79 +73,52 @@ enum HashKind {
     Str = 1,
 }
 
-/// Mask covering the bits where `HashKind` lives in `HashedAny::tagged`.
-/// Single bit so the invariant holds on every `PyObject*` alignment ≥ 2B.
 const KIND_MASK: usize = 0b1;
 
 /// Owning hashable wrapper around a `Py<PyAny>` used as a map key.
 ///
-/// Caches the hash (computed once via Python `__hash__`) so `Hash` becomes a
-/// `write_isize` instead of a Python call. The `HashKind` tag is packed into
-/// the low bits of the object pointer so `PartialEq` can take the str-bytes
-/// fast path without re-detecting the type — and the struct fits in 16 bytes
-/// rather than 24 (8B pointer + 8B hash, no separate kind byte + padding).
+/// Caches `__hash__` so `Hash` is a single `write_isize`, and packs
+/// `HashKind` into the low bits of the object pointer so `PartialEq` can
+/// take the str-bytes fast path without re-detecting the type. Layout is
+/// `{pointer, isize}` — 16B on 64-bit (vs. 24B with a separate `kind` byte).
 struct HashedAny {
-    /// Object pointer with `HashKind` tag packed into bits covered by
-    /// `KIND_MASK` (currently the low bit).
-    ///
-    /// Holds one owned reference to the underlying `PyObject` — `Drop` calls
-    /// `Py_DECREF` on the masked pointer. The tagged value is non-null
-    /// because a valid `PyObject*` is non-null and the tag bits are also
-    /// permitted to be zero (`HashKind::Other = 0`).
+    /// Owned `PyObject*` with the `HashKind` tag in bits covered by
+    /// `KIND_MASK`. `Drop` calls `Py_DECREF` on the masked pointer.
     tagged: NonNull<ffi::PyObject>,
     /// Cached `__hash__` result.
     hash: isize,
 }
 
-// SAFETY: `HashedAny` owns one strong reference to a `PyObject`, exactly the
-// same invariant `Py<PyAny>` carries — and `Py<PyAny>` is `Send + Sync`. The
-// `NonNull<ffi::PyObject>` we store is `!Send + !Sync` only because the raw
-// pointer alias is conservative; the *semantics* of the owned reference are
-// unchanged from `Py<PyAny>`:
-//   * `Py_INCREF` / `Py_DECREF` are atomic (always under the GIL on the
-//     classic build, lock-free atomics on the free-threaded build).
-//   * The pointee is never dereferenced without first calling
-//     `Python::attach` to acquire a `Python<'_>` token.
-// So sending/sharing a `HashedAny` between threads is no less safe than
-// sending/sharing the `Py<PyAny>` it replaced.
+// SAFETY: same invariant as `Py<PyAny>` (which is `Send + Sync`): we own one
+// strong reference, refcount changes go through atomic `Py_INCREF` /
+// `Py_DECREF`, and the pointee is only dereferenced under `Python::attach`.
 unsafe impl Send for HashedAny {}
 unsafe impl Sync for HashedAny {}
 
-// Compile-time check that the tag-packing trick keeps the struct compact:
-// {NonNull<PyObject>} + {isize}, no padding. On 64-bit that's 16B (vs 24B
-// for the old layout with a separate `kind` byte + 7B padding); on 32-bit
-// it's 8B. We assert `2 * size_of::<usize>()` so the bound stays correct
-// across `target_pointer_width`.
+// Compact layout: {pointer, isize}, no padding. 16B on 64-bit, 8B on 32-bit.
 const _: () = assert!(std::mem::size_of::<HashedAny>() == 2 * std::mem::size_of::<usize>());
 
 impl HashedAny {
-    /// Pack a raw `PyObject*` together with its `HashKind` into a tagged
-    /// `NonNull`. The caller is responsible for the refcount being correct —
-    /// this routine performs no `Py_INCREF` / `Py_DECREF`.
+    /// Pack `obj` and `kind` into a tagged `NonNull`. Does not touch the
+    /// refcount.
     ///
     /// # Safety
-    /// `obj` must be non-null, and its low `KIND_MASK` bit must be zero
-    /// (`CPython` guarantees this for any real `PyObject*` since the struct
-    /// starts with a `Py_ssize_t` and thus has alignment ≥ 2B on every
-    /// supported platform).
+    /// `obj` must be non-null and its `KIND_MASK` bits must be zero —
+    /// `CPython` guarantees this since `PyObject` starts with a `Py_ssize_t`.
     #[inline]
     unsafe fn pack(obj: *mut ffi::PyObject, kind: HashKind) -> NonNull<ffi::PyObject> {
         assert!(!obj.is_null(), "PyObject pointer must be non-null");
-        // Runtime assert (not `debug_assert!`) so a future call site with a
-        // misaligned pointer fails loudly in release rather than silently
-        // corrupting the tagged value. `from_bound` / `ProbeKey::from_bound`
-        // run once per insert (cold path), so the one `cmp+jne` is negligible.
+        // Runtime (not debug) assert: cold path, and silent corruption of a
+        // misaligned pointer would be far worse than one extra `cmp+jne`.
         assert_eq!(
             obj as usize & KIND_MASK,
             0,
             "PyObject* low bits must be zero for tag packing"
         );
-        // SAFETY: caller guarantees `obj` is non-null. ORing in the tag bits
-        // can only set bits, so the result is also non-null.
+        // SAFETY: `obj` is non-null and ORing in tag bits keeps it non-null.
         unsafe { NonNull::new_unchecked(((obj as usize) | (kind as usize)) as *mut ffi::PyObject) }
     }
 
-    /// Detect the kind of `ob` for the str-bytes equality fast path.
     #[inline]
     fn detect_kind(ob: &Bound<'_, PyAny>) -> HashKind {
         // SAFETY: `Bound` always holds a valid `PyObject*`.
@@ -165,29 +132,23 @@ impl HashedAny {
     }
 
     /// Build by computing `__hash__` once and bumping the object's refcount.
-    /// We call `Py_INCREF` directly on the raw pointer instead of going
-    /// through `Bound::clone().unbind() + forget`, which would also produce
-    /// one strong reference but with extra moves of a `Py<PyAny>` smart
-    /// pointer the optimizer doesn't always elide.
+    /// Goes through `Py_INCREF` on the raw pointer rather than
+    /// `Bound::clone().unbind() + forget` to avoid `Py<PyAny>` moves the
+    /// optimizer doesn't always elide.
     fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let hash = ob.hash()?;
         let kind = Self::detect_kind(ob);
         let raw = ob.as_ptr();
-        // SAFETY: `Bound` guarantees `raw` is a valid, non-null `PyObject*`
-        // and the GIL is held (it's tied to `Bound`'s lifetime). We take
-        // ownership of the new strong reference into our tagged slot.
+        // SAFETY: `Bound` guarantees `raw` is non-null and the GIL is held.
         unsafe { ffi::Py_INCREF(raw) };
-        // SAFETY: `raw` is a non-null PyObject pointer whose low `KIND_MASK`
-        // bit is zero (`PyObject` alignment ≥ 2B on every supported target).
+        // SAFETY: `raw` is a valid `PyObject*` with zeroed low bit.
         let tagged = unsafe { Self::pack(raw, kind) };
         Ok(Self { tagged, hash })
     }
 
-    /// Refcount-bumping clone. Reuses the cached hash and kind so only the
-    /// `Py_INCREF` is paid.
+    /// Refcount-bumping clone. Reuses the cached hash and tag.
     fn clone_with_py(&self, _py: Python<'_>) -> Self {
-        // SAFETY: we hold one strong reference to `obj_ptr()`, so it remains
-        // valid for `Py_INCREF`. Calling under GIL (`_py`) is required.
+        // SAFETY: we hold a strong reference to `obj_ptr()`; GIL is held.
         unsafe { ffi::Py_INCREF(self.obj_ptr()) };
         Self {
             tagged: self.tagged,
@@ -201,40 +162,30 @@ impl HashedAny {
         ((self.tagged.as_ptr() as usize) & !KIND_MASK) as *mut ffi::PyObject
     }
 
-    /// Decoded `HashKind` tag. Lists every `HashKind` discriminant
-    /// explicitly so adding a new variant requires an update here
-    /// instead of silently aliasing to `Other` via a catch-all.
-    /// Hot path — called twice per `PartialEq::eq` cross-type check.
+    /// Decoded `HashKind` tag. Exhaustive match (not catch-all) so a new
+    /// variant won't silently alias to `Other`.
     #[inline]
     fn kind(&self) -> HashKind {
         match (self.tagged.as_ptr() as usize) & KIND_MASK {
             x if x == HashKind::Other as usize => HashKind::Other,
             x if x == HashKind::Str as usize => HashKind::Str,
-            // SAFETY: `KIND_MASK == 0b1`, so the masked value is always 0
-            // or 1 — both arms above cover it. A future `HashKind` variant
-            // whose discriminant overlaps `KIND_MASK` must add its own arm
-            // (or widen the mask, which would re-invalidate this comment).
+            // SAFETY: `KIND_MASK == 0b1`, so the value is always 0 or 1.
+            // A new variant overlapping the mask must add an arm here.
             _ => unsafe { std::hint::unreachable_unchecked() },
         }
     }
 
-    /// Borrow the underlying object as a `Borrowed<PyAny>` without bumping
-    /// refcount. Derefs to `&Bound<'py, PyAny>` for method calls.
+    /// Non-refcount-bumping borrow of the underlying object.
     #[inline]
     fn obj_borrowed<'a, 'py>(&'a self, py: Python<'py>) -> Borrowed<'a, 'py, PyAny> {
-        // SAFETY: `obj_ptr()` returns the live, masked PyObject pointer we
-        // own a strong reference to. The borrow lifetime `'a` is tied to
-        // `&self`, so the pointer can't outlive our refcount.
+        // SAFETY: we own a strong reference; the `'a` borrow keeps it live.
         unsafe { Borrowed::from_ptr(py, self.obj_ptr()) }
     }
 
     /// Return a fresh owned `Py<PyAny>` (bumps refcount).
     #[inline]
     fn obj_clone_ref(&self, py: Python<'_>) -> Py<PyAny> {
-        // SAFETY: we hold a strong reference, so the borrowed pointer is
-        // valid. `to_owned()` bumps the refcount, yielding a second valid
-        // strong reference packaged as `Bound`, which `unbind()` converts
-        // to a `Py` without further refcount changes.
+        // SAFETY: we own a strong reference; `to_owned()` bumps it.
         unsafe { Borrowed::from_ptr(py, self.obj_ptr()) }
             .to_owned()
             .unbind()
@@ -243,18 +194,9 @@ impl HashedAny {
 
 impl Drop for HashedAny {
     fn drop(&mut self) {
-        // CPython requires the GIL for refcount decrements (outside of the
-        // free-threaded build, where this is still safe). PyO3 attaches a
-        // GIL guard internally for `Py<T>::drop`; we do the same dance.
-        //
-        // Known limitation: bulk-drop paths (`clear()`, map destruction on
-        // `Drop`, table teardown during resize) pay one `Python::attach`
-        // per slot rather than amortizing one attach over the whole sweep.
-        // This is parity with the previous `Py<PyAny>`-based layout (PyO3
-        // does the same per-slot attach), so it's not a regression — but
-        // if a future profile flags it, wrap the table drop site in an
-        // outer `Python::attach` and inline a plain `Py_DECREF` here under
-        // a `#[cfg(...)]` or a separate raw-DECREF helper.
+        // `Py_DECREF` requires the GIL. Matches `Py<T>::drop`'s per-slot
+        // attach — bulk-drop paths (clear, resize teardown) inherit the
+        // same per-slot cost as the previous `Py<PyAny>` layout.
         Python::attach(|_py| {
             // SAFETY: we own one strong reference to the masked pointer.
             unsafe { ffi::Py_DECREF(self.obj_ptr()) };
@@ -274,18 +216,14 @@ struct ProbeKey {
 }
 
 impl ProbeKey {
-    /// Build a non-owning probe wrapping `ob`'s raw `PyObject*` and cached
-    /// hash. No refcount bump — the returned `ProbeKey` borrows the object
-    /// from `ob` lexically.
+    /// Build a non-owning probe borrowing `ob`'s `PyObject*` and cached hash.
     ///
     /// # Safety
-    /// `ob` must outlive the returned `ProbeKey`. The probe stores the raw
-    /// pointer (with the kind tag packed into the low bits) in a
-    /// `ManuallyDrop<HashedAny>` and never bumps or decrements the refcount,
-    /// so dropping the source `Bound` before the probe would leave the
-    /// inner pointer dangling. Marked `unsafe fn` because the function
-    /// signature cannot bind the probe's lifetime to `ob` — every call site
-    /// must visually confirm the source `Bound` is still in scope.
+    /// `ob` must outlive the returned `ProbeKey`. The probe holds the raw
+    /// pointer without refcount changes, so dropping the source `Bound`
+    /// first leaves it dangling. The function signature can't bind the
+    /// probe's lifetime to `ob`, so this is `unsafe fn` to force call sites
+    /// to confirm by inspection.
     unsafe fn from_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let hash = ob.hash()?;
         let kind = HashedAny::detect_kind(ob);
