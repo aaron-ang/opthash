@@ -60,7 +60,7 @@ const DELETE_OP_COUNT: usize = 6_000;
 const RESIZE_INSERT_COUNT: usize = 8_000;
 const MIXED_LOOKUP_COUNT: usize = 100_000;
 
-// `get_many` batched lookup: 10M-entry map, 1000-key bursts, repeated.
+// `multi_get` batched lookup: 10M-entry map, 1000-key bursts, repeated.
 const GET_MANY_MAP_SIZE: usize = 10_000_000;
 const GET_MANY_BATCH: usize = 1_000;
 const GET_MANY_TOTAL: usize = 100_000;
@@ -526,15 +526,15 @@ fn bench_mixed_lookup_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_get_many_batch(c: &mut Criterion) {
+fn bench_multi_get_batch(c: &mut Criterion) {
     // Build pairs once, then query in 1000-key bursts. Compares naive loop of
-    // `.get()` against `get_many` which prefetches level-0 control bytes.
+    // `.get()` against `multi_get` which prefetches level-0 control bytes.
     let pairs = make_pairs(GET_MANY_MAP_SIZE);
     let query_keys: Vec<u64> = (0..GET_MANY_TOTAL)
         .map(|idx| pairs[idx % GET_MANY_MAP_SIZE].0)
         .collect();
 
-    let mut group = c.benchmark_group("get_many_batch");
+    let mut group = c.benchmark_group("multi_get_batch");
     group.throughput(Throughput::Elements(GET_MANY_TOTAL as u64));
 
     // Naive: a flat loop of `.get()` over the same keys. Establishes the
@@ -558,8 +558,8 @@ fn bench_get_many_batch(c: &mut Criterion) {
     });
 
     // Batched: same total work, but issued in `GET_MANY_BATCH`-sized chunks
-    // so the prefetch in stage 1 of `get_many` can hide DRAM latency.
-    group.bench_function("elastic_get_many", |b| {
+    // so the prefetch in stage 1 of `multi_get` can hide DRAM latency.
+    group.bench_function("elastic_multi_get", |b| {
         let map = build_elastic_map(&pairs);
         let chunks: Vec<Vec<&u64>> = query_keys
             .chunks(GET_MANY_BATCH)
@@ -567,12 +567,12 @@ fn bench_get_many_batch(c: &mut Criterion) {
             .collect();
         b.iter(|| {
             for chunk in &chunks {
-                black_box(map.get_many(chunk));
+                black_box(map.multi_get(chunk));
             }
         });
     });
 
-    group.bench_function("funnel_get_many", |b| {
+    group.bench_function("funnel_multi_get", |b| {
         let map = build_funnel_map(&pairs);
         let chunks: Vec<Vec<&u64>> = query_keys
             .chunks(GET_MANY_BATCH)
@@ -580,7 +580,7 @@ fn bench_get_many_batch(c: &mut Criterion) {
             .collect();
         b.iter(|| {
             for chunk in &chunks {
-                black_box(map.get_many(chunk));
+                black_box(map.multi_get(chunk));
             }
         });
     });
@@ -654,7 +654,7 @@ criterion_group!(
         bench_delete_heavy_throughput,
         bench_resize_heavy_throughput,
         bench_mixed_lookup_throughput,
-        bench_get_many_batch,
+        bench_multi_get_batch,
         bench_get_hit_latency
 );
 criterion_main!(benches);

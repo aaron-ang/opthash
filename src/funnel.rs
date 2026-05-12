@@ -548,12 +548,12 @@ where
     /// Batched lookup: pipelines N keys by issuing prefetches for the
     /// level-0 bucket `PIPELINE_DEPTH` iterations ahead of the resolution
     /// loop. Overlaps independent DRAM/L3 misses.
-    pub fn get_many<'a, Q>(&self, keys: &[&'a Q]) -> Vec<Option<&V>>
+    pub fn multi_get<'a, Q>(&self, keys: &[&'a Q]) -> Vec<Option<&V>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized + 'a,
     {
-        // See ElasticHashMap::get_many for depth tuning rationale.
+        // See ElasticHashMap::multi_get for depth tuning rationale.
         const PIPELINE_DEPTH: usize = 8;
 
         let n = keys.len();
@@ -1888,7 +1888,7 @@ mod tests {
     }
 
     #[test]
-    fn get_many_matches_get_for_hits_and_misses() {
+    fn multi_get_matches_get_for_hits_and_misses() {
         let n: i32 = 1_000;
         let cap = usize::try_from(n * 2).expect("positive capacity");
         let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(cap);
@@ -1898,7 +1898,7 @@ mod tests {
 
         let probe_keys: Vec<i32> = (-100..(n + 100)).collect();
         let refs: Vec<&i32> = probe_keys.iter().collect();
-        let batched = map.get_many(&refs);
+        let batched = map.multi_get(&refs);
         assert_eq!(batched.len(), refs.len());
         for (k, got) in refs.iter().zip(batched.iter()) {
             let expected = map.get(*k);
@@ -1907,11 +1907,11 @@ mod tests {
     }
 
     #[test]
-    fn get_many_on_empty_map_returns_all_none() {
+    fn multi_get_on_empty_map_returns_all_none() {
         let map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
         let keys = [1, 2, 3];
         let refs: Vec<&i32> = keys.iter().collect();
-        let out = map.get_many(&refs);
+        let out = map.multi_get(&refs);
         assert_eq!(out.len(), 3);
         assert!(out.iter().all(Option::is_none));
     }

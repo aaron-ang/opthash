@@ -384,13 +384,13 @@ where
     /// probe group `PIPELINE_DEPTH` iterations ahead of the resolution loop.
     /// Overlaps independent DRAM/L3 misses to hide memory latency on
     /// workloads like batch joins or set intersection.
-    pub fn get_many<'a, Q>(&self, keys: &[&'a Q]) -> Vec<Option<&V>>
+    pub fn multi_get<'a, Q>(&self, keys: &[&'a Q]) -> Vec<Option<&V>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized + 'a,
     {
         // Sliding-window prefetch depth. Tuned empirically against
-        // `bench_get_many_batch`: depths in {4, 8, 12, 16} produced
+        // `bench_multi_get_batch`: depths in {4, 8, 12, 16} produced
         // statistically indistinguishable throughput at 10M entries and
         // 1000-key bursts, so we keep the value modest to limit
         // line-fill-buffer pressure on smaller microarchitectures.
@@ -1207,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn get_many_matches_get_for_hits_and_misses() {
+    fn multi_get_matches_get_for_hits_and_misses() {
         let n: i32 = 1_000;
         let cap = usize::try_from(n * 2).expect("positive capacity");
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(cap);
@@ -1218,7 +1218,7 @@ mod tests {
         // Mix of hits and misses.
         let probe_keys: Vec<i32> = (-100..(n + 100)).collect();
         let refs: Vec<&i32> = probe_keys.iter().collect();
-        let batched = map.get_many(&refs);
+        let batched = map.multi_get(&refs);
         assert_eq!(batched.len(), refs.len());
         for (k, got) in refs.iter().zip(batched.iter()) {
             let expected = map.get(*k);
@@ -1227,11 +1227,11 @@ mod tests {
     }
 
     #[test]
-    fn get_many_on_empty_map_returns_all_none() {
+    fn multi_get_on_empty_map_returns_all_none() {
         let map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
         let keys = [1, 2, 3];
         let refs: Vec<&i32> = keys.iter().collect();
-        let out = map.get_many(&refs);
+        let out = map.multi_get(&refs);
         assert_eq!(out.len(), 3);
         assert!(out.iter().all(Option::is_none));
     }
