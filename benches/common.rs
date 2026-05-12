@@ -5,7 +5,7 @@ use std::collections::HashMap as StdHashMap;
 use hashbrown::HashMap as HashbrownMap;
 use opthash::{ElasticHashMap, FunnelHashMap};
 
-pub const LATENCY_SIZES: &[usize] = &[100, 1_000, 10_000, 100_000, 1_000_000];
+pub const LATENCY_SIZES: &[usize] = &[100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
 
 /// Knuth multiplicative-hash constant (golden ratio * 2^64, odd).
 pub const GOLDEN_RATIO_U64: u64 = 0x9E37_79B9_7F4A_7C15;

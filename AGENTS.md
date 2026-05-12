@@ -36,7 +36,7 @@ Example path: `target/criterion/get_hit_throughput/elastic/change/estimates.json
 
 #### Low-noise runs
 
-`scripts/bench.sh` wraps `cargo bench` with `taskset -c $CORE` + `setarch -R` (no privileges needed). Run with `sudo` to additionally pin governor=performance, disable Intel turbo, and run at SCHED_FIFO/99 — the script drops back to `$SUDO_USER` for the cargo invocation so build artifacts stay user-owned. Workflow:
+`scripts/bench.sh` wraps `cargo bench` with `taskset -c $CORE` + `setarch -R` (no privileges needed). Run with `sudo` to additionally pin governor=performance, disable Intel turbo, and run at SCHED_FIFO/99 — the script drops back to `$SUDO_USER` for the cargo invocation so build artifacts stay user-owned. `BENCH` defaults to `all` (runs `speedup` then `latency` sequentially); set `BENCH=speedup` or `BENCH=latency` for single-target iteration. Workflow:
 
 ```bash
 scripts/bench.sh                            # save baseline as "ref"
@@ -44,19 +44,19 @@ scripts/bench.sh                            # save baseline as "ref"
 BASELINE=ref scripts/bench.sh               # compare against the pinned baseline
 ```
 
-Re-pin `ref` whenever the harness env changes (sudo vs not, core pin) — Criterion compares wall-clock timings, so a baseline saved at boost frequency is meaningless once turbo is disabled. Pass override flags after `--`, e.g. `BASELINE=ref scripts/bench.sh -- --measurement-time 10 --sample-size 200`.
+Re-pin `ref` whenever the harness env changes (sudo vs not, core pin) — Criterion compares wall-clock timings, so a baseline saved at boost frequency is meaningless once turbo is disabled. Pass override flags after `--`, e.g. `BASELINE=ref scripts/bench.sh -- --measurement-time 10 --sample-size 200`. The `latency` bench is a custom harness (writes histograms to `target/latency/`) and ignores `--baseline`.
 
 ### Tail-latency harness
 
-- **`cargo bench --bench latency`** — per-operation latency distributions (p50/p90/p99/p999/p9999/max) via `hdrhistogram`. Hard-coded matrix (edit the consts at the top of `benches/latency.rs` to change): sizes 10K/100K/1M/10M × ops get-hit/get-miss/insert × all four maps × 1M samples × 10K warmup. `insert` pre-fills to `size − samples` before measuring so tail percentiles reflect insert cost near the target load, not into an empty map.
+- **`cargo bench --bench latency`** — HDR get-hit latency distribution (p50…p99999/max), fixed config: 10M × 4 maps × 1M samples × 10K warmup.
 - Output: `target/latency/<map>/<size>/<op>.json` — percentiles + histogram buckets + `clock_overhead_ns`.
 
 ### Python-side benchmarks
 
-`benches/test_python.py` — pytest-benchmark suite comparing `dict`, `ElasticHashMap`, and `FunnelHashMap` from Python across insert / get_hit / get_miss / mixed / delete workloads at N = 10K. Each opthash op crosses the GIL → `HashedAny::hash()` → Python bytecode.
+`benches/python_throughput.py` — pytest-benchmark suite comparing `dict`, `ElasticHashMap`, and `FunnelHashMap` from Python across insert / get_hit / get_miss / mixed / delete workloads at N = 10K. Each opthash op crosses the GIL → `HashedAny::hash()` → Python bytecode.
 
 ```bash
-pytest benches/test_python.py --benchmark-json=.benchmarks/python.json
+pytest benches/python_throughput.py --benchmark-json=.benchmarks/python.json
 
 uv run --group charts python scripts/generate_python_chart.py
 ```
@@ -64,7 +64,7 @@ uv run --group charts python scripts/generate_python_chart.py
 ### Charts
 
 - `uv run --group charts scripts/generate_speedup_chart.py` — throughput speedup bar chart
-- `uv run --group charts scripts/generate_latency_chart.py` — Criterion-mean latency line + pinned tail CDFs (edit `TAIL_CONFIGS` in the script to re-pin; currently 1M × 3 ops)
+- `uv run --group charts scripts/generate_latency_chart.py` — Criterion mean-latency line (`target/criterion/get_hit_latency_<size>`; sizes from `LATENCY_SIZES` in `benches/common.rs`) + HDR get-hit tail CDF @ 10M (`target/latency/`).
 - `uv run --group charts scripts/generate_all_charts.py` — regenerate everything
 - `uv run --group charts scripts/generate_python_chart.py` — Python-side dict-vs-opthash speedup (reads `.benchmarks/python.json`)
 

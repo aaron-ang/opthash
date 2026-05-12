@@ -6,7 +6,7 @@
 # runs at SCHED_FIFO/99. The script gracefully degrades — sudo is not required.
 #
 # Optional env knobs:
-#   BENCH=speedup    cargo bench --bench target (default speedup)
+#   BENCH=all        cargo bench --bench target (default all = speedup + latency)
 #   CORE=2           physical core to pin to via taskset
 #   BASELINE=        if set, passes --baseline <name>; else --save-baseline ref
 #
@@ -15,46 +15,56 @@
 
 set -euo pipefail
 
-BENCH=${BENCH:-speedup}
+BENCH=${BENCH:-all}
 CORE=${CORE:-2}
 BASELINE=${BASELINE:-}
 
 # sudo strips PATH and points HOME at /root; recover the invoking user's
 # rustup + cargo so the rustup shim can resolve their default toolchain.
 if [[ -n "${SUDO_USER:-}" ]]; then
-    user_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-    if [[ -x "$user_home/.cargo/bin/cargo" ]]; then
-        export PATH="$user_home/.cargo/bin:$PATH"
-        export CARGO_HOME="${CARGO_HOME:-$user_home/.cargo}"
-        export RUSTUP_HOME="${RUSTUP_HOME:-$user_home/.rustup}"
-    fi
+	user_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+	if [[ -x "$user_home/.cargo/bin/cargo" ]]; then
+		export PATH="$user_home/.cargo/bin:$PATH"
+		export CARGO_HOME="${CARGO_HOME:-$user_home/.cargo}"
+		export RUSTUP_HOME="${RUSTUP_HOME:-$user_home/.rustup}"
+	fi
 fi
-command -v cargo >/dev/null 2>&1 || { echo "error: cargo not found in PATH" >&2; exit 1; }
+command -v cargo >/dev/null 2>&1 || {
+	echo "error: cargo not found in PATH" >&2
+	exit 1
+}
 
 if [[ $EUID -eq 0 ]]; then
-    if command -v cpupower >/dev/null 2>&1; then
-        cpupower frequency-set -g performance >/dev/null
-    fi
-    if [[ -w /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
-        echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo
-    fi
+	if command -v cpupower >/dev/null 2>&1; then
+		cpupower frequency-set -g performance >/dev/null
+	fi
+	if [[ -w /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
+		echo 1 >/sys/devices/system/cpu/intel_pstate/no_turbo
+	fi
 fi
 
 if [[ -n "$BASELINE" ]]; then
-    criterion_args=(--baseline "$BASELINE")
+	criterion_args=(--baseline "$BASELINE")
 else
-    criterion_args=(--save-baseline ref)
+	criterion_args=(--save-baseline ref)
 fi
 
-cmd=(taskset -c "$CORE" setarch -R cargo bench --bench "$BENCH" -- "${criterion_args[@]}" "$@")
+if [[ "$BENCH" == "all" ]]; then
+	bench_targets=(speedup latency)
+else
+	bench_targets=("$BENCH")
+fi
 
 # Under sudo, prefix with chrt and drop back to the invoking user for cargo
 # so build artifacts stay user-owned. SCHED_FIFO survives the UID drop —
 # it's a process attribute, not a credential.
 launcher=()
 if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] && command -v chrt >/dev/null 2>&1; then
-    launcher=(chrt -f 99 sudo -u "$SUDO_USER"
-        --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME --)
+	launcher=(chrt -f 99 sudo -u "$SUDO_USER"
+		--preserve-env=PATH,CARGO_HOME,RUSTUP_HOME --)
 fi
 
-exec "${launcher[@]}" "${cmd[@]}"
+for target in "${bench_targets[@]}"; do
+	cmd=(taskset -c "$CORE" setarch -R cargo bench --bench "$target" -- "${criterion_args[@]}" "$@")
+	"${launcher[@]}" "${cmd[@]}"
+done

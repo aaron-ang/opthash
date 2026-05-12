@@ -10,7 +10,6 @@ from plot_common import ASSETS_DIR, ROOT, apply_axis_style, save_svg
 
 
 BENCHMARKS_JSON = ROOT / ".benchmarks" / "python.json"
-OUTPUT = ASSETS_DIR / "benchmark-python-speedup.svg"
 
 WORKLOADS = (
     ("insert", "Insert"),
@@ -49,7 +48,7 @@ def load_means(path: Path) -> dict[str, dict[str, float]]:
     return out
 
 
-def plot_speedup(means: dict[str, dict[str, float]], output_path: Path) -> None:
+def plot_speedup(means: dict[str, dict[str, float]], assets_dir: Path) -> None:
     labels: list[str] = []
     elastic_speedups: list[float] = []
     funnel_speedups: list[float] = []
@@ -106,12 +105,12 @@ def plot_speedup(means: dict[str, dict[str, float]], output_path: Path) -> None:
                 color="black",
             )
 
-    save_svg(fig, output_path)
+    save_svg(fig, assets_dir / "benchmark-python-speedup.svg")
 
 
 def main() -> None:
     means = load_means(BENCHMARKS_JSON)
-    plot_speedup(means, OUTPUT)
+    plot_speedup(means, ASSETS_DIR)
 
 
 if __name__ == "__main__":
