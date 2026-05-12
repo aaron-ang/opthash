@@ -545,6 +545,64 @@ where
         }
     }
 
+    /// Batched lookup: pipelines N keys by issuing prefetches for the
+    /// level-0 bucket `PIPELINE_DEPTH` iterations ahead of the resolution
+    /// loop. Overlaps independent DRAM/L3 misses.
+    pub fn get_many<'a, Q>(&self, keys: &[&'a Q]) -> Vec<Option<&V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized + 'a,
+    {
+        // See ElasticHashMap::get_many for depth tuning rationale.
+        const PIPELINE_DEPTH: usize = 8;
+
+        let n = keys.len();
+        let mut hashes: Vec<u64> = Vec::with_capacity(n);
+        for k in keys {
+            hashes.push(self.hash_key(*k));
+        }
+
+        let level0_opt = self.levels.first().filter(|l| l.bucket_count > 0);
+
+        if let Some(level0) = level0_opt {
+            for &h in hashes.iter().take(PIPELINE_DEPTH.min(n)) {
+                let bucket_idx = level0.bucket_index(h);
+                let group_idx = (bucket_idx * level0.bucket_size) / GROUP_SIZE;
+                unsafe { prefetch_read(level0.table.group_data_ptr(group_idx)) };
+            }
+        }
+
+        let mut out: Vec<Option<&V>> = Vec::with_capacity(n);
+        for i in 0..n {
+            if let Some(level0) = level0_opt
+                && let Some(&h_ahead) = hashes.get(i + PIPELINE_DEPTH)
+            {
+                let bucket_idx = level0.bucket_index(h_ahead);
+                let group_idx = (bucket_idx * level0.bucket_size) / GROUP_SIZE;
+                unsafe { prefetch_read(level0.table.group_data_ptr(group_idx)) };
+            }
+
+            let h = hashes[i];
+            let fp = ControlOps::control_fingerprint(h);
+            let result = self
+                .find_slot_location_with_hash(keys[i], h, fp)
+                .map(|loc| match loc {
+                    SlotLocation::Level {
+                        level_idx,
+                        slot_idx,
+                    } => unsafe { &self.levels[level_idx].table.get_ref(slot_idx).value },
+                    SlotLocation::SpecialPrimary { slot_idx } => unsafe {
+                        &self.special.primary.table.get_ref(slot_idx).value
+                    },
+                    SlotLocation::SpecialFallback { slot_idx } => unsafe {
+                        &self.special.fallback.table.get_ref(slot_idx).value
+                    },
+                });
+            out.push(result);
+        }
+        out
+    }
+
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         K: Borrow<Q>,
@@ -1826,5 +1884,34 @@ mod tests {
     fn iter_empty_map_is_empty() {
         let map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
         assert_eq!(map.iter().count(), 0);
+    }
+
+    #[test]
+    fn get_many_matches_get_for_hits_and_misses() {
+        let n: i32 = 1_000;
+        let cap = usize::try_from(n * 2).expect("positive capacity");
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(cap);
+        for i in 0..n {
+            map.insert(i, i * 7);
+        }
+
+        let probe_keys: Vec<i32> = (-100..(n + 100)).collect();
+        let refs: Vec<&i32> = probe_keys.iter().collect();
+        let batched = map.get_many(&refs);
+        assert_eq!(batched.len(), refs.len());
+        for (k, got) in refs.iter().zip(batched.iter()) {
+            let expected = map.get(*k);
+            assert_eq!(got.copied(), expected.copied(), "mismatch on key {k}");
+        }
+    }
+
+    #[test]
+    fn get_many_on_empty_map_returns_all_none() {
+        let map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        let keys = [1, 2, 3];
+        let refs: Vec<&i32> = keys.iter().collect();
+        let out = map.get_many(&refs);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(Option::is_none));
     }
 }
