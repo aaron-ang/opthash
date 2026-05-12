@@ -416,11 +416,13 @@ where
         Q: Hash + Eq + ?Sized + 'b,
     {
         // Sliding-window prefetch depth. Tuned empirically against
-        // `bench_multi_get_batch`: depths in {4, 8, 12, 16} produced
-        // statistically indistinguishable throughput at 10M entries and
-        // 1000-key bursts. Kept modest to limit line-fill-buffer pressure
-        // on smaller microarchitectures. See PR #11 for per-depth Criterion
-        // deltas.
+        // `bench_multi_get_batch` at 10M entries / 1000-key bursts. Depths
+        // 4, 8, 12 all saturate the prefetch win and are within run-to-run
+        // noise on elastic (~2.95-2.97 ms / 100K ops); depth 16 regresses
+        // by ~16 % (line-fill-buffer pressure). The smaller per-bucket
+        // funnel layout shows the same shape: 4 and 12 best (~1.62 ms),
+        // 16 worst. We pick 8 as a conservative midpoint that doesn't add
+        // register pressure on smaller microarchitectures.
         const PIPELINE_DEPTH: usize = 8;
 
         let n = keys.len();
