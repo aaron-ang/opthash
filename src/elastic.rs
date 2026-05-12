@@ -397,10 +397,11 @@ where
         const PIPELINE_DEPTH: usize = 8;
 
         let n = keys.len();
-        let mut hashes: Vec<u64> = Vec::with_capacity(n);
-        for k in keys {
-            hashes.push(self.hash_key(*k));
+        if self.len == 0 {
+            return vec![None; n];
         }
+
+        let hashes: Vec<u64> = keys.iter().map(|k| self.hash_key(*k)).collect();
 
         let level0_opt = self.levels.first().filter(|l| l.len > 0);
 
