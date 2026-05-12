@@ -246,6 +246,15 @@ impl Drop for HashedAny {
         // CPython requires the GIL for refcount decrements (outside of the
         // free-threaded build, where this is still safe). PyO3 attaches a
         // GIL guard internally for `Py<T>::drop`; we do the same dance.
+        //
+        // Known limitation: bulk-drop paths (`clear()`, map destruction on
+        // `Drop`, table teardown during resize) pay one `Python::attach`
+        // per slot rather than amortizing one attach over the whole sweep.
+        // This is parity with the previous `Py<PyAny>`-based layout (PyO3
+        // does the same per-slot attach), so it's not a regression — but
+        // if a future profile flags it, wrap the table drop site in an
+        // outer `Python::attach` and inline a plain `Py_DECREF` here under
+        // a `#[cfg(...)]` or a separate raw-DECREF helper.
         Python::attach(|_py| {
             // SAFETY: we own one strong reference to the masked pointer.
             unsafe { ffi::Py_DECREF(self.obj_ptr()) };
