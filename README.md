@@ -2,8 +2,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/opthash?logo=rust&label=crates.io)](https://crates.io/crates/opthash)
 [![PyPI](https://img.shields.io/pypi/v/opthash?logo=pypi&logoColor=white&label=pypi)](https://pypi.org/project/opthash/)
-[![CI](https://github.com/aaron-ang/opthash/actions/workflows/ci.yml/badge.svg)](https://github.com/aaron-ang/opthash/actions/workflows/ci.yml)
-[![Release](https://github.com/aaron-ang/opthash/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/aaron-ang/opthash/actions/workflows/release.yml)
+[![CI](https://github.com/aaron-ang/opthash-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/aaron-ang/opthash-rs/actions/workflows/ci.yml)
+[![Release](https://github.com/aaron-ang/opthash-rs/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/aaron-ang/opthash-rs/actions/workflows/release.yml)
 [![Python](https://img.shields.io/pypi/pyversions/opthash?logo=python&logoColor=white)](https://pypi.org/project/opthash/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 

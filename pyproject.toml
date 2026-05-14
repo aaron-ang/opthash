@@ -23,8 +23,8 @@ classifiers = [
 dynamic = ["version"]
 
 [project.urls]
-Repository = "https://github.com/aaron-ang/opthash"
-Issues = "https://github.com/aaron-ang/opthash/issues"
+Repository = "https://github.com/aaron-ang/opthash-rs"
+Issues = "https://github.com/aaron-ang/opthash-rs/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=8", "hypothesis>=6", "pytest-benchmark>=5"]
