@@ -795,6 +795,16 @@ where
         }
     }
 
+    #[cfg(test)]
+    fn special_primary_uses_triangular(&self) -> bool {
+        self.special.primary.uses_triangular
+    }
+
+    #[cfg(test)]
+    fn special_primary_group_count(&self) -> usize {
+        self.special.primary.table.group_count()
+    }
+
     pub fn clear(&mut self) {
         for level in &mut self.levels {
             for idx in 0..level.table.capacity() {
@@ -2236,5 +2246,65 @@ mod tests {
 
         map.multi_get_into::<i32>(&[], &mut out);
         assert!(out.is_empty());
+    }
+
+    /// Sanity check: a known capacity drives the funnel special primary
+    /// onto the triangular path. Tracks bench config next to the
+    /// implementation so a future change to either side fails fast.
+    #[test]
+    fn bench_pow2_capacity_triggers_special_primary_triangular() {
+        let map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(27_104);
+        assert!(
+            map.special_primary_uses_triangular(),
+            "bench pow2 capacity (27104) must drive funnel special primary onto triangular path; \
+             primary group_count = {}",
+            map.special_primary_group_count(),
+        );
+    }
+
+    /// Triangular probing in the special-primary fires when its
+    /// `group_count` is a power of two. Scan a range of capacities, pick one
+    /// that drives the primary onto pow2 group_count, then exercise the
+    /// full insert / get / remove / re-insert cycle on the triangular path.
+    #[test]
+    fn pow2_capacity_exercises_special_primary_triangular_path() {
+        let mut pow2_capacity = None;
+        for cap in (8_192..=65_536).step_by(64) {
+            let map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(cap);
+            if map.special_primary_uses_triangular() && map.special_primary_group_count() >= 2 {
+                pow2_capacity = Some(cap);
+                break;
+            }
+        }
+        let capacity = pow2_capacity.expect("found pow2-primary capacity in 8K..=64K");
+
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(capacity);
+        assert!(map.special_primary_uses_triangular());
+
+        let n = 4_000;
+        for i in 0..n {
+            assert_eq!(map.insert(i, i * 3), None);
+        }
+        for i in 0..n {
+            assert_eq!(map.get(&i), Some(&(i * 3)));
+            assert!(map.contains_key(&i));
+        }
+        for i in (0..n).step_by(2) {
+            assert_eq!(map.remove(&i), Some(i * 3));
+        }
+        for i in 0..n {
+            if i % 2 == 0 {
+                assert_eq!(map.get(&i), None);
+            } else {
+                assert_eq!(map.get(&i), Some(&(i * 3)));
+            }
+        }
+        for i in (0..n).step_by(2) {
+            assert_eq!(map.insert(i, i * 5), None);
+        }
+        for i in 0..n {
+            let expected = if i % 2 == 0 { i * 5 } else { i * 3 };
+            assert_eq!(map.get(&i), Some(&expected));
+        }
     }
 }
