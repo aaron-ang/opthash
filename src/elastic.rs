@@ -9,9 +9,8 @@ use crate::common::{
     control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
-        advance_wrapping_index, ceil_three_quarters, fastmod_magic, fastmod_u32,
-        floor_half_reserve_slots, level_salt, max_insertions, sanitize_reserve_fraction,
-        usize_to_f64,
+        ceil_three_quarters, floor_half_reserve_slots, level_salt, max_insertions,
+        round_up_to_pow2_groups, sanitize_reserve_fraction, usize_to_f64,
     },
 };
 
@@ -75,16 +74,15 @@ impl ElasticOptions {
 /// the capacity of the previous level. Inserts cascade from level 0 outward
 /// per the active batch plan; lookups probe every populated level.
 struct Level<K, V> {
-    /// Structure of Arrays control bytes + entries.
+    /// `SoA` control bytes + entries.
     table: RawTable<Entry<K, V>>,
     /// Live entry count.
     len: usize,
     /// Per-level salt mixed into key hashes. Hot — read every lookup.
     salt: u64,
-    /// `group_count - 1` when `uses_triangular`, else 0. Hot — read every lookup.
+    /// `group_count - 1`. `group_count` is pow2 by construction (see
+    /// `partition_levels`), so `(idx + delta) & mask` wraps in one op.
     group_count_mask: usize,
-    /// `group_count.is_power_of_two()`. Hot — branched every lookup.
-    uses_triangular: bool,
     /// Deleted-slot count.
     tombstones: usize,
     /// Cached `floor(reserve * cap / 2)` for the
@@ -92,12 +90,6 @@ struct Level<K, V> {
     half_reserve_slot_threshold: usize,
     /// Probe budget indexed by `free_slots()`.
     limited_probe_budgets: Box<[usize]>,
-    /// Double-hashing step set; empty when `uses_triangular`. Cold.
-    group_steps: Box<[usize]>,
-    /// Fastmod magic for `group_count`. Cold.
-    group_count_magic: u64,
-    /// Fastmod magic for `group_steps.len()`. Cold.
-    step_count_magic: u64,
 }
 
 impl<K, V> Level<K, V> {
@@ -109,44 +101,20 @@ impl<K, V> Level<K, V> {
     ) -> Self {
         let table = RawTable::new(capacity);
         let group_count = table.group_count();
-        let uses_triangular = group_count.is_power_of_two();
-        // Skip allocating the step set when we won't use it: triangular
-        // probing visits every group via (g + T_k) & mask, no GCD step table.
-        let group_steps = if uses_triangular {
-            Box::new([]) as Box<[usize]>
-        } else {
-            ProbeOps::build_group_steps(group_count)
-        };
+        debug_assert!(
+            group_count == 0 || group_count.is_power_of_two(),
+            "partition_levels must produce pow2 group_count",
+        );
         let limited_probe_budgets =
             build_probe_budgets(capacity, group_count, reserve_fraction, probe_scale);
-        let group_count_magic = if !uses_triangular && group_count > 1 {
-            fastmod_magic(group_count)
-        } else {
-            0
-        };
-        let step_count_magic = if group_steps.len() > 1 {
-            fastmod_magic(group_steps.len())
-        } else {
-            0
-        };
-        let group_count_mask = if uses_triangular {
-            group_count.wrapping_sub(1)
-        } else {
-            0
-        };
-
         Self {
             table,
             len: 0,
             salt: level_salt(level_idx),
-            group_count_mask,
-            uses_triangular,
+            group_count_mask: group_count.wrapping_sub(1),
             tombstones: 0,
             half_reserve_slot_threshold: floor_half_reserve_slots(reserve_fraction, capacity),
             limited_probe_budgets,
-            group_steps,
-            group_count_magic,
-            step_count_magic,
         }
     }
 
@@ -155,15 +123,13 @@ impl<K, V> Level<K, V> {
         self.table.capacity()
     }
 
-    /// Slots minus live entries. Includes tombstone slots since they're
-    /// reusable on insert (control byte FREE-or-TOMBSTONE).
+    /// Slots minus live entries. Includes tombstones (reusable on insert).
     #[inline]
     fn free_slots(&self) -> usize {
         self.capacity().saturating_sub(self.len)
     }
 
-    /// Probe-group budget at the current fill level for limited (early-stop)
-    /// probing. Tighter as the level fills.
+    /// Per-fill-level probe budget (tighter as the level fills).
     #[inline]
     fn limited_group_budget(&self) -> usize {
         self.limited_probe_budgets[self.free_slots()]
@@ -175,11 +141,6 @@ impl<K, V> Level<K, V> {
     #[inline]
     fn needs_cleanup(&self) -> bool {
         self.tombstones > self.capacity() / 2
-    }
-
-    #[cfg(test)]
-    fn uses_triangular(&self) -> bool {
-        self.uses_triangular
     }
 }
 
@@ -444,7 +405,7 @@ where
 
         if let Some(level0) = level0_opt {
             for &h in hashes.iter().take(PIPELINE_DEPTH.min(n)) {
-                let (group_start, _) = Self::group_probe_params(level0, h);
+                let group_start = Self::triangular_group_start(level0, h);
                 unsafe { prefetch_read(level0.table.group_data_ptr(group_start)) };
             }
         }
@@ -453,7 +414,7 @@ where
             if let Some(level0) = level0_opt
                 && let Some(&h_ahead) = hashes.get(i + PIPELINE_DEPTH)
             {
-                let (group_start, _) = Self::group_probe_params(level0, h_ahead);
+                let group_start = Self::triangular_group_start(level0, h_ahead);
                 unsafe { prefetch_read(level0.table.group_data_ptr(group_start)) };
             }
 
@@ -578,11 +539,6 @@ where
         self.current_batch_index = 0;
         self.batch_remaining = self.batch_plan.first().copied().unwrap_or(0);
         self.max_populated_level = 0;
-    }
-
-    #[cfg(test)]
-    fn level_uses_triangular(&self, level_idx: usize) -> bool {
-        self.levels[level_idx].uses_triangular()
     }
 
     #[must_use]
@@ -818,35 +774,10 @@ where
         }
 
         let group_count = level.table.group_count();
+        let mask = level.group_count_mask;
         let capacity = level.capacity();
-
-        if level.uses_triangular {
-            let mask = level.group_count_mask;
-            let mut group_idx = Self::triangular_group_start(level, key_hash);
-            let mut delta: usize = 0;
-            for _ in 0..group_count {
-                let match_mask = level.table.group_match_mask(group_idx, key_fingerprint);
-                for relative_idx in match_mask {
-                    let slot_idx = group_idx * GROUP_SIZE + relative_idx;
-                    let entry = unsafe { level.table.get_ref(slot_idx) };
-                    if entry.key.borrow() == key {
-                        return Some(slot_idx);
-                    }
-                }
-                let empty_mask = level.table.group_match_mask(group_idx, CTRL_EMPTY);
-                if let Some(off) = empty_mask.lowest()
-                    && group_idx * GROUP_SIZE + off < capacity
-                {
-                    return None;
-                }
-                delta += 1;
-                group_idx = (group_idx + delta) & mask;
-            }
-            return None;
-        }
-
-        let (group_start, group_step) = Self::group_probe_params(level, key_hash);
-        let mut group_idx = group_start;
+        let mut group_idx = Self::triangular_group_start(level, key_hash);
+        let mut delta: usize = 0;
 
         for _ in 0..group_count {
             let match_mask = level.table.group_match_mask(group_idx, key_fingerprint);
@@ -857,23 +788,21 @@ where
                     return Some(slot_idx);
                 }
             }
-
             let empty_mask = level.table.group_match_mask(group_idx, CTRL_EMPTY);
             if let Some(off) = empty_mask.lowest()
                 && group_idx * GROUP_SIZE + off < capacity
             {
                 return None;
             }
-
-            group_idx = advance_wrapping_index(group_idx, group_step, group_count);
+            delta += 1;
+            group_idx = (group_idx + delta) & mask;
         }
-
         None
     }
 
     /// Probe-bounded variant of `first_free_uniform`: scans at most
-    /// `max_groups` groups before giving up. Used by the elastic schedule
-    /// when `current_level` still has reserve headroom.
+    /// `max_groups` groups. Used by the elastic schedule when
+    /// `current_level` still has reserve headroom.
     fn first_free_limited(
         &self,
         key_hash: u64,
@@ -887,37 +816,21 @@ where
 
         let group_count = level.table.group_count();
         let max_groups = max_groups.min(group_count.max(1));
-
-        if level.uses_triangular {
-            let mask = level.group_count_mask;
-            let mut group_idx = Self::triangular_group_start(level, key_hash);
-            let mut delta: usize = 0;
-            for _ in 0..max_groups {
-                if let Some(slot_idx) = level.table.first_free_in_group(group_idx) {
-                    return Some(slot_idx);
-                }
-                delta += 1;
-                group_idx = (group_idx + delta) & mask;
-            }
-            return None;
-        }
-
-        let (group_start, group_step) = Self::group_probe_params(level, key_hash);
-        let mut group_idx = group_start;
-
+        let mask = level.group_count_mask;
+        let mut group_idx = Self::triangular_group_start(level, key_hash);
+        let mut delta: usize = 0;
         for _ in 0..max_groups {
             if let Some(slot_idx) = level.table.first_free_in_group(group_idx) {
                 return Some(slot_idx);
             }
-            group_idx = advance_wrapping_index(group_idx, group_step, group_count);
+            delta += 1;
+            group_idx = (group_idx + delta) & mask;
         }
-
         None
     }
 
-    /// Linear scan over all groups in `level_idx` for the first FREE-or-
-    /// TOMBSTONE slot, following the level's intra-level probe sequence.
-    /// Returns `None` only if the level is completely full of OCCUPIED bytes.
+    /// Triangular scan over all groups for the first FREE-or-TOMBSTONE slot.
+    /// Returns `None` only if the level is completely OCCUPIED.
     fn first_free_uniform(&self, key_hash: u64, level_idx: usize) -> Option<usize> {
         let level = &self.levels[level_idx];
         if level.len >= level.capacity() {
@@ -925,75 +838,27 @@ where
         }
 
         let group_count = level.table.group_count();
-
-        if level.uses_triangular {
-            let mask = level.group_count_mask;
-            let mut group_idx = Self::triangular_group_start(level, key_hash);
-            let mut delta: usize = 0;
-            for _ in 0..group_count {
-                if let Some(slot_idx) = level.table.first_free_in_group(group_idx) {
-                    return Some(slot_idx);
-                }
-                delta += 1;
-                group_idx = (group_idx + delta) & mask;
-            }
-            return None;
-        }
-
-        let (group_start, group_step) = Self::group_probe_params(level, key_hash);
-        let mut group_idx = group_start;
-
+        let mask = level.group_count_mask;
+        let mut group_idx = Self::triangular_group_start(level, key_hash);
+        let mut delta: usize = 0;
         for _ in 0..group_count {
             if let Some(slot_idx) = level.table.first_free_in_group(group_idx) {
                 return Some(slot_idx);
             }
-            group_idx = advance_wrapping_index(group_idx, group_step, group_count);
+            delta += 1;
+            group_idx = (group_idx + delta) & mask;
         }
-
         None
     }
 
-    #[inline]
-    /// Compute `(group_start, group_step)` for double-hashing within
-    /// `level`. Mixes `key_hash` with the level's salt and rotates for the
-    /// step index so each level walks the group ring differently. Only
-    /// callers serving non-power-of-2 levels should use this; triangular
-    /// levels use [`Self::triangular_group_start`] and a fixed delta walk.
-    fn group_probe_params(level: &Level<K, V>, key_hash: u64) -> (usize, usize) {
-        if level.uses_triangular {
-            return (Self::triangular_group_start(level, key_hash), 1);
-        }
-        let group_count = level.table.group_count();
-        if group_count <= 1 {
-            return (0, 1);
-        }
-
-        let mixed = key_hash ^ level.salt;
-        let group_start = fastmod_u32(mixed, level.group_count_magic, group_count);
-        let step = if level.group_steps.len() > 1 {
-            let step_idx = fastmod_u32(
-                mixed.rotate_left(29),
-                level.step_count_magic,
-                level.group_steps.len(),
-            );
-            level.group_steps[step_idx]
-        } else {
-            level.group_steps[0]
-        };
-        (group_start, step)
-    }
-
     /// Triangular-probing starting group: `(key_hash ^ salt) & (group_count - 1)`.
-    /// Caller must ensure `level.uses_triangular`.
+    /// `group_count` is pow2 by `partition_levels` construction.
     #[inline]
     fn triangular_group_start(level: &Level<K, V>, key_hash: u64) -> usize {
-        debug_assert!(level.uses_triangular);
         let group_count = level.table.group_count();
         if group_count <= 1 {
             return 0;
         }
-        // SAFETY of cast: group_count is a power of two ≤ usize::MAX, so the
-        // low bits of (mixed as usize) are enough to select a group.
         let mixed = key_hash ^ level.salt;
         ProbeOps::hash_to_usize(mixed) & level.group_count_mask
     }
@@ -1072,9 +937,10 @@ fn build_probe_budgets(
     budgets.into_boxed_slice()
 }
 
-/// Split `total_capacity` into geometrically halving level sizes.
-/// First level is `ceil(total / 2)`; each subsequent level halves until the
-/// remaining budget is exhausted. Returns `[]` for capacity 0.
+/// Split `total_capacity` into geometrically halving level sizes, then round
+/// each up so `group_count = size / GROUP_SIZE` is pow2 — required for the
+/// triangular probe path's `(idx + delta) & mask` wrap. Total slots may
+/// exceed `total_capacity` by up to ~2x. Returns `[]` for capacity 0.
 fn partition_levels(total_capacity: usize) -> Vec<usize> {
     if total_capacity == 0 {
         return Vec::new();
@@ -1094,7 +960,7 @@ fn partition_levels(total_capacity: usize) -> Vec<usize> {
         next_size = (size / 2).max(1);
     }
 
-    sizes
+    sizes.into_iter().map(round_up_to_pow2_groups).collect()
 }
 
 /// Build the per-batch insertion quota that drives `current_batch_index`.
@@ -1154,16 +1020,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn level_partition_keeps_capacity_and_halving_shape() {
-        let sizes = partition_levels(127);
-        assert_eq!(sizes.iter().sum::<usize>(), 127);
-        assert!(!sizes.is_empty());
-
-        for window in sizes.windows(2) {
-            let current_level_size = usize_to_f64(window[0]);
-            let next_level_size = usize_to_f64(window[1]);
-            assert!(next_level_size >= (current_level_size / 2.0 - 1.0));
-            assert!(next_level_size <= (current_level_size / 2.0 + 1.0));
+    fn level_partition_inflates_to_pow2_groups_and_preserves_halving() {
+        for &cap in &[127usize, 1_000, 10_000, 100_000] {
+            let sizes = partition_levels(cap);
+            assert!(!sizes.is_empty());
+            // Each level's group_count must be pow2 (triangular precondition).
+            for &s in &sizes {
+                let g = s / GROUP_SIZE;
+                assert!(
+                    g.is_power_of_two(),
+                    "cap={cap} level slots={s} groups={g} not pow2"
+                );
+            }
+            // Slot total covers the requested capacity, bounded above by 2x.
+            let total: usize = sizes.iter().sum();
+            assert!(total >= cap, "cap={cap} total={total} below request");
+            assert!(total <= cap * 2, "cap={cap} total={total} exceeds 2x");
+            // Each next level is at most the previous (non-increasing) and at
+            // least half — the geometric halving shape, with pow2 rounding
+            // tolerance.
+            for w in sizes.windows(2) {
+                assert!(w[1] <= w[0], "non-monotonic: {} → {}", w[0], w[1]);
+                assert!(w[1] * 2 >= w[0], "shrinks too fast: {} → {}", w[0], w[1]);
+            }
         }
     }
 
@@ -1530,51 +1409,5 @@ mod tests {
 
         map.multi_get_into::<i32>(&[], &mut out);
         assert!(out.is_empty());
-    }
-
-    /// Pins the pow2 bench capacity to the triangular path so a change to
-    /// either side fails fast.
-    #[test]
-    fn bench_pow2_capacity_triggers_triangular() {
-        let map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(32_768);
-        assert!(
-            map.level_uses_triangular(0),
-            "bench pow2 capacity (32768) must drive elastic level 0 onto triangular path",
-        );
-    }
-
-    /// `cap=32768` → level 0 group_count=1024 (pow2), triangular fires for
-    /// every lookup. Exercises insert / get / remove / re-insert with
-    /// tombstone reuse.
-    #[test]
-    fn pow2_capacity_exercises_triangular_path() {
-        let mut map = ElasticHashMap::with_capacity(32_768);
-        assert!(map.level_uses_triangular(0));
-
-        let n = 5_000;
-        for i in 0..n {
-            assert_eq!(map.insert(i, i * 3), None);
-        }
-        for i in 0..n {
-            assert_eq!(map.get(&i), Some(&(i * 3)));
-            assert!(map.contains_key(&i));
-        }
-        for i in (0..n).step_by(2) {
-            assert_eq!(map.remove(&i), Some(i * 3));
-        }
-        for i in 0..n {
-            if i % 2 == 0 {
-                assert_eq!(map.get(&i), None);
-            } else {
-                assert_eq!(map.get(&i), Some(&(i * 3)));
-            }
-        }
-        for i in (0..n).step_by(2) {
-            assert_eq!(map.insert(i, i * 5), None);
-        }
-        for i in 0..n {
-            let expected = if i % 2 == 0 { i * 5 } else { i * 3 };
-            assert_eq!(map.get(&i), Some(&expected));
-        }
     }
 }

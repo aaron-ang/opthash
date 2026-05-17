@@ -58,13 +58,6 @@ const TINY_LOOKUP_COUNT: usize = 20_000;
 const DELETE_MAP_SIZE: usize = 12_000;
 const DELETE_OP_COUNT: usize = 6_000;
 
-/// `2 * N → with_capacity(32768)` puts elastic level 0 on pow2 group_count,
-/// triggering the triangular probe path. Pinned by
-/// `bench_pow2_capacity_triggers_triangular`.
-const LOOKUP_MAP_SIZE_POW2: usize = 16_384;
-/// `2 * N → with_capacity(27104)` puts funnel SpecialPrimary on pow2
-/// group_count. Pinned by `bench_pow2_capacity_triggers_special_primary_triangular`.
-const FUNNEL_POW2_MAP_SIZE: usize = 13_552;
 const RESIZE_INSERT_COUNT: usize = 8_000;
 const MIXED_LOOKUP_COUNT: usize = 100_000;
 
@@ -656,50 +649,6 @@ fn bench_get_hit_latency(c: &mut Criterion) {
     }
 }
 
-/// Get-hit throughput at pow2 group_count capacities (triangular path fires).
-/// Compare to `bench_get_hit_throughput` (non-pow2) to isolate the algorithmic
-/// win from the dispatch refactor.
-fn bench_pow2_lookup_throughput(c: &mut Criterion) {
-    let elastic_pairs = make_pairs(LOOKUP_MAP_SIZE_POW2);
-    let elastic_keys: Vec<u64> = (0..HIT_LOOKUP_COUNT)
-        .map(|idx| elastic_pairs[idx % LOOKUP_MAP_SIZE_POW2].0)
-        .collect();
-
-    let funnel_pairs = make_pairs(FUNNEL_POW2_MAP_SIZE);
-    let funnel_keys: Vec<u64> = (0..HIT_LOOKUP_COUNT)
-        .map(|idx| funnel_pairs[idx % FUNNEL_POW2_MAP_SIZE].0)
-        .collect();
-
-    let mut group = c.benchmark_group("get_hit_throughput_pow2");
-    group.throughput(Throughput::Elements(HIT_LOOKUP_COUNT as u64));
-
-    group.bench_function("elastic", |b| {
-        b.iter_batched(
-            || build_elastic_map(&elastic_pairs),
-            |map| {
-                for key in &elastic_keys {
-                    black_box(map.get(black_box(key)));
-                }
-            },
-            BatchSize::LargeInput,
-        );
-    });
-
-    group.bench_function("funnel", |b| {
-        b.iter_batched(
-            || build_funnel_map(&funnel_pairs),
-            |map| {
-                for key in &funnel_keys {
-                    black_box(map.get(black_box(key)));
-                }
-            },
-            BatchSize::LargeInput,
-        );
-    });
-
-    group.finish();
-}
-
 criterion_group!(
     name = benches;
     config = Criterion::default()
@@ -715,7 +664,6 @@ criterion_group!(
         bench_resize_heavy_throughput,
         bench_mixed_lookup_throughput,
         bench_multi_get_batch,
-        bench_pow2_lookup_throughput,
         bench_get_hit_latency
 );
 criterion_main!(benches);

@@ -202,45 +202,6 @@ impl ProbeOps {
     pub(crate) fn hash_to_usize(hash: u64) -> usize {
         hash as usize
     }
-
-    #[inline]
-    #[must_use]
-    pub(crate) fn greatest_common_divisor(mut a: usize, mut b: usize) -> usize {
-        while b != 0 {
-            let next = a % b;
-            a = b;
-            b = next;
-        }
-        a
-    }
-
-    #[inline]
-    #[must_use]
-    pub(crate) fn advance_wrapping_index(index: usize, step: usize, len: usize) -> usize {
-        // step < len is guaranteed by build_group_steps, so index + step < 2*len.
-        // A conditional subtract avoids the expensive division that modulo requires.
-        debug_assert!(len > 0, "advance_wrapping_index requires len > 0");
-        let r = index + step;
-        if r >= len { r - len } else { r }
-    }
-
-    #[must_use]
-    pub(crate) fn build_group_steps(group_count: usize) -> Box<[usize]> {
-        if group_count <= 1 {
-            return Box::new([1]);
-        }
-
-        let mut steps = Vec::new();
-        for step in 1..group_count {
-            if Self::greatest_common_divisor(step, group_count) == 1 {
-                steps.push(step);
-            }
-        }
-        if steps.is_empty() {
-            steps.push(1);
-        }
-        steps.into_boxed_slice()
-    }
 }
 
 // ---------------------------------------------------------------------------

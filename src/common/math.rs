@@ -1,8 +1,6 @@
 use super::config::{DEFAULT_RESERVE_FRACTION, MAX_RESERVE_FRACTION, MIN_RESERVE_FRACTION};
 use super::layout::GROUP_SIZE;
 
-pub(crate) use super::simd::ProbeOps;
-
 #[allow(clippy::cast_precision_loss)]
 #[inline]
 pub(crate) fn usize_to_f64(value: usize) -> f64 {
@@ -49,17 +47,23 @@ pub(crate) fn floor_half_reserve_slots(reserve_fraction: f64, value: usize) -> u
 }
 
 #[inline]
-pub(crate) fn advance_wrapping_index(current: usize, step: usize, len: usize) -> usize {
-    ProbeOps::advance_wrapping_index(current, step, len)
-}
-
-#[inline]
 pub(crate) fn round_up_to_group(value: usize) -> usize {
     if value == 0 {
         0
     } else {
         value.div_ceil(GROUP_SIZE) * GROUP_SIZE
     }
+}
+
+/// Round `slots` up so `group_count = ceil(slots / GROUP_SIZE)` is pow2 —
+/// required for `(idx + delta) & (group_count - 1)` to wrap the full range.
+#[inline]
+pub(crate) fn round_up_to_pow2_groups(slots: usize) -> usize {
+    if slots == 0 {
+        return 0;
+    }
+    let groups = slots.div_ceil(GROUP_SIZE).max(1).next_power_of_two();
+    groups * GROUP_SIZE
 }
 
 /// Knuth multiplicative-hash constant (golden ratio * 2^64, odd).
