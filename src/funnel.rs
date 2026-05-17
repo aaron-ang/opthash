@@ -6,7 +6,7 @@ use crate::common::simd::{ProbeOps, prefetch_read};
 
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
-    control::{CTRL_EMPTY, ControlByte, ControlOps},
+    control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
         ceil_to_usize, fastmod_magic, fastmod_u32, floor_to_usize, level_salt, max_insertions,
@@ -145,18 +145,21 @@ impl<K, V> Drop for BucketLevel<K, V> {
 }
 
 /// Fallback table for keys that didn't fit in any bucket level. SIMD-group
-/// open addressing with `SwissTable` triangular probing; capacity rounded up
-/// to pow2 `group_count`.
+/// open addressing with per-key odd-step probing over pow2 `group_count`
+/// (step coprime to `group_count` ⇒ permutation over all groups).
 struct SpecialPrimary<K, V> {
     /// `SoA` control bytes + entries.
     table: RawTable<Entry<K, V>>,
     /// Live entry count.
     len: usize,
+    /// Total tombstone count across all groups; drives the global
+    /// 50%-capacity resize trigger.
+    tombstones: usize,
     /// `group_count - 1`. Pow2 by construction.
     group_count_mask: usize,
     /// Per-group packed fingerprint metadata for fast scans.
     group_summaries: Box<[u128]>,
-    /// Per-group tombstone count, bounds probe length.
+    /// Per-group tombstone count, gates `StopSearch` during probing.
     group_tombstones: Box<[usize]>,
 }
 
@@ -172,7 +175,8 @@ impl<K, V> SpecialPrimary<K, V> {
         Self {
             table,
             len: 0,
-            group_count_mask: group_count.wrapping_sub(1),
+            tombstones: 0,
+            group_count_mask: group_count.saturating_sub(1),
             group_summaries: vec![0; group_count].into_boxed_slice(),
             group_tombstones: vec![0; group_count].into_boxed_slice(),
         }
@@ -713,7 +717,8 @@ where
                 primary.table.mark_tombstone(slot_idx);
                 primary.len -= 1;
                 primary.group_tombstones[group_idx] += 1;
-                let needs_resize = primary.group_tombstones[group_idx] > GROUP_SIZE / 4;
+                primary.tombstones += 1;
+                let needs_resize = primary.tombstones > primary.table.capacity() / 2;
                 (removed, needs_resize)
             }
             SlotLocation::SpecialFallback { slot_idx } => {
@@ -784,6 +789,7 @@ where
         }
         self.special.primary.table.clear_all_controls();
         self.special.primary.len = 0;
+        self.special.primary.tombstones = 0;
         self.special.primary.group_summaries.fill(0);
         self.special.primary.group_tombstones.fill(0);
 
@@ -826,6 +832,7 @@ where
         }
         self.special.primary.table.clear_all_controls();
         self.special.primary.len = 0;
+        self.special.primary.tombstones = 0;
         self.special.primary.group_summaries.fill(0);
         self.special.primary.group_tombstones.fill(0);
 
@@ -867,15 +874,28 @@ where
         self.hash_builder.hash_one(key)
     }
 
-    /// Triangular-probing start group for the special primary. `group_count`
+    /// Start group for the special primary probe sequence. `group_count`
     /// is pow2 by `SpecialPrimary::with_capacity` construction.
     #[inline]
-    fn special_primary_triangular_start(&self, key_hash: u64) -> usize {
+    fn special_primary_group_start(&self, key_hash: u64) -> usize {
         let mask = self.special.primary.group_count_mask;
         if mask == 0 {
             return 0;
         }
         ProbeOps::hash_to_usize(key_hash.rotate_left(11)) & mask
+    }
+
+    /// Per-key odd step over the pow2 `group_count`. Forcing the low bit
+    /// makes the step coprime to any power of two, so iterating
+    /// `group_idx = (group_idx + step) & mask` visits every group within
+    /// `group_count` iterations. Restores probe-path diversity that the
+    /// fixed-step triangular probe (g, g+1, g+3, g+6, …) lost when it
+    /// replaced double hashing — all keys sharing a start group then walked
+    /// the same path, concentrating tombstones under delete-heavy workloads.
+    #[inline]
+    fn special_primary_step(&self, key_hash: u64) -> usize {
+        let mask = self.special.primary.group_count_mask;
+        (ProbeOps::hash_to_usize(key_hash.rotate_left(43)) | 1) & mask
     }
 
     #[inline]
@@ -1030,11 +1050,20 @@ where
             SlotLocation::SpecialPrimary { slot_idx } => {
                 let group_idx = slot_idx / GROUP_SIZE;
                 let primary = &mut self.special.primary;
+                // Reusing a tombstone slot must decrement the tombstone
+                // counters (global + per-group); otherwise resize triggers
+                // prematurely and the per-group `StopSearch` early-exit at
+                // find_in_special_primary never re-enables.
+                let was_tombstone = primary.table.control_at(slot_idx) == CTRL_TOMBSTONE;
                 primary
                     .table
                     .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
                 primary.len += 1;
                 primary.group_summaries[group_idx] |= ControlOps::fingerprint_bit(key_fingerprint);
+                if was_tombstone {
+                    primary.tombstones -= 1;
+                    primary.group_tombstones[group_idx] -= 1;
+                }
             }
             SlotLocation::SpecialFallback { slot_idx } => {
                 let fallback = &mut self.special.fallback;
@@ -1073,14 +1102,13 @@ where
         let group_count = primary.table.group_count();
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
         let mask = primary.group_count_mask;
-        let mut group_idx = self.special_primary_triangular_start(key_hash);
-        let mut delta: usize = 0;
+        let mut group_idx = self.special_primary_group_start(key_hash);
+        let step = self.special_primary_step(key_hash);
         for _ in 0..group_limit {
             if let Some(slot_idx) = Self::first_free_in_special_primary_group(primary, group_idx) {
                 return Some(slot_idx);
             }
-            delta += 1;
-            group_idx = (group_idx + delta) & mask;
+            group_idx = (group_idx + step) & mask;
         }
         None
     }
@@ -1248,8 +1276,8 @@ where
         let group_count = primary.table.group_count();
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
         let mask = primary.group_count_mask;
-        let mut group_idx = self.special_primary_triangular_start(key_hash);
-        let mut delta: usize = 0;
+        let mut group_idx = self.special_primary_group_start(key_hash);
+        let step = self.special_primary_step(key_hash);
         for _ in 0..group_limit {
             if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
                 for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
@@ -1265,8 +1293,7 @@ where
             {
                 return LookupStep::StopSearch;
             }
-            delta += 1;
-            let next = (group_idx + delta) & mask;
+            let next = (group_idx + step) & mask;
             unsafe { prefetch_read(primary.table.group_data_ptr(next)) };
             group_idx = next;
         }
@@ -1301,8 +1328,8 @@ where
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
         let mask = primary.group_count_mask;
         let mut candidate = None;
-        let mut group_idx = self.special_primary_triangular_start(key_hash);
-        let mut delta: usize = 0;
+        let mut group_idx = self.special_primary_group_start(key_hash);
+        let step = self.special_primary_step(key_hash);
         for _ in 0..group_limit {
             if candidate.is_none() {
                 candidate = primary.table.first_free_in_group(group_idx);
@@ -1321,8 +1348,7 @@ where
             {
                 return (LookupStep::StopSearch, candidate);
             }
-            delta += 1;
-            let next = (group_idx + delta) & mask;
+            let next = (group_idx + step) & mask;
             unsafe { prefetch_read(primary.table.group_data_ptr(next)) };
             group_idx = next;
         }
@@ -1804,9 +1830,9 @@ mod tests {
 
     #[test]
     fn funnel_layout_covers_capacity() {
-        // SpecialPrimary now rounds up to pow2 group_count for triangular
-        // probing, so total slots may exceed the requested capacity. The
-        // invariant is "covers at least the request, bounded inflation".
+        // SpecialPrimary rounds up to pow2 group_count for odd-step probing,
+        // so total slots may exceed the requested capacity. The invariant is
+        // "covers at least the request, bounded inflation".
         let capacity = 257;
         let map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(capacity);
         let level_capacity = map.levels.iter().map(BucketLevel::capacity).sum::<usize>();
@@ -1947,6 +1973,29 @@ mod tests {
         }
         for i in (1..100).step_by(2) {
             assert_eq!(map.get(&i), None, "odd key {i} should be gone");
+        }
+    }
+
+    #[test]
+    fn special_primary_single_group_edge_case() {
+        // Smallest capacity exercises the SpecialPrimary path with
+        // `group_count == 1` (`mask == 0`). The odd-step probe must still
+        // make forward progress (loop terminates via `group_limit`).
+        let mut map: FunnelHashMap<u64, u64> = FunnelHashMap::with_capacity(1);
+        for i in 0..16 {
+            map.insert(i, i * 3);
+        }
+        for i in 0..16 {
+            assert_eq!(map.get(&i), Some(&(i * 3)));
+        }
+        for i in 0..8 {
+            assert_eq!(map.remove(&i), Some(i * 3));
+        }
+        for i in 0..8 {
+            assert_eq!(map.get(&i), None);
+        }
+        for i in 8..16 {
+            assert_eq!(map.get(&i), Some(&(i * 3)));
         }
     }
 
