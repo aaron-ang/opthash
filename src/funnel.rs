@@ -9,8 +9,8 @@ use crate::common::{
     control::{CTRL_EMPTY, ControlByte, ControlOps},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
-        advance_wrapping_index, ceil_to_usize, fastmod_magic, fastmod_u32, floor_to_usize,
-        level_salt, max_insertions, round_to_usize, round_up_to_group, sanitize_reserve_fraction,
+        ceil_to_usize, fastmod_magic, fastmod_u32, floor_to_usize, level_salt, max_insertions,
+        round_to_usize, round_up_to_group, round_up_to_pow2_groups, sanitize_reserve_fraction,
         usize_to_f64,
     },
 };
@@ -144,31 +144,37 @@ impl<K, V> Drop for BucketLevel<K, V> {
     }
 }
 
-/// Fallback table for keys that didn't fit in any bucket level.
-/// Open-addressed with double-hashing across SIMD groups (16 slots each).
+/// Fallback table for keys that didn't fit in any bucket level. SIMD-group
+/// open addressing with `SwissTable` triangular probing; capacity rounded up
+/// to pow2 `group_count`.
 struct SpecialPrimary<K, V> {
-    /// Structure of Arrays control bytes + entries.
+    /// `SoA` control bytes + entries.
     table: RawTable<Entry<K, V>>,
     /// Live entry count.
     len: usize,
+    /// `group_count - 1`. Pow2 by construction.
+    group_count_mask: usize,
     /// Per-group packed fingerprint metadata for fast scans.
     group_summaries: Box<[u128]>,
     /// Per-group tombstone count, bounds probe length.
     group_tombstones: Box<[usize]>,
-    /// Precomputed double-hashing step set.
-    group_steps: Box<[usize]>,
 }
 
 impl<K, V> SpecialPrimary<K, V> {
     fn with_capacity(capacity: usize) -> Self {
-        let table = RawTable::new(capacity);
+        let inflated = round_up_to_pow2_groups(capacity);
+        let table = RawTable::new(inflated);
         let group_count = table.group_count();
+        debug_assert!(
+            group_count == 0 || group_count.is_power_of_two(),
+            "SpecialPrimary group_count must be pow2",
+        );
         Self {
             table,
             len: 0,
+            group_count_mask: group_count.wrapping_sub(1),
             group_summaries: vec![0; group_count].into_boxed_slice(),
             group_tombstones: vec![0; group_count].into_boxed_slice(),
-            group_steps: ProbeOps::build_group_steps(group_count),
         }
     }
 }
@@ -878,15 +884,15 @@ where
         self.hash_builder.hash_one(key)
     }
 
+    /// Triangular-probing start group for the special primary. `group_count`
+    /// is pow2 by `SpecialPrimary::with_capacity` construction.
     #[inline]
-    fn special_primary_probe_params(&self, key_hash: u64, group_count: usize) -> (usize, usize) {
-        if group_count <= 1 {
-            return (0, 1);
+    fn special_primary_triangular_start(&self, key_hash: u64) -> usize {
+        let mask = self.special.primary.group_count_mask;
+        if mask == 0 {
+            return 0;
         }
-        let start = ProbeOps::hash_to_usize(key_hash.rotate_left(11)) % group_count;
-        let steps = &self.special.primary.group_steps;
-        let step = steps[ProbeOps::hash_to_usize(key_hash.rotate_left(43)) % steps.len()];
-        (start, step)
+        ProbeOps::hash_to_usize(key_hash.rotate_left(11)) & mask
     }
 
     #[inline]
@@ -1082,15 +1088,16 @@ where
         }
 
         let group_count = primary.table.group_count();
-        let (group_start, group_step) = self.special_primary_probe_params(key_hash, group_count);
-        let mut group_idx = group_start;
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
-
+        let mask = primary.group_count_mask;
+        let mut group_idx = self.special_primary_triangular_start(key_hash);
+        let mut delta: usize = 0;
         for _ in 0..group_limit {
             if let Some(slot_idx) = Self::first_free_in_special_primary_group(primary, group_idx) {
                 return Some(slot_idx);
             }
-            group_idx = advance_wrapping_index(group_idx, group_step, group_count);
+            delta += 1;
+            group_idx = (group_idx + delta) & mask;
         }
         None
     }
@@ -1256,10 +1263,10 @@ where
 
         let fingerprint_mask = ControlOps::fingerprint_bit(key_fingerprint);
         let group_count = primary.table.group_count();
-        let (group_start, group_step) = self.special_primary_probe_params(key_hash, group_count);
-        let mut group_idx = group_start;
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
-
+        let mask = primary.group_count_mask;
+        let mut group_idx = self.special_primary_triangular_start(key_hash);
+        let mut delta: usize = 0;
         for _ in 0..group_limit {
             if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
                 for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
@@ -1270,18 +1277,16 @@ where
                     }
                 }
             }
-
             if primary.group_tombstones[group_idx] == 0
                 && primary.table.first_free_in_group(group_idx).is_some()
             {
                 return LookupStep::StopSearch;
             }
-
-            let next = advance_wrapping_index(group_idx, group_step, group_count);
+            delta += 1;
+            let next = (group_idx + delta) & mask;
             unsafe { prefetch_read(primary.table.group_data_ptr(next)) };
             group_idx = next;
         }
-
         LookupStep::Continue
     }
 
@@ -1310,16 +1315,15 @@ where
 
         let fingerprint_mask = ControlOps::fingerprint_bit(key_fingerprint);
         let group_count = primary.table.group_count();
-        let (group_start, group_step) = self.special_primary_probe_params(key_hash, group_count);
-        let mut group_idx = group_start;
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
+        let mask = primary.group_count_mask;
         let mut candidate = None;
-
+        let mut group_idx = self.special_primary_triangular_start(key_hash);
+        let mut delta: usize = 0;
         for _ in 0..group_limit {
-            if candidate.is_none() && primary.table.first_free_in_group(group_idx).is_some() {
+            if candidate.is_none() {
                 candidate = primary.table.first_free_in_group(group_idx);
             }
-
             if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
                 for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
                     let slot_idx = group_idx * GROUP_SIZE + relative_idx;
@@ -1329,18 +1333,16 @@ where
                     }
                 }
             }
-
             if primary.group_tombstones[group_idx] == 0
                 && primary.table.first_free_in_group(group_idx).is_some()
             {
                 return (LookupStep::StopSearch, candidate);
             }
-
-            let next = advance_wrapping_index(group_idx, group_step, group_count);
+            delta += 1;
+            let next = (group_idx + delta) & mask;
             unsafe { prefetch_read(primary.table.group_data_ptr(next)) };
             group_idx = next;
         }
-
         (LookupStep::Continue, candidate)
     }
 
@@ -1766,13 +1768,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn funnel_layout_uses_full_capacity() {
+    fn funnel_layout_covers_capacity() {
+        // SpecialPrimary now rounds up to pow2 group_count for triangular
+        // probing, so total slots may exceed the requested capacity. The
+        // invariant is "covers at least the request, bounded inflation".
         let capacity = 257;
         let map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(capacity);
         let level_capacity = map.levels.iter().map(BucketLevel::capacity).sum::<usize>();
         let special_capacity =
             map.special.primary.table.capacity() + map.special.fallback.table.capacity();
-        assert_eq!(level_capacity + special_capacity, capacity);
+        let total = level_capacity + special_capacity;
+        assert!(
+            total >= capacity,
+            "total={total} below requested={capacity}"
+        );
+        assert!(
+            total <= capacity * 2,
+            "total={total} exceeds 2x of requested={capacity}",
+        );
     }
 
     #[test]

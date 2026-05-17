@@ -13,10 +13,12 @@ Both are open-addressing hash maps that achieve optimal expected probe complexit
 
 ## Data Structures
 
-Both maps share a common core: `RawTable`-backed multi-level layouts, 7-bit fingerprint control bytes, SIMD control-byte scans for occupancy + lookup, tombstone accounting, and per-level Lemire fastmod magics for the hash → slot mapping. The default `BuildHasher` is [`foldhash`](https://crates.io/crates/foldhash).
+Both maps share a common core: `RawTable`-backed multi-level layouts, 7-bit fingerprint control bytes, SIMD control-byte scans for occupancy + lookup, tombstone accounting, and SwissTable-style triangular probing within every level. Per-level `group_count` is rounded up to a power of two so `(idx + delta) & mask` wraps in one op. The default `BuildHasher` is [`foldhash`](https://crates.io/crates/foldhash).
 
-- **`ElasticHashMap<K, V>`** — Flat `RawTable` per level with geometrically halving capacities; insertion uses per-level probe budgets + coprime group steps.
+- **`ElasticHashMap<K, V>`** — Flat `RawTable` per level with geometrically halving capacities; insertion uses per-level probe budgets.
 - **`FunnelHashMap<K, V>`** — Bucketed levels plus a split special array: `primary` (group-probed) and `fallback` (two-choice buckets).
+
+Memory note: pow2 rounding can inflate slot count by up to ~2× the requested capacity; the logical capacity (used for `max_insertions` / resize) is unchanged.
 
 Both support `insert`, `get`, `get_mut`, `contains_key`, `remove`, and `clear`. Maps start with zero allocation (`new()`) and grow dynamically on demand. Advanced tuning is available through `ElasticOptions`, `FunnelOptions`, and `with_options(...)`.
 
@@ -104,8 +106,7 @@ ElasticHashMap
     Level 2    ...
 
     per-level  len, tombstones, half_reserve_slot_threshold,
-               limited_probe_budgets, group_steps, salt,
-               group_count_magic, step_count_magic
+               limited_probe_budgets, salt, group_count_mask
 
   table-wide   len, capacity, max_insertions, reserve_fraction,
                probe_scale, batch_plan, current_batch_index,
@@ -131,7 +132,7 @@ FunnelHashMap
   special: SpecialArray
 
     primary    RawTable, group-probed (like elastic)
-    (paper B)  len, group_summaries, group_tombstones, group_steps
+    (paper B)  len, group_count_mask, group_summaries, group_tombstones
 
     fallback   RawTable, two-choice bucketed
     (paper C)  len, tombstones, bucket_size, bucket_count
