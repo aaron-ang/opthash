@@ -26,6 +26,12 @@ BENCH=${BENCH:-all}
 BASELINE=${BASELINE:-}
 LOCK_DIR=${LOCK_DIR:-/tmp/opthash-bench-locks}
 
+# Low-noise primitives below (cpufreq scan, taskset, setarch, chrt, cpupower,
+# intel_pstate) are Linux-only. On other OSes, skip pinning + ASLR-disable and
+# fall through to plain `cargo bench`. Bench will run, just noisier.
+IS_LINUX=0
+[[ $(uname) == Linux ]] && IS_LINUX=1
+
 # Detect performance-cluster cores: the subset whose cpuinfo_max_freq equals
 # the system maximum. On a hybrid SoC (e.g. Cortex-X925 perf + A725 efficiency)
 # this picks the X925 cores; on a homogeneous CPU it returns every core.
@@ -79,7 +85,7 @@ claim_perf_core() {
 	echo "info: all perf cores busy; restricting to cluster CORE=$CORE" >&2
 }
 
-if [[ -z ${CORE:-} ]]; then
+if ((IS_LINUX)) && [[ -z ${CORE:-} ]]; then
 	claim_perf_core
 fi
 
@@ -98,7 +104,7 @@ command -v cargo >/dev/null 2>&1 || {
 	exit 1
 }
 
-if [[ $EUID -eq 0 ]]; then
+if ((IS_LINUX)) && [[ $EUID -eq 0 ]]; then
 	if command -v cpupower >/dev/null 2>&1; then
 		cpupower frequency-set -g performance >/dev/null
 	fi
@@ -123,12 +129,18 @@ fi
 # so build artifacts stay user-owned. SCHED_FIFO survives the UID drop —
 # it's a process attribute, not a credential.
 launcher=()
-if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] && command -v chrt >/dev/null 2>&1; then
+if ((IS_LINUX)) && [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] && command -v chrt >/dev/null 2>&1; then
 	launcher=(chrt -f 99 sudo -u "$SUDO_USER"
 		--preserve-env=PATH,CARGO_HOME,RUSTUP_HOME --)
 fi
 
+# Pin + ASLR-disable wrapper only on Linux; elsewhere run cargo bench bare.
+pin_wrapper=()
+if ((IS_LINUX)) && [[ -n "${CORE:-}" ]]; then
+	pin_wrapper=(taskset -c "$CORE" setarch -R)
+fi
+
 for target in "${bench_targets[@]}"; do
-	cmd=(taskset -c "$CORE" setarch -R cargo bench --bench "$target" -- "${criterion_args[@]}" "$@")
+	cmd=("${pin_wrapper[@]}" cargo bench --bench "$target" -- "${criterion_args[@]}" "$@")
 	"${launcher[@]}" "${cmd[@]}"
 done
