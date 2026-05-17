@@ -79,33 +79,24 @@ struct Level<K, V> {
     table: RawTable<Entry<K, V>>,
     /// Live entry count.
     len: usize,
-    /// Per-level salt mixed into the key hash so each level probes a
-    /// different sequence. Hot — read on every lookup.
+    /// Per-level salt mixed into key hashes. Hot — read every lookup.
     salt: u64,
-    /// `group_count - 1` when `uses_triangular` (power-of-2 group count),
-    /// otherwise 0. Enables `idx & mask` group wrap. Hot — kept adjacent to
-    /// `salt` and `uses_triangular` so one cache line covers the lookup-hot
-    /// suffix.
+    /// `group_count - 1` when `uses_triangular`, else 0. Hot — read every lookup.
     group_count_mask: usize,
-    /// True iff `group_count` is a power of two: enables SwissTable-style
-    /// triangular probing `(g + T_k) & mask` instead of GCD-step double hashing.
-    /// Hot — branched on every lookup.
+    /// `group_count.is_power_of_two()`. Hot — branched every lookup.
     uses_triangular: bool,
     /// Deleted-slot count.
     tombstones: usize,
     /// Cached `floor(reserve * cap / 2)` for the
     /// `current_free_slots > threshold` branch in slot selection.
     half_reserve_slot_threshold: usize,
-    /// Per-(free-slot count) probe budget for limited probing.
-    /// Indexed by `free_slots()`.
+    /// Probe budget indexed by `free_slots()`.
     limited_probe_budgets: Box<[usize]>,
-    /// Precomputed double-hashing step set. Empty when `uses_triangular`
-    /// (`group_count` is a power of two). Cold on the triangular hot path.
+    /// Double-hashing step set; empty when `uses_triangular`. Cold.
     group_steps: Box<[usize]>,
-    /// Fastmod magic for `group_count`. Unused (and zero) when
-    /// `uses_triangular`. Cold on the triangular hot path.
+    /// Fastmod magic for `group_count`. Cold.
     group_count_magic: u64,
-    /// Fastmod magic for `group_steps.len()`. Cold on the triangular hot path.
+    /// Fastmod magic for `group_steps.len()`. Cold.
     step_count_magic: u64,
 }
 
@@ -1541,9 +1532,8 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// Sanity check: the capacity used by the speedup bench's pow2 variants
-    /// must drive level 0 onto the triangular path. Tracks bench config next
-    /// to the implementation so a future change to either side fails fast.
+    /// Pins the pow2 bench capacity to the triangular path so a change to
+    /// either side fails fast.
     #[test]
     fn bench_pow2_capacity_triggers_triangular() {
         let map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(32_768);
@@ -1553,9 +1543,9 @@ mod tests {
         );
     }
 
-    /// `with_capacity(32768)` makes level 0 = 16384 (1024 groups, pow2) so
-    /// the triangular path fires for every lookup. Exercises insert / get /
-    /// remove / re-insert with tombstone reuse on the triangular path.
+    /// `cap=32768` → level 0 group_count=1024 (pow2), triangular fires for
+    /// every lookup. Exercises insert / get / remove / re-insert with
+    /// tombstone reuse.
     #[test]
     fn pow2_capacity_exercises_triangular_path() {
         let mut map = ElasticHashMap::with_capacity(32_768);

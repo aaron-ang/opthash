@@ -149,20 +149,20 @@ impl<K, V> Drop for BucketLevel<K, V> {
 /// triangular probing when `group_count` is a power of two; falls back to
 /// GCD-step double hashing otherwise.
 struct SpecialPrimary<K, V> {
-    /// Structure of Arrays control bytes + entries.
+    /// `SoA` control bytes + entries.
     table: RawTable<Entry<K, V>>,
     /// Live entry count.
     len: usize,
+    /// `group_count - 1` when `uses_triangular`, else 0. Hot — read every lookup.
+    group_count_mask: usize,
+    /// `group_count.is_power_of_two()`. Hot — branched every lookup.
+    uses_triangular: bool,
     /// Per-group packed fingerprint metadata for fast scans.
     group_summaries: Box<[u128]>,
     /// Per-group tombstone count, bounds probe length.
     group_tombstones: Box<[usize]>,
-    /// Precomputed double-hashing step set. Empty when `uses_triangular`.
+    /// Double-hashing step set; empty when `uses_triangular`. Cold.
     group_steps: Box<[usize]>,
-    /// `group_count - 1` when `uses_triangular`, else 0.
-    group_count_mask: usize,
-    /// True iff `group_count` is a power of two.
-    uses_triangular: bool,
 }
 
 impl<K, V> SpecialPrimary<K, V> {
@@ -183,11 +183,11 @@ impl<K, V> SpecialPrimary<K, V> {
         Self {
             table,
             len: 0,
+            group_count_mask,
+            uses_triangular,
             group_summaries: vec![0; group_count].into_boxed_slice(),
             group_tombstones: vec![0; group_count].into_boxed_slice(),
             group_steps,
-            group_count_mask,
-            uses_triangular,
         }
     }
 }
@@ -1404,7 +1404,7 @@ where
             let mut group_idx = self.special_primary_triangular_start(key_hash);
             let mut delta: usize = 0;
             for _ in 0..group_limit {
-                if candidate.is_none() && primary.table.first_free_in_group(group_idx).is_some() {
+                if candidate.is_none() {
                     candidate = primary.table.first_free_in_group(group_idx);
                 }
                 if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
@@ -1433,7 +1433,7 @@ where
         let mut group_idx = group_start;
 
         for _ in 0..group_limit {
-            if candidate.is_none() && primary.table.first_free_in_group(group_idx).is_some() {
+            if candidate.is_none() {
                 candidate = primary.table.first_free_in_group(group_idx);
             }
 
@@ -2248,9 +2248,8 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// Sanity check: a known capacity drives the funnel special primary
-    /// onto the triangular path. Tracks bench config next to the
-    /// implementation so a future change to either side fails fast.
+    /// Pins the pow2 bench capacity to the special-primary triangular path
+    /// so a change to either side fails fast.
     #[test]
     fn bench_pow2_capacity_triggers_special_primary_triangular() {
         let map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(27_104);
@@ -2262,10 +2261,8 @@ mod tests {
         );
     }
 
-    /// Triangular probing in the special-primary fires when its
-    /// `group_count` is a power of two. Scan a range of capacities, pick one
-    /// that drives the primary onto pow2 group_count, then exercise the
-    /// full insert / get / remove / re-insert cycle on the triangular path.
+    /// Scan capacities for one that lands SpecialPrimary on pow2 group_count,
+    /// then exercise insert / get / remove / re-insert on the triangular path.
     #[test]
     fn pow2_capacity_exercises_special_primary_triangular_path() {
         let mut pow2_capacity = None;
