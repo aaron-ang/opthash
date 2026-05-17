@@ -26,15 +26,13 @@ BENCH=${BENCH:-all}
 BASELINE=${BASELINE:-}
 LOCK_DIR=${LOCK_DIR:-/tmp/opthash-bench-locks}
 
-# Low-noise primitives below (cpufreq scan, taskset, setarch, chrt, cpupower,
-# intel_pstate) are Linux-only. On other OSes, skip pinning + ASLR-disable and
-# fall through to plain `cargo bench`. Bench will run, just noisier.
+# Low-noise primitives below are Linux-only; non-Linux falls through to
+# plain `cargo bench` (noisier but functional).
 IS_LINUX=0
 [[ $(uname) == Linux ]] && IS_LINUX=1
 
-# Detect performance-cluster cores: the subset whose cpuinfo_max_freq equals
-# the system maximum. On a hybrid SoC (e.g. Cortex-X925 perf + A725 efficiency)
-# this picks the X925 cores; on a homogeneous CPU it returns every core.
+# Cores at the system's max cpufreq. On hybrid SoCs this picks the perf
+# cluster (e.g. Cortex-X925 over A725); on homogeneous CPUs, all cores.
 detect_perf_cores() {
 	local max_freq=0
 	local path f
@@ -52,10 +50,9 @@ detect_perf_cores() {
 	done
 }
 
-# Claim a free perf core via flock. Sets CORE on success; falls back to the
-# full perf-cluster CPU list (taskset accepts "5,6,7,8,9") if every core is
-# already locked. The lock fd is intentionally kept open for the script's
-# lifetime — the kernel releases it on exit.
+# Claim a free perf core via flock so concurrent invocations don't collide.
+# Lock fd stays open for script lifetime; kernel releases on exit. If every
+# core is locked, falls back to the cluster CPU list.
 claim_perf_core() {
 	mkdir -p "$LOCK_DIR"
 	local perf_cores=()
@@ -89,8 +86,8 @@ if ((IS_LINUX)) && [[ -z ${CORE:-} ]]; then
 	claim_perf_core
 fi
 
-# sudo strips PATH and points HOME at /root; recover the invoking user's
-# rustup + cargo so the rustup shim can resolve their default toolchain.
+# sudo strips PATH/HOME; recover invoker's rustup so the shim resolves their
+# default toolchain.
 if [[ -n "${SUDO_USER:-}" ]]; then
 	user_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
 	if [[ -x "$user_home/.cargo/bin/cargo" ]]; then
@@ -125,16 +122,14 @@ else
 	bench_targets=("$BENCH")
 fi
 
-# Under sudo, prefix with chrt and drop back to the invoking user for cargo
-# so build artifacts stay user-owned. SCHED_FIFO survives the UID drop —
-# it's a process attribute, not a credential.
+# Under sudo, prefix chrt and drop back to invoking user so build artifacts
+# stay user-owned. SCHED_FIFO survives the UID drop (process attribute).
 launcher=()
 if ((IS_LINUX)) && [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]] && command -v chrt >/dev/null 2>&1; then
 	launcher=(chrt -f 99 sudo -u "$SUDO_USER"
 		--preserve-env=PATH,CARGO_HOME,RUSTUP_HOME --)
 fi
 
-# Pin + ASLR-disable wrapper only on Linux; elsewhere run cargo bench bare.
 pin_wrapper=()
 if ((IS_LINUX)) && [[ -n "${CORE:-}" ]]; then
 	pin_wrapper=(taskset -c "$CORE" setarch -R)
