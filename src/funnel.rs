@@ -144,10 +144,9 @@ impl<K, V> Drop for BucketLevel<K, V> {
     }
 }
 
-/// Fallback table for keys that didn't fit in any bucket level. Open-addressed
-/// across SIMD groups (16 slots each) using SwissTable-style triangular probing.
-/// Capacity is rounded up so `group_count` is pow2 (the precondition for
-/// `(idx + delta) & mask` to wrap the full range).
+/// Fallback table for keys that didn't fit in any bucket level. SIMD-group
+/// open addressing with `SwissTable` triangular probing; capacity rounded up
+/// to pow2 `group_count`.
 struct SpecialPrimary<K, V> {
     /// `SoA` control bytes + entries.
     table: RawTable<Entry<K, V>>,

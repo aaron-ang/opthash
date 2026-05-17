@@ -68,11 +68,8 @@ impl ElasticOptions {
     }
 }
 
-/// One level in elastic hashing's geometric partition.
-///
-/// Each level is an independent open-addressed table sized to roughly half
-/// the capacity of the previous level. Inserts cascade from level 0 outward
-/// per the active batch plan; lookups probe every populated level.
+/// One level in elastic hashing's geometric partition: an independent
+/// open-addressed table roughly half the previous level's capacity.
 struct Level<K, V> {
     /// `SoA` control bytes + entries.
     table: RawTable<Entry<K, V>>,
