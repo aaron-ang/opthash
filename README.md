@@ -143,22 +143,22 @@ FunnelHashMap
 
 ## Benchmarks
 
-See [benches/README.md](https://github.com/aaron-ang/opthash-rs/blob/main/benches/README.md) for bench target layout, charts, CLI flags, chart regeneration, and flamegraph profiling.
+See [benches/README.md](benches/README.md) for bench target layout, charts, CLI flags, chart regeneration, and flamegraph profiling.
 
 ## References
 
-[^fkk2025]: Martín Farach-Colton, Andrew Krapivin, William Kuszmaul. *Optimal Bounds for Open Addressing Without Reordering* (2025). arXiv: <https://arxiv.org/abs/2501.02305>. Establishes the elastic and funnel hashing schemes implemented in [`src/elastic.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/elastic.rs) and [`src/funnel.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/funnel.rs); the funnel "special array" split into `primary` (group-probed, paper B) and `fallback` (two-choice, paper C) follows the paper's construction directly.
+[^fkk2025]: Martín Farach-Colton, Andrew Krapivin, William Kuszmaul. *Optimal Bounds for Open Addressing Without Reordering* (2025). arXiv: <https://arxiv.org/abs/2501.02305>. Establishes the elastic and funnel hashing schemes implemented in [`src/elastic.rs`](src/elastic.rs) and [`src/funnel.rs`](src/funnel.rs); the funnel "special array" split into `primary` (group-probed, paper B) and `fallback` (two-choice, paper C) follows the paper's construction directly.
 
-[^cw1979]: J. Lawrence Carter, Mark N. Wegman. *Universal Classes of Hash Functions* (STOC 1977 / JCSS 1979). DOI: <https://doi.org/10.1016/0022-0000(79)90044-8>. Foundational hash-based probing model the FKK bounds rely on; the per-level `salt` re-randomization in `Level`/`BucketLevel` (see `level_salt` in [`src/common/math.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/math.rs)) follows the universal-hashing assumption.
+[^cw1979]: J. Lawrence Carter, Mark N. Wegman. *Universal Classes of Hash Functions* (STOC 1977 / JCSS 1979). DOI: <https://doi.org/10.1016/0022-0000(79)90044-8>. Foundational hash-based probing model the FKK bounds rely on; the per-level `salt` re-randomization in `Level`/`BucketLevel` (see `level_salt` in [`src/common/math.rs`](src/common/math.rs)) follows the universal-hashing assumption.
 
-[^swisstable]: Abseil. *SwissTable design notes*. <https://abseil.io/about/design/swisstables>. Source of the 7-bit fingerprint control-byte layout + SIMD group scans used by `RawTable` (see [`src/common/control.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/control.rs), [`src/common/simd.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/simd.rs)) and the triangular `(idx + delta) & mask` probe sequence used in `ElasticHashMap::triangular_group_start` and `FunnelHashMap::special_primary_triangular_start`.
+[^swisstable]: Abseil. *SwissTable design notes*. <https://abseil.io/about/design/swisstables>. Source of the 7-bit fingerprint control-byte layout + SIMD group scans used by `RawTable` (see [`src/common/control.rs`](src/common/control.rs), [`src/common/simd.rs`](src/common/simd.rs)) and the triangular `(idx + delta) & mask` probe sequence used in `ElasticHashMap::triangular_group_start` and `FunnelHashMap::special_primary_triangular_start`.
 
 [^cppcon2017]: Matt Kulukundis. *Designing a Fast, Efficient, Cache-friendly Hash Table, Step by Step* (CppCon 2017). <https://www.youtube.com/watch?v=ncHmEUmJZf4>. Talk introducing the SwissTable design referenced above.
 
-[^hashbrown]: `hashbrown` — Rust port of SwissTable. <https://github.com/rust-lang/hashbrown>. Used as the absolute throughput ceiling in the Criterion benches (see [benches/README.md](https://github.com/aaron-ang/opthash-rs/blob/main/benches/README.md)).
+[^hashbrown]: `hashbrown` — Rust port of SwissTable. <https://github.com/rust-lang/hashbrown>. Used as the absolute throughput ceiling in the Criterion benches (see [benches/README.md](benches/README.md)).
 
-[^foldhash]: `foldhash` crate. <https://crates.io/crates/foldhash>. Default `BuildHasher` (`foldhash::fast::RandomState`) wired up in [`src/common/mod.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/mod.rs).
+[^foldhash]: `foldhash` crate. <https://crates.io/crates/foldhash>. Default `BuildHasher` (`foldhash::fast::RandomState`) wired up in [`src/common/mod.rs`](src/common/mod.rs).
 
-[^prefetch2007]: Shimin Chen, Anastassia Ailamaki, Phillip B. Gibbons, Todd C. Mowry. *Improving Hash Join Performance through Prefetching* (ACM TODS 2007). PDF: <https://www.cs.cmu.edu/~chensm/papers/hashjoin_tods_preliminary.pdf>. Motivates the intra-probe `prefetch_read(group_data_ptr(next))` issued one group ahead in `find_in_special_primary` / `find_in_special_primary_with_candidate` (see [`src/funnel.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/funnel.rs)).
+[^prefetch2007]: Shimin Chen, Anastassia Ailamaki, Phillip B. Gibbons, Todd C. Mowry. *Improving Hash Join Performance through Prefetching* (ACM TODS 2007). PDF: <https://www.cs.cmu.edu/~chensm/papers/hashjoin_tods_preliminary.pdf>. Motivates the intra-probe `prefetch_read(group_data_ptr(next))` issued one group ahead in `find_in_special_primary` / `find_in_special_primary_with_candidate` (see [`src/funnel.rs`](src/funnel.rs)).
 
-[^fastmod]: Daniel Lemire. *Faster Remainders when the Divisor is a Constant: Beating Compilers and libdivide* (2019). <https://lemire.me/blog/2019/02/08/faster-remainders-when-the-divisor-is-a-constant-beating-compilers-and-libdivide/>. Algorithm behind `fastmod_magic` / `fastmod_u32` in [`src/common/math.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/math.rs), used by `BucketLevel::bucket_index` to map a hash to a bucket without a hardware divide.
+[^fastmod]: Daniel Lemire. *Faster Remainders when the Divisor is a Constant: Beating Compilers and libdivide* (2019). <https://lemire.me/blog/2019/02/08/faster-remainders-when-the-divisor-is-a-constant-beating-compilers-and-libdivide/>. Algorithm behind `fastmod_magic` / `fastmod_u32` in [`src/common/math.rs`](src/common/math.rs), used by `BucketLevel::bucket_index` to map a hash to a bucket without a hardware divide.
