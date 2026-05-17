@@ -5,7 +5,10 @@ mod funnel;
 #[cfg(feature = "python")]
 mod python;
 
-pub use elastic::ElasticHashMap;
-pub use elastic::ElasticOptions;
-pub use funnel::FunnelHashMap;
-pub use funnel::FunnelOptions;
+pub use common::DefaultHashBuilder;
+pub use elastic::{
+    ElasticHashMap, ElasticIter, ElasticOptions, Keys as ElasticKeys, Values as ElasticValues,
+};
+pub use funnel::{
+    FunnelHashMap, FunnelIter, FunnelOptions, Keys as FunnelKeys, Values as FunnelValues,
+};
