@@ -6,7 +6,7 @@ use crate::common::simd::{ProbeOps, prefetch_read};
 
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
-    control::{CTRL_EMPTY, ControlByte, ControlOps},
+    control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
         ceil_to_usize, fastmod_magic, fastmod_u32, floor_to_usize, level_salt, max_insertions,
@@ -176,7 +176,7 @@ impl<K, V> SpecialPrimary<K, V> {
             table,
             len: 0,
             tombstones: 0,
-            group_count_mask: group_count.wrapping_sub(1),
+            group_count_mask: group_count.saturating_sub(1),
             group_summaries: vec![0; group_count].into_boxed_slice(),
             group_tombstones: vec![0; group_count].into_boxed_slice(),
         }
@@ -1067,11 +1067,20 @@ where
             SlotLocation::SpecialPrimary { slot_idx } => {
                 let group_idx = slot_idx / GROUP_SIZE;
                 let primary = &mut self.special.primary;
+                // Reusing a tombstone slot must decrement the tombstone
+                // counters (global + per-group); otherwise resize triggers
+                // prematurely and the per-group `StopSearch` early-exit at
+                // find_in_special_primary never re-enables.
+                let was_tombstone = primary.table.control_at(slot_idx) == CTRL_TOMBSTONE;
                 primary
                     .table
                     .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
                 primary.len += 1;
                 primary.group_summaries[group_idx] |= ControlOps::fingerprint_bit(key_fingerprint);
+                if was_tombstone {
+                    primary.tombstones -= 1;
+                    primary.group_tombstones[group_idx] -= 1;
+                }
             }
             SlotLocation::SpecialFallback { slot_idx } => {
                 let fallback = &mut self.special.fallback;
