@@ -2,7 +2,7 @@ use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash};
 
 use crate::common::DefaultHashBuilder;
-use crate::common::simd::{ProbeOps, prefetch_read};
+use crate::common::simd::ProbeOps;
 
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
@@ -357,73 +357,6 @@ where
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
         Some(unsafe { &self.levels[level_idx].table.get_ref(slot_idx).value })
-    }
-
-    /// Batched lookup that pipelines prefetches for the level-0 probe group
-    /// to overlap DRAM/L3 misses. Allocates the result vector; hot loops
-    /// should prefer [`Self::multi_get_into`].
-    ///
-    /// Only level 0 is prefetched: miss-heavy batches that fall through to
-    /// deeper levels see no prefetch benefit.
-    pub fn multi_get<'a, Q>(&self, keys: &[&'a Q]) -> Vec<Option<&V>>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized + 'a,
-    {
-        let mut out = Vec::with_capacity(keys.len());
-        self.multi_get_into(keys, &mut out);
-        out
-    }
-
-    /// Like [`Self::multi_get`], but writes into the caller-owned `out`
-    /// (cleared and re-reserved on entry) so repeated batches can reuse the
-    /// allocation.
-    pub fn multi_get_into<'a, 'b, Q>(&'a self, keys: &[&'b Q], out: &mut Vec<Option<&'a V>>)
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized + 'b,
-    {
-        // Depths 4/8/12 all saturate the prefetch win at 10M × 1000-key
-        // bursts; 16 regresses ~16% (line-fill-buffer pressure). 8 is the
-        // midpoint with the least register pressure.
-        const PIPELINE_DEPTH: usize = 8;
-
-        let n = keys.len();
-        out.clear();
-        out.reserve(n);
-        if self.len == 0 {
-            out.extend(std::iter::repeat_n(None, n));
-            return;
-        }
-
-        let hashes: Vec<u64> = keys.iter().map(|k| self.hash_key(*k)).collect();
-
-        let level0_opt = self.levels.first().filter(|l| l.len > 0);
-
-        if let Some(level0) = level0_opt {
-            for &h in hashes.iter().take(PIPELINE_DEPTH.min(n)) {
-                let group_start = Self::triangular_group_start(level0, h);
-                unsafe { prefetch_read(level0.table.group_data_ptr(group_start)) };
-            }
-        }
-
-        for i in 0..n {
-            if let Some(level0) = level0_opt
-                && let Some(&h_ahead) = hashes.get(i + PIPELINE_DEPTH)
-            {
-                let group_start = Self::triangular_group_start(level0, h_ahead);
-                unsafe { prefetch_read(level0.table.group_data_ptr(group_start)) };
-            }
-
-            let h = hashes[i];
-            let fp = ControlOps::control_fingerprint(h);
-            let result = self.find_slot_indices_with_hash(keys[i], h, fp).map(
-                |(level_idx, slot_idx)| unsafe {
-                    &self.levels[level_idx].table.get_ref(slot_idx).value
-                },
-            );
-            out.push(result);
-        }
     }
 
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
@@ -1242,36 +1175,6 @@ mod tests {
     }
 
     #[test]
-    fn multi_get_matches_get_for_hits_and_misses() {
-        let n: i32 = 1_000;
-        let cap = usize::try_from(n * 2).expect("positive capacity");
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(cap);
-        for i in 0..n {
-            map.insert(i, i * 7);
-        }
-
-        // Mix of hits and misses.
-        let probe_keys: Vec<i32> = (-100..(n + 100)).collect();
-        let refs: Vec<&i32> = probe_keys.iter().collect();
-        let batched = map.multi_get(&refs);
-        assert_eq!(batched.len(), refs.len());
-        for (k, got) in refs.iter().zip(batched.iter()) {
-            let expected = map.get(*k);
-            assert_eq!(got.copied(), expected.copied(), "mismatch on key {k}");
-        }
-    }
-
-    #[test]
-    fn multi_get_on_empty_map_returns_all_none() {
-        let map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
-        let keys = [1, 2, 3];
-        let refs: Vec<&i32> = keys.iter().collect();
-        let out = map.multi_get(&refs);
-        assert_eq!(out.len(), 3);
-        assert!(out.iter().all(Option::is_none));
-    }
-
-    #[test]
     fn get_disjoint_mut_returns_all_refs_on_hits() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
         for i in 0..16 {
@@ -1327,84 +1230,5 @@ mod tests {
         }
         assert_eq!(map.get(&2), Some(&222));
         assert_eq!(map.get(&5), Some(&555));
-    }
-
-    // Exercise off-by-one around PIPELINE_DEPTH = 8.
-    #[test]
-    fn multi_get_at_pipeline_depth_boundary() {
-        let n: i32 = 32;
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
-        for i in 0..n {
-            map.insert(i, i + 1);
-        }
-
-        for batch_size in [7usize, 8, 9, 16, 17] {
-            let probe_keys: Vec<i32> = (0..i32::try_from(batch_size).expect("fits")).collect();
-            let refs: Vec<&i32> = probe_keys.iter().collect();
-            let batched = map.multi_get(&refs);
-            assert_eq!(batched.len(), batch_size, "len at N={batch_size}");
-            for (k, got) in refs.iter().zip(batched.iter()) {
-                assert_eq!(got.copied(), map.get(*k).copied(), "N={batch_size} key={k}");
-            }
-        }
-    }
-
-    #[test]
-    fn multi_get_miss_heavy_batch() {
-        let n: i32 = 1_000;
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(2_000);
-        for i in 0..n {
-            map.insert(i, i);
-        }
-
-        let miss_keys: Vec<i32> = ((n + 1_000)..(n + 2_000)).collect();
-        let refs: Vec<&i32> = miss_keys.iter().collect();
-        let out = map.multi_get(&refs);
-        assert_eq!(out.len(), miss_keys.len());
-        assert!(out.iter().all(Option::is_none));
-    }
-
-    #[test]
-    fn multi_get_duplicate_keys_in_batch_yield_same_value() {
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(32);
-        map.insert(7, 700);
-        map.insert(13, 1300);
-
-        let keys = [&7, &13, &7, &13, &7];
-        let out = map.multi_get(&keys);
-        assert_eq!(out.len(), 5);
-        assert_eq!(out[0].copied(), Some(700));
-        assert_eq!(out[1].copied(), Some(1300));
-        assert_eq!(out[2].copied(), Some(700));
-        assert_eq!(out[3].copied(), Some(1300));
-        assert_eq!(out[4].copied(), Some(700));
-    }
-
-    #[test]
-    fn multi_get_into_reuses_buffer_across_calls() {
-        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
-        for i in 0..16 {
-            map.insert(i, i * 2);
-        }
-
-        let mut out: Vec<Option<&i32>> = Vec::with_capacity(32);
-        let keys1: Vec<i32> = (0..8).collect();
-        let refs1: Vec<&i32> = keys1.iter().collect();
-        map.multi_get_into(&refs1, &mut out);
-        assert_eq!(out.len(), 8);
-        for (k, v) in refs1.iter().zip(out.iter()) {
-            assert_eq!(v.copied(), Some(*k * 2));
-        }
-
-        let keys2: Vec<i32> = (8..16).collect();
-        let refs2: Vec<&i32> = keys2.iter().collect();
-        map.multi_get_into(&refs2, &mut out);
-        assert_eq!(out.len(), 8);
-        for (k, v) in refs2.iter().zip(out.iter()) {
-            assert_eq!(v.copied(), Some(*k * 2));
-        }
-
-        map.multi_get_into::<i32>(&[], &mut out);
-        assert!(out.is_empty());
     }
 }
