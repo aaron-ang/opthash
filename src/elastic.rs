@@ -359,6 +359,20 @@ where
         Some(unsafe { &self.levels[level_idx].table.get_ref(slot_idx).value })
     }
 
+    /// Like [`Self::get`] but returns the stored key alongside its value.
+    pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let key_hash = self.hash_key(key);
+        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let (level_idx, slot_idx) =
+            self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
+        let entry = unsafe { self.levels[level_idx].table.get_ref(slot_idx) };
+        Some((&entry.key, &entry.value))
+    }
+
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         K: Borrow<Q>,
@@ -431,6 +445,23 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        self.remove_inner(key).map(|(_, v)| v)
+    }
+
+    /// Like [`Self::remove`] but returns the stored key alongside its value.
+    pub fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.remove_inner(key)
+    }
+
+    fn remove_inner<Q>(&mut self, key: &Q) -> Option<(K, V)>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let key_hash = self.hash_key(key);
         let key_fingerprint = ControlOps::control_fingerprint(key_hash);
         let (level_idx, slot_idx) =
@@ -451,7 +482,7 @@ where
         if needs_resize {
             self.resize(self.capacity);
         }
-        Some(removed_entry.value)
+        Some((removed_entry.key, removed_entry.value))
     }
 
     pub fn clear(&mut self) {
@@ -478,6 +509,24 @@ where
             level_idx: 0,
             slot_idx: 0,
         }
+    }
+
+    /// Borrowing iterator over `&K`. Order matches [`Self::iter`].
+    #[must_use]
+    pub fn keys(&self) -> Keys<'_, K, V> {
+        Keys { inner: self.iter() }
+    }
+
+    /// Borrowing iterator over `&V`. Order matches [`Self::iter`].
+    #[must_use]
+    pub fn values(&self) -> Values<'_, K, V> {
+        Values { inner: self.iter() }
+    }
+
+    /// Reference to the map's [`BuildHasher`].
+    #[must_use]
+    pub fn hasher(&self) -> &DefaultHashBuilder {
+        &self.hash_builder
     }
 }
 
@@ -519,6 +568,32 @@ where
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+/// Borrowing iterator over `&K`, returned by [`ElasticHashMap::keys`].
+pub struct Keys<'a, K, V> {
+    inner: ElasticIter<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for Keys<'a, K, V> {
+    type Item = &'a K;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, _)| k)
+    }
+}
+
+/// Borrowing iterator over `&V`, returned by [`ElasticHashMap::values`].
+pub struct Values<'a, K, V> {
+    inner: ElasticIter<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for Values<'a, K, V> {
+    type Item = &'a V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(_, v)| v)
     }
 }
 
@@ -1230,5 +1305,65 @@ mod tests {
         }
         assert_eq!(map.get(&2), Some(&222));
         assert_eq!(map.get(&5), Some(&555));
+    }
+
+    #[test]
+    fn keys_yields_inserted_keys_only() {
+        use std::collections::HashSet;
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..30 {
+            map.insert(i, i * 10);
+        }
+        let got: HashSet<i32> = map.keys().copied().collect();
+        let expected: HashSet<i32> = (0..30).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn values_yields_inserted_values_only() {
+        use std::collections::HashSet;
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..30 {
+            map.insert(i, i * 10);
+        }
+        let got: HashSet<i32> = map.values().copied().collect();
+        let expected: HashSet<i32> = (0..30).map(|i| i * 10).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn hasher_returns_consistent_handle() {
+        let map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        let a: *const _ = map.hasher();
+        let b: *const _ = map.hasher();
+        assert!(std::ptr::eq(a, b));
+    }
+
+    #[test]
+    fn get_key_value_returns_both_on_hit_none_on_miss() {
+        let mut map: ElasticHashMap<String, i32> = ElasticHashMap::with_capacity(16);
+        map.insert("alpha".to_string(), 1);
+        map.insert("beta".to_string(), 2);
+
+        let (k, v) = map.get_key_value("alpha").expect("hit");
+        assert_eq!(k, "alpha");
+        assert_eq!(*v, 1);
+
+        assert!(map.get_key_value("missing").is_none());
+    }
+
+    #[test]
+    fn remove_entry_returns_both_and_actually_removes() {
+        let mut map: ElasticHashMap<String, i32> = ElasticHashMap::with_capacity(16);
+        map.insert("alpha".to_string(), 1);
+        map.insert("beta".to_string(), 2);
+
+        let (k, v) = map.remove_entry("alpha").expect("hit");
+        assert_eq!(k, "alpha");
+        assert_eq!(v, 1);
+        assert_eq!(map.len(), 1);
+        assert!(map.get("alpha").is_none());
+
+        assert!(map.remove_entry("alpha").is_none());
     }
 }
