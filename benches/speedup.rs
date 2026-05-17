@@ -60,11 +60,6 @@ const DELETE_OP_COUNT: usize = 6_000;
 const RESIZE_INSERT_COUNT: usize = 8_000;
 const MIXED_LOOKUP_COUNT: usize = 100_000;
 
-// `multi_get` batched lookup: 1M-entry map (spills L3), 1000-key bursts.
-const GET_MANY_MAP_SIZE: usize = 1_000_000;
-const GET_MANY_BATCH: usize = 1_000;
-const GET_MANY_TOTAL: usize = 100_000;
-
 fn bench_insert_throughput(c: &mut Criterion) {
     let pairs = make_pairs(INSERT_COUNT);
     let mut group = c.benchmark_group("insert_throughput");
@@ -526,76 +521,6 @@ fn bench_mixed_lookup_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_multi_get_batch(c: &mut Criterion) {
-    // Naive `.get()` loop vs. pipelined `multi_get_into`. Both arms share
-    // the chunk slices and a caller-owned scratch buffer so the only delta
-    // is the prefetch. The `*_multi_get` arms keep the per-call alloc cost
-    // of the owning wrapper visible.
-    let pairs = make_pairs(GET_MANY_MAP_SIZE);
-    let query_keys: Vec<u64> = (0..GET_MANY_TOTAL)
-        .map(|idx| pairs[idx % GET_MANY_MAP_SIZE].0)
-        .collect();
-    let chunks: Vec<Vec<&u64>> = query_keys
-        .chunks(GET_MANY_BATCH)
-        .map(|chunk| chunk.iter().collect())
-        .collect();
-
-    let mut group = c.benchmark_group("multi_get_batch");
-    group.throughput(Throughput::Elements(GET_MANY_TOTAL as u64));
-
-    group.bench_function("elastic_naive", |b| {
-        let map = build_elastic_map(&pairs);
-        let mut scratch: Vec<Option<&u64>> = Vec::with_capacity(GET_MANY_BATCH);
-        b.iter(|| {
-            for chunk in &chunks {
-                scratch.clear();
-                for key in chunk {
-                    scratch.push(map.get(black_box(*key)));
-                }
-                black_box(&scratch);
-            }
-        });
-    });
-
-    group.bench_function("funnel_naive", |b| {
-        let map = build_funnel_map(&pairs);
-        let mut scratch: Vec<Option<&u64>> = Vec::with_capacity(GET_MANY_BATCH);
-        b.iter(|| {
-            for chunk in &chunks {
-                scratch.clear();
-                for key in chunk {
-                    scratch.push(map.get(black_box(*key)));
-                }
-                black_box(&scratch);
-            }
-        });
-    });
-
-    group.bench_function("elastic_multi_get_into", |b| {
-        let map = build_elastic_map(&pairs);
-        let mut scratch: Vec<Option<&u64>> = Vec::with_capacity(GET_MANY_BATCH);
-        b.iter(|| {
-            for chunk in &chunks {
-                map.multi_get_into(chunk, &mut scratch);
-                black_box(&scratch);
-            }
-        });
-    });
-
-    group.bench_function("funnel_multi_get_into", |b| {
-        let map = build_funnel_map(&pairs);
-        let mut scratch: Vec<Option<&u64>> = Vec::with_capacity(GET_MANY_BATCH);
-        b.iter(|| {
-            for chunk in &chunks {
-                map.multi_get_into(chunk, &mut scratch);
-                black_box(&scratch);
-            }
-        });
-    });
-
-    group.finish();
-}
-
 fn bench_get_hit_latency(c: &mut Criterion) {
     for &size in LATENCY_SIZES {
         let pairs = make_pairs(size);
@@ -662,7 +587,6 @@ criterion_group!(
         bench_delete_heavy_throughput,
         bench_resize_heavy_throughput,
         bench_mixed_lookup_throughput,
-        bench_multi_get_batch,
         bench_get_hit_latency
 );
 criterion_main!(benches);
