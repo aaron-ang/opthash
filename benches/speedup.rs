@@ -57,7 +57,6 @@ const TINY_MAP_SIZE: usize = 32;
 const TINY_LOOKUP_COUNT: usize = 20_000;
 const DELETE_MAP_SIZE: usize = 12_000;
 const DELETE_OP_COUNT: usize = 6_000;
-
 const RESIZE_INSERT_COUNT: usize = 8_000;
 const MIXED_LOOKUP_COUNT: usize = 100_000;
 
