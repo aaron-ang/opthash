@@ -532,10 +532,20 @@ where
 
 /// Borrowing iterator over occupied entries. Walks levels in order, scanning
 /// each level's slot array linearly. Skips FREE and TOMBSTONE control bytes.
+#[derive(Clone)]
 pub struct ElasticIter<'a, K, V> {
     levels: &'a [Level<K, V>],
     level_idx: usize,
     slot_idx: usize,
+}
+
+impl<K, V> std::fmt::Debug for ElasticIter<'_, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ElasticIter")
+            .field("level_idx", &self.level_idx)
+            .field("slot_idx", &self.slot_idx)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a, K, V> Iterator for ElasticIter<'a, K, V> {
@@ -572,6 +582,7 @@ where
 }
 
 /// Borrowing iterator over `&K`, returned by [`ElasticHashMap::keys`].
+#[derive(Clone)]
 pub struct Keys<'a, K, V> {
     inner: ElasticIter<'a, K, V>,
 }
@@ -584,7 +595,14 @@ impl<'a, K, V> Iterator for Keys<'a, K, V> {
     }
 }
 
+impl<K, V> std::fmt::Debug for Keys<'_, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keys").finish_non_exhaustive()
+    }
+}
+
 /// Borrowing iterator over `&V`, returned by [`ElasticHashMap::values`].
+#[derive(Clone)]
 pub struct Values<'a, K, V> {
     inner: ElasticIter<'a, K, V>,
 }
@@ -594,6 +612,12 @@ impl<'a, K, V> Iterator for Values<'a, K, V> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|(_, v)| v)
+    }
+}
+
+impl<K, V> std::fmt::Debug for Values<'_, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Values").finish_non_exhaustive()
     }
 }
 

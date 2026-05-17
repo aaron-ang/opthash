@@ -1480,6 +1480,7 @@ where
 
 /// Three-phase iterator state: walk all bucket levels, then the special
 /// primary, then the special fallback.
+#[derive(Debug, Clone, Copy)]
 enum FunnelIterPhase {
     Levels,
     Primary,
@@ -1490,6 +1491,7 @@ enum FunnelIterPhase {
 /// Borrowing iterator over occupied entries.
 /// Visits each region in funnel order: bucket levels → special primary → special fallback.
 /// Skips FREE and TOMBSTONE control bytes.
+#[derive(Clone)]
 pub struct FunnelIter<'a, K, V> {
     levels: &'a [BucketLevel<K, V>],
     primary: &'a SpecialPrimary<K, V>,
@@ -1497,6 +1499,16 @@ pub struct FunnelIter<'a, K, V> {
     phase: FunnelIterPhase,
     level_idx: usize,
     slot_idx: usize,
+}
+
+impl<K, V> std::fmt::Debug for FunnelIter<'_, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FunnelIter")
+            .field("phase", &self.phase)
+            .field("level_idx", &self.level_idx)
+            .field("slot_idx", &self.slot_idx)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a, K, V> Iterator for FunnelIter<'a, K, V> {
@@ -1566,6 +1578,7 @@ where
 }
 
 /// Borrowing iterator over `&K`, returned by [`FunnelHashMap::keys`].
+#[derive(Clone)]
 pub struct Keys<'a, K, V> {
     inner: FunnelIter<'a, K, V>,
 }
@@ -1578,7 +1591,14 @@ impl<'a, K, V> Iterator for Keys<'a, K, V> {
     }
 }
 
+impl<K, V> std::fmt::Debug for Keys<'_, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keys").finish_non_exhaustive()
+    }
+}
+
 /// Borrowing iterator over `&V`, returned by [`FunnelHashMap::values`].
+#[derive(Clone)]
 pub struct Values<'a, K, V> {
     inner: FunnelIter<'a, K, V>,
 }
@@ -1588,6 +1608,12 @@ impl<'a, K, V> Iterator for Values<'a, K, V> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|(_, v)| v)
+    }
+}
+
+impl<K, V> std::fmt::Debug for Values<'_, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Values").finish_non_exhaustive()
     }
 }
 
