@@ -5,17 +5,15 @@
 # Optional (with sudo): also sets the perf governor, disables Intel turbo, and
 # runs at SCHED_FIFO/99. The script gracefully degrades — sudo is not required.
 #
-# Hybrid-CPU aware: if CORE is not set, auto-detects the performance cluster
-# (cores at the system's max cpufreq) and claims one free perf core via flock,
-# so concurrent invocations land on different cores. If all perf cores are
-# already claimed, falls back to pinning across the whole perf cluster and
-# letting the OS schedule within it.
+# Hybrid-CPU aware: if CORE is unset, claims a free core in the perf cluster
+# (cores at max cpufreq) via flock so concurrent runs don't collide. Falls
+# back to the full cluster CPU list when every core is claimed.
 #
 # Optional env knobs:
 #   BENCH=all        cargo bench --bench target (default all = speedup + latency)
 #   CORE=            physical core to pin to via taskset; auto-claim if unset
 #   BASELINE=        if set, passes --baseline <name>; else --save-baseline ref
-#   LOCK_DIR=        directory for per-core flock files (default /tmp/opthash-bench-locks)
+#   LOCK_DIR=        per-core flock files (default /tmp/opthash-bench-locks)
 #
 # Forwarded args (after `--`) are appended to the Criterion command line — pass
 # `--measurement-time 10 --sample-size 200` here for tighter confidence bands.
@@ -26,13 +24,13 @@ BENCH=${BENCH:-all}
 BASELINE=${BASELINE:-}
 LOCK_DIR=${LOCK_DIR:-/tmp/opthash-bench-locks}
 
-# Low-noise primitives below are Linux-only; non-Linux falls through to
-# plain `cargo bench` (noisier but functional).
+# Low-noise primitives below are Linux-only; elsewhere we fall through to
+# plain `cargo bench`.
 IS_LINUX=0
 [[ $(uname) == Linux ]] && IS_LINUX=1
 
-# Cores at the system's max cpufreq. On hybrid SoCs this picks the perf
-# cluster (e.g. Cortex-X925 over A725); on homogeneous CPUs, all cores.
+# Cores at the system's max cpufreq — perf cluster on hybrid SoCs, every
+# core on homogeneous CPUs.
 detect_perf_cores() {
 	local max_freq=0
 	local path f
@@ -50,11 +48,9 @@ detect_perf_cores() {
 	done
 }
 
-# Claim a free perf core via flock so concurrent invocations don't collide.
-# Lock fd stays open for script lifetime; kernel releases on exit. If every
-# core is locked, falls back to the cluster CPU list.
+# Lock fd is held for the script's lifetime; the kernel releases it on exit.
 claim_perf_core() {
-	mkdir -p "$LOCK_DIR"
+	mkdir -p "$LOCK_DIR" 2>/dev/null || true
 	local perf_cores=()
 	while IFS= read -r c; do perf_cores+=("$c"); done < <(detect_perf_cores)
 	if ((${#perf_cores[@]} == 0)); then
@@ -65,7 +61,8 @@ claim_perf_core() {
 	local c lock
 	for c in "${perf_cores[@]}"; do
 		lock="$LOCK_DIR/core-${c}.lock"
-		exec {LOCK_FD}>"$lock"
+		# Permission-denied (e.g. lock owned by another user) → try next core.
+		exec {LOCK_FD}>"$lock" 2>/dev/null || continue
 		if flock -n "$LOCK_FD"; then
 			CORE=$c
 			echo "info: claimed perf core $c (lock: $lock)" >&2
@@ -74,7 +71,7 @@ claim_perf_core() {
 		exec {LOCK_FD}>&-
 		unset LOCK_FD
 	done
-	# All perf cores busy: restrict to the cluster, let OS schedule.
+	# All perf cores busy or unlockable: restrict to the cluster, let OS schedule.
 	CORE=$(
 		IFS=,
 		echo "${perf_cores[*]}"
