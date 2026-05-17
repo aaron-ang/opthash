@@ -87,15 +87,22 @@ struct Level<K, V> {
     /// Per-(free-slot count) probe budget for limited probing.
     /// Indexed by `free_slots()`.
     limited_probe_budgets: Box<[usize]>,
-    /// Precomputed double-hashing step set.
+    /// Precomputed double-hashing step set. Empty when `uses_triangular`
+    /// (`group_count` is a power of two) — the triangular path needs no steps.
     group_steps: Box<[usize]>,
     /// Per-level salt mixed into the key hash so each level probes a
     /// different sequence.
     salt: u64,
-    /// Fastmod magic for `group_count`.
+    /// Fastmod magic for `group_count`. Unused when `uses_triangular`.
     group_count_magic: u64,
     /// Fastmod magic for `group_steps.len()`.
     step_count_magic: u64,
+    /// `group_count - 1` when `uses_triangular` (power-of-2 group count),
+    /// otherwise 0. Enables `idx & mask` group wrap.
+    group_count_mask: usize,
+    /// True iff `group_count` is a power of two: enables SwissTable-style
+    /// triangular probing `(g + T_k) & mask` instead of GCD-step double hashing.
+    uses_triangular: bool,
 }
 
 impl<K, V> Level<K, V> {
@@ -107,16 +114,28 @@ impl<K, V> Level<K, V> {
     ) -> Self {
         let table = RawTable::new(capacity);
         let group_count = table.group_count();
-        let group_steps = ProbeOps::build_group_steps(group_count);
+        let uses_triangular = group_count.is_power_of_two();
+        // Skip allocating the step set when we won't use it: triangular
+        // probing visits every group via (g + T_k) & mask, no GCD step table.
+        let group_steps = if uses_triangular {
+            Box::new([]) as Box<[usize]>
+        } else {
+            ProbeOps::build_group_steps(group_count)
+        };
         let limited_probe_budgets =
             build_probe_budgets(capacity, group_count, reserve_fraction, probe_scale);
-        let group_count_magic = if group_count > 1 {
+        let group_count_magic = if !uses_triangular && group_count > 1 {
             fastmod_magic(group_count)
         } else {
             0
         };
         let step_count_magic = if group_steps.len() > 1 {
             fastmod_magic(group_steps.len())
+        } else {
+            0
+        };
+        let group_count_mask = if uses_triangular {
+            group_count.wrapping_sub(1)
         } else {
             0
         };
@@ -131,6 +150,8 @@ impl<K, V> Level<K, V> {
             salt: level_salt(level_idx),
             group_count_magic,
             step_count_magic,
+            group_count_mask,
+            uses_triangular,
         }
     }
 
@@ -771,9 +792,10 @@ where
         None
     }
 
-    /// Probe one level for `key`. Walks groups via the level's double-hashing
-    /// step, SIMD-matches the fingerprint byte, then key-compares only the
-    /// matched slots. Stops on FREE byte (group has space) when no
+    /// Probe one level for `key`. Walks groups via the level's intra-level
+    /// probe sequence (triangular for power-of-2 group counts, double-hash
+    /// step otherwise), SIMD-matches the fingerprint byte, then key-compares
+    /// only the matched slots. Stops on FREE byte (group has space) when no
     /// tombstones exist.
     #[inline]
     fn find_in_level_by_probe<Q>(
@@ -790,11 +812,37 @@ where
             return None;
         }
 
-        let (group_start, group_step) = Self::group_probe_params(level, key_hash);
         let group_count = level.table.group_count();
+        let capacity = level.capacity();
+
+        if level.uses_triangular {
+            let mask = level.group_count_mask;
+            let mut group_idx = Self::triangular_group_start(level, key_hash);
+            let mut delta: usize = 0;
+            for _ in 0..group_count {
+                let match_mask = level.table.group_match_mask(group_idx, key_fingerprint);
+                for relative_idx in match_mask {
+                    let slot_idx = group_idx * GROUP_SIZE + relative_idx;
+                    let entry = unsafe { level.table.get_ref(slot_idx) };
+                    if entry.key.borrow() == key {
+                        return Some(slot_idx);
+                    }
+                }
+                let empty_mask = level.table.group_match_mask(group_idx, CTRL_EMPTY);
+                if let Some(off) = empty_mask.lowest()
+                    && group_idx * GROUP_SIZE + off < capacity
+                {
+                    return None;
+                }
+                delta += 1;
+                group_idx = (group_idx + delta) & mask;
+            }
+            return None;
+        }
+
+        let (group_start, group_step) = Self::group_probe_params(level, key_hash);
         let mut group_idx = group_start;
 
-        let capacity = level.capacity();
         for _ in 0..group_count {
             let match_mask = level.table.group_match_mask(group_idx, key_fingerprint);
             for relative_idx in match_mask {
@@ -832,10 +880,25 @@ where
             return None;
         }
 
-        let (group_start, group_step) = Self::group_probe_params(level, key_hash);
         let group_count = level.table.group_count();
-        let mut group_idx = group_start;
         let max_groups = max_groups.min(group_count.max(1));
+
+        if level.uses_triangular {
+            let mask = level.group_count_mask;
+            let mut group_idx = Self::triangular_group_start(level, key_hash);
+            let mut delta: usize = 0;
+            for _ in 0..max_groups {
+                if let Some(slot_idx) = level.table.first_free_in_group(group_idx) {
+                    return Some(slot_idx);
+                }
+                delta += 1;
+                group_idx = (group_idx + delta) & mask;
+            }
+            return None;
+        }
+
+        let (group_start, group_step) = Self::group_probe_params(level, key_hash);
+        let mut group_idx = group_start;
 
         for _ in 0..max_groups {
             if let Some(slot_idx) = level.table.first_free_in_group(group_idx) {
@@ -848,16 +911,31 @@ where
     }
 
     /// Linear scan over all groups in `level_idx` for the first FREE-or-
-    /// TOMBSTONE slot, following the level's double-hashing step. Returns
-    /// `None` only if the level is completely full of OCCUPIED bytes.
+    /// TOMBSTONE slot, following the level's intra-level probe sequence.
+    /// Returns `None` only if the level is completely full of OCCUPIED bytes.
     fn first_free_uniform(&self, key_hash: u64, level_idx: usize) -> Option<usize> {
         let level = &self.levels[level_idx];
         if level.len >= level.capacity() {
             return None;
         }
 
-        let (group_start, group_step) = Self::group_probe_params(level, key_hash);
         let group_count = level.table.group_count();
+
+        if level.uses_triangular {
+            let mask = level.group_count_mask;
+            let mut group_idx = Self::triangular_group_start(level, key_hash);
+            let mut delta: usize = 0;
+            for _ in 0..group_count {
+                if let Some(slot_idx) = level.table.first_free_in_group(group_idx) {
+                    return Some(slot_idx);
+                }
+                delta += 1;
+                group_idx = (group_idx + delta) & mask;
+            }
+            return None;
+        }
+
+        let (group_start, group_step) = Self::group_probe_params(level, key_hash);
         let mut group_idx = group_start;
 
         for _ in 0..group_count {
@@ -873,8 +951,13 @@ where
     #[inline]
     /// Compute `(group_start, group_step)` for double-hashing within
     /// `level`. Mixes `key_hash` with the level's salt and rotates for the
-    /// step index so each level walks the group ring differently.
+    /// step index so each level walks the group ring differently. Only
+    /// callers serving non-power-of-2 levels should use this; triangular
+    /// levels use [`Self::triangular_group_start`] and a fixed delta walk.
     fn group_probe_params(level: &Level<K, V>, key_hash: u64) -> (usize, usize) {
+        if level.uses_triangular {
+            return (Self::triangular_group_start(level, key_hash), 1);
+        }
         let group_count = level.table.group_count();
         if group_count <= 1 {
             return (0, 1);
@@ -893,6 +976,21 @@ where
             level.group_steps[0]
         };
         (group_start, step)
+    }
+
+    /// Triangular-probing starting group: `(key_hash ^ salt) & (group_count - 1)`.
+    /// Caller must ensure `level.uses_triangular`.
+    #[inline]
+    fn triangular_group_start(level: &Level<K, V>, key_hash: u64) -> usize {
+        debug_assert!(level.uses_triangular);
+        let group_count = level.table.group_count();
+        if group_count <= 1 {
+            return 0;
+        }
+        // SAFETY of cast: group_count is a power of two ≤ usize::MAX, so the
+        // low bits of (mixed as usize) are enough to select a group.
+        let mixed = key_hash ^ level.salt;
+        ProbeOps::hash_to_usize(mixed) & level.group_count_mask
     }
 
     /// After a remove, walk down `max_populated_level` past any now-empty

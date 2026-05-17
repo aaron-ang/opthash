@@ -145,7 +145,9 @@ impl<K, V> Drop for BucketLevel<K, V> {
 }
 
 /// Fallback table for keys that didn't fit in any bucket level.
-/// Open-addressed with double-hashing across SIMD groups (16 slots each).
+/// Open-addressed across SIMD groups (16 slots each). Uses SwissTable-style
+/// triangular probing when `group_count` is a power of two; falls back to
+/// GCD-step double hashing otherwise.
 struct SpecialPrimary<K, V> {
     /// Structure of Arrays control bytes + entries.
     table: RawTable<Entry<K, V>>,
@@ -155,20 +157,37 @@ struct SpecialPrimary<K, V> {
     group_summaries: Box<[u128]>,
     /// Per-group tombstone count, bounds probe length.
     group_tombstones: Box<[usize]>,
-    /// Precomputed double-hashing step set.
+    /// Precomputed double-hashing step set. Empty when `uses_triangular`.
     group_steps: Box<[usize]>,
+    /// `group_count - 1` when `uses_triangular`, else 0.
+    group_count_mask: usize,
+    /// True iff `group_count` is a power of two.
+    uses_triangular: bool,
 }
 
 impl<K, V> SpecialPrimary<K, V> {
     fn with_capacity(capacity: usize) -> Self {
         let table = RawTable::new(capacity);
         let group_count = table.group_count();
+        let uses_triangular = group_count.is_power_of_two();
+        let group_steps = if uses_triangular {
+            Box::new([]) as Box<[usize]>
+        } else {
+            ProbeOps::build_group_steps(group_count)
+        };
+        let group_count_mask = if uses_triangular {
+            group_count.wrapping_sub(1)
+        } else {
+            0
+        };
         Self {
             table,
             len: 0,
             group_summaries: vec![0; group_count].into_boxed_slice(),
             group_tombstones: vec![0; group_count].into_boxed_slice(),
-            group_steps: ProbeOps::build_group_steps(group_count),
+            group_steps,
+            group_count_mask,
+            uses_triangular,
         }
     }
 }
@@ -889,6 +908,18 @@ where
         (start, step)
     }
 
+    /// Triangular-probing start group for the special primary. Caller must
+    /// ensure `self.special.primary.uses_triangular`.
+    #[inline]
+    fn special_primary_triangular_start(&self, key_hash: u64) -> usize {
+        debug_assert!(self.special.primary.uses_triangular);
+        let mask = self.special.primary.group_count_mask;
+        if mask == 0 {
+            return 0;
+        }
+        ProbeOps::hash_to_usize(key_hash.rotate_left(11)) & mask
+    }
+
     #[inline]
     fn special_fallback_bucket_a(key_hash: u64, bucket_count: usize) -> usize {
         ProbeOps::hash_to_usize(key_hash.rotate_left(19)) % bucket_count
@@ -1082,9 +1113,26 @@ where
         }
 
         let group_count = primary.table.group_count();
+        let group_limit = self.primary_probe_limit.min(group_count.max(1));
+
+        if primary.uses_triangular {
+            let mask = primary.group_count_mask;
+            let mut group_idx = self.special_primary_triangular_start(key_hash);
+            let mut delta: usize = 0;
+            for _ in 0..group_limit {
+                if let Some(slot_idx) =
+                    Self::first_free_in_special_primary_group(primary, group_idx)
+                {
+                    return Some(slot_idx);
+                }
+                delta += 1;
+                group_idx = (group_idx + delta) & mask;
+            }
+            return None;
+        }
+
         let (group_start, group_step) = self.special_primary_probe_params(key_hash, group_count);
         let mut group_idx = group_start;
-        let group_limit = self.primary_probe_limit.min(group_count.max(1));
 
         for _ in 0..group_limit {
             if let Some(slot_idx) = Self::first_free_in_special_primary_group(primary, group_idx) {
@@ -1256,9 +1304,37 @@ where
 
         let fingerprint_mask = ControlOps::fingerprint_bit(key_fingerprint);
         let group_count = primary.table.group_count();
+        let group_limit = self.primary_probe_limit.min(group_count.max(1));
+
+        if primary.uses_triangular {
+            let mask = primary.group_count_mask;
+            let mut group_idx = self.special_primary_triangular_start(key_hash);
+            let mut delta: usize = 0;
+            for _ in 0..group_limit {
+                if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
+                    for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
+                        let slot_idx = group_idx * GROUP_SIZE + relative_idx;
+                        let entry = unsafe { primary.table.get_ref(slot_idx) };
+                        if entry.key.borrow() == key {
+                            return LookupStep::Found(slot_idx);
+                        }
+                    }
+                }
+                if primary.group_tombstones[group_idx] == 0
+                    && primary.table.first_free_in_group(group_idx).is_some()
+                {
+                    return LookupStep::StopSearch;
+                }
+                delta += 1;
+                let next = (group_idx + delta) & mask;
+                unsafe { prefetch_read(primary.table.group_data_ptr(next)) };
+                group_idx = next;
+            }
+            return LookupStep::Continue;
+        }
+
         let (group_start, group_step) = self.special_primary_probe_params(key_hash, group_count);
         let mut group_idx = group_start;
-        let group_limit = self.primary_probe_limit.min(group_count.max(1));
 
         for _ in 0..group_limit {
             if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
@@ -1310,10 +1386,41 @@ where
 
         let fingerprint_mask = ControlOps::fingerprint_bit(key_fingerprint);
         let group_count = primary.table.group_count();
-        let (group_start, group_step) = self.special_primary_probe_params(key_hash, group_count);
-        let mut group_idx = group_start;
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
         let mut candidate = None;
+
+        if primary.uses_triangular {
+            let mask = primary.group_count_mask;
+            let mut group_idx = self.special_primary_triangular_start(key_hash);
+            let mut delta: usize = 0;
+            for _ in 0..group_limit {
+                if candidate.is_none() && primary.table.first_free_in_group(group_idx).is_some() {
+                    candidate = primary.table.first_free_in_group(group_idx);
+                }
+                if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
+                    for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
+                        let slot_idx = group_idx * GROUP_SIZE + relative_idx;
+                        let entry = unsafe { primary.table.get_ref(slot_idx) };
+                        if entry.key.borrow() == key {
+                            return (LookupStep::Found(slot_idx), candidate);
+                        }
+                    }
+                }
+                if primary.group_tombstones[group_idx] == 0
+                    && primary.table.first_free_in_group(group_idx).is_some()
+                {
+                    return (LookupStep::StopSearch, candidate);
+                }
+                delta += 1;
+                let next = (group_idx + delta) & mask;
+                unsafe { prefetch_read(primary.table.group_data_ptr(next)) };
+                group_idx = next;
+            }
+            return (LookupStep::Continue, candidate);
+        }
+
+        let (group_start, group_step) = self.special_primary_probe_params(key_hash, group_count);
+        let mut group_idx = group_start;
 
         for _ in 0..group_limit {
             if candidate.is_none() && primary.table.first_free_in_group(group_idx).is_some() {
