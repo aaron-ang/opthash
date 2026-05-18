@@ -318,6 +318,11 @@ pub struct FunnelHashMap<K, V> {
     primary_probe_limit: usize,
     /// Highest level index ever written; bounds the lookup probe loop.
     max_populated_level: usize,
+    /// While true, `remove` skips the tombstone-cleanup resize so a bulk-op
+    /// iterator (`drain`, `extract_if`, `retain`) can safely hold a slot
+    /// cursor across many removals. Cleared (and a deferred resize applied)
+    /// when the iterator drops.
+    resize_suppressed: bool,
     /// Hash builder. Cloned across resizes to preserve probe sequences.
     hash_builder: DefaultHashBuilder,
 }
@@ -419,6 +424,7 @@ where
             reserve_fraction,
             primary_probe_limit,
             max_populated_level: 0,
+            resize_suppressed: false,
             hash_builder,
         }
     }
@@ -728,7 +734,7 @@ where
 
         self.len -= 1;
         self.shrink_max_populated_level();
-        if needs_resize {
+        if needs_resize && !self.resize_suppressed {
             self.resize(self.capacity);
         }
         Some((removed_entry.key, removed_entry.value))
@@ -864,6 +870,67 @@ where
         let final_location = location.expect("location set above");
         self.place_new_entry(final_location, key, value, key_fingerprint);
         final_location
+    }
+
+    /// Drops every entry for which `f(&K, &mut V)` returns `false`.
+    /// Mirrors [`std::collections::HashMap::retain`].
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        // `extract_if` removes entries where the predicate returns `true`;
+        // `retain` keeps entries where the user's predicate returns `true`.
+        // Inverting the predicate reuses the same walk.
+        self.extract_if(|k, v| !f(k, v)).for_each(drop);
+    }
+
+    /// Returns a draining iterator over every entry, emptying the map.
+    /// Mirrors [`std::collections::HashMap::drain`]: entries left in the
+    /// iterator at drop time are still dropped — the map is empty afterwards.
+    pub fn drain(&mut self) -> Drain<'_, K, V> {
+        self.resize_suppressed = true;
+        Drain {
+            map: self,
+            phase: DrainPhase::Levels,
+            level_idx: 0,
+            slot_idx: 0,
+        }
+    }
+
+    /// Like [`Self::drain`] but conditional on `f(&K, &mut V) -> bool`.
+    /// Yields only the `(K, V)` pairs for which `f` returned `true`; entries
+    /// the predicate kept (and any entries past the iterator's cursor when
+    /// it drops) remain in the map. Mirrors
+    /// [`std::collections::HashMap::extract_if`].
+    pub fn extract_if<F>(&mut self, f: F) -> ExtractIf<'_, K, V, F>
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        self.resize_suppressed = true;
+        ExtractIf {
+            map: self,
+            pred: f,
+            phase: DrainPhase::Levels,
+            level_idx: 0,
+            slot_idx: 0,
+        }
+    }
+
+    /// Triggers a no-grow rehash if any region crossed its cleanup threshold
+    /// while resize was suppressed. Called once from each bulk-op iterator's
+    /// `Drop`.
+    fn resize_if_needed(&mut self) {
+        let level_dirty = self
+            .levels
+            .iter()
+            .any(|level| level.tombstones > level.capacity() / 2);
+        let primary_dirty =
+            self.special.primary.tombstones > self.special.primary.table.capacity() / 2;
+        let fallback_dirty =
+            self.special.fallback.tombstones > self.special.fallback.capacity() / 2;
+        if level_dirty || primary_dirty || fallback_dirty {
+            self.resize(self.capacity);
+        }
     }
 
     pub fn clear(&mut self) {
@@ -2005,6 +2072,251 @@ where
     }
 }
 
+/// Walk phase shared by `Drain` and `ExtractIf`: levels first, then the
+/// special primary, then the special fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainPhase {
+    Levels,
+    Primary,
+    Fallback,
+    Done,
+}
+
+/// Draining iterator. Yields and removes every `(K, V)` entry; the map is
+/// empty once the iterator is consumed or dropped. Returned by
+/// [`FunnelHashMap::drain`].
+pub struct Drain<'a, K, V> {
+    map: &'a mut FunnelHashMap<K, V>,
+    phase: DrainPhase,
+    level_idx: usize,
+    slot_idx: usize,
+}
+
+impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for Drain<'_, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Drain").finish_non_exhaustive()
+    }
+}
+
+impl<K, V> Iterator for Drain<'_, K, V> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.phase {
+                DrainPhase::Levels => {
+                    while self.level_idx < self.map.levels.len() {
+                        let level = &mut self.map.levels[self.level_idx];
+                        while self.slot_idx < level.table.capacity() {
+                            let idx = self.slot_idx;
+                            self.slot_idx += 1;
+                            if level.table.control_at(idx).is_occupied() {
+                                let entry = unsafe { level.table.take(idx) };
+                                level.table.mark_tombstone(idx);
+                                level.len -= 1;
+                                level.tombstones += 1;
+                                self.map.len -= 1;
+                                return Some((entry.key, entry.value));
+                            }
+                        }
+                        self.level_idx += 1;
+                        self.slot_idx = 0;
+                    }
+                    self.phase = DrainPhase::Primary;
+                    self.slot_idx = 0;
+                }
+                DrainPhase::Primary => {
+                    let primary = &mut self.map.special.primary;
+                    while self.slot_idx < primary.table.capacity() {
+                        let idx = self.slot_idx;
+                        self.slot_idx += 1;
+                        if primary.table.control_at(idx).is_occupied() {
+                            let entry = unsafe { primary.table.take(idx) };
+                            primary.table.mark_tombstone(idx);
+                            primary.len -= 1;
+                            primary.tombstones += 1;
+                            self.map.len -= 1;
+                            return Some((entry.key, entry.value));
+                        }
+                    }
+                    self.phase = DrainPhase::Fallback;
+                    self.slot_idx = 0;
+                }
+                DrainPhase::Fallback => {
+                    let fallback = &mut self.map.special.fallback;
+                    while self.slot_idx < fallback.table.capacity() {
+                        let idx = self.slot_idx;
+                        self.slot_idx += 1;
+                        if fallback.table.control_at(idx).is_occupied() {
+                            let entry = unsafe { fallback.table.take(idx) };
+                            fallback.table.mark_tombstone(idx);
+                            fallback.len -= 1;
+                            fallback.tombstones += 1;
+                            self.map.len -= 1;
+                            return Some((entry.key, entry.value));
+                        }
+                    }
+                    self.phase = DrainPhase::Done;
+                }
+                DrainPhase::Done => return None,
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.map.len))
+    }
+}
+
+impl<K, V> Drop for Drain<'_, K, V> {
+    fn drop(&mut self) {
+        // Drop any not-yet-yielded entries so consumers don't leak memory.
+        // Mirrors `std::collections::hash_map::Drain` semantics.
+        for _ in &mut *self {}
+        // Drain visited every slot via `next()`; values are already moved out.
+        // Wipe control bytes en bloc and reset counters.
+        for level in &mut self.map.levels {
+            level.table.clear_all_controls();
+            level.len = 0;
+            level.tombstones = 0;
+        }
+        self.map.special.primary.table.clear_all_controls();
+        self.map.special.primary.len = 0;
+        self.map.special.primary.tombstones = 0;
+        self.map.special.primary.group_summaries.fill(0);
+        self.map.special.fallback.table.clear_all_controls();
+        self.map.special.fallback.len = 0;
+        self.map.special.fallback.tombstones = 0;
+        self.map.len = 0;
+        self.map.max_populated_level = 0;
+        self.map.resize_suppressed = false;
+    }
+}
+
+/// Filtering drain. Yields and removes entries for which the predicate
+/// returns `true`; the rest stay in the map. Returned by
+/// [`FunnelHashMap::extract_if`].
+pub struct ExtractIf<'a, K, V, F>
+where
+    K: Eq + Hash,
+    F: FnMut(&K, &mut V) -> bool,
+{
+    map: &'a mut FunnelHashMap<K, V>,
+    pred: F,
+    phase: DrainPhase,
+    level_idx: usize,
+    slot_idx: usize,
+}
+
+impl<K, V, F> std::fmt::Debug for ExtractIf<'_, K, V, F>
+where
+    K: Eq + Hash,
+    F: FnMut(&K, &mut V) -> bool,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtractIf").finish_non_exhaustive()
+    }
+}
+
+impl<K, V, F> Iterator for ExtractIf<'_, K, V, F>
+where
+    K: Eq + Hash,
+    F: FnMut(&K, &mut V) -> bool,
+{
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.phase {
+                DrainPhase::Levels => {
+                    while self.level_idx < self.map.levels.len() {
+                        let level = &mut self.map.levels[self.level_idx];
+                        while self.slot_idx < level.table.capacity() {
+                            let idx = self.slot_idx;
+                            self.slot_idx += 1;
+                            if !level.table.control_at(idx).is_occupied() {
+                                continue;
+                            }
+                            let entry = unsafe { level.table.get_mut(idx) };
+                            if (self.pred)(&entry.key, &mut entry.value) {
+                                let removed = unsafe { level.table.take(idx) };
+                                level.table.mark_tombstone(idx);
+                                level.len -= 1;
+                                level.tombstones += 1;
+                                self.map.len -= 1;
+                                return Some((removed.key, removed.value));
+                            }
+                        }
+                        self.level_idx += 1;
+                        self.slot_idx = 0;
+                    }
+                    self.phase = DrainPhase::Primary;
+                    self.slot_idx = 0;
+                }
+                DrainPhase::Primary => {
+                    let primary = &mut self.map.special.primary;
+                    while self.slot_idx < primary.table.capacity() {
+                        let idx = self.slot_idx;
+                        self.slot_idx += 1;
+                        if !primary.table.control_at(idx).is_occupied() {
+                            continue;
+                        }
+                        let entry = unsafe { primary.table.get_mut(idx) };
+                        if (self.pred)(&entry.key, &mut entry.value) {
+                            let removed = unsafe { primary.table.take(idx) };
+                            primary.table.mark_tombstone(idx);
+                            primary.len -= 1;
+                            primary.tombstones += 1;
+                            self.map.len -= 1;
+                            return Some((removed.key, removed.value));
+                        }
+                    }
+                    self.phase = DrainPhase::Fallback;
+                    self.slot_idx = 0;
+                }
+                DrainPhase::Fallback => {
+                    let fallback = &mut self.map.special.fallback;
+                    while self.slot_idx < fallback.table.capacity() {
+                        let idx = self.slot_idx;
+                        self.slot_idx += 1;
+                        if !fallback.table.control_at(idx).is_occupied() {
+                            continue;
+                        }
+                        let entry = unsafe { fallback.table.get_mut(idx) };
+                        if (self.pred)(&entry.key, &mut entry.value) {
+                            let removed = unsafe { fallback.table.take(idx) };
+                            fallback.table.mark_tombstone(idx);
+                            fallback.len -= 1;
+                            fallback.tombstones += 1;
+                            self.map.len -= 1;
+                            return Some((removed.key, removed.value));
+                        }
+                    }
+                    self.phase = DrainPhase::Done;
+                }
+                DrainPhase::Done => return None,
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.map.len))
+    }
+}
+
+impl<K, V, F> Drop for ExtractIf<'_, K, V, F>
+where
+    K: Eq + Hash,
+    F: FnMut(&K, &mut V) -> bool,
+{
+    fn drop(&mut self) {
+        // Dropping `extract_if` early leaves unvisited entries in the map.
+        // Only consolidate any tombstone backlog from already-removed entries.
+        self.map.resize_suppressed = false;
+        self.map.resize_if_needed();
+    }
+}
+
 /// `&K` iterator returned by [`FunnelHashMap::keys`].
 #[derive(Clone)]
 pub struct Keys<'a, K, V> {
@@ -2952,6 +3264,51 @@ mod tests {
     }
 
     #[test]
+    fn retain_keeps_matching_drops_rest() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(256);
+        for i in 0..80 {
+            map.insert(i, i * 10);
+        }
+        map.retain(|k, _| k % 2 == 0);
+        assert_eq!(map.len(), 40);
+        for i in 0..80 {
+            if i % 2 == 0 {
+                assert_eq!(map.get(&i), Some(&(i * 10)));
+            } else {
+                assert!(map.get(&i).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn retain_with_empty_map_is_noop() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        let mut called = false;
+        map.retain(|_, _| {
+            called = true;
+            true
+        });
+        assert!(!called);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn retain_can_mutate_values_in_place() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(256);
+        for i in 0..40 {
+            map.insert(i, i);
+        }
+        map.retain(|k, v| {
+            *v += 100;
+            k % 2 == 0
+        });
+        assert_eq!(map.len(), 20);
+        for i in (0..40).step_by(2) {
+            assert_eq!(map.get(&i), Some(&(i + 100)));
+        }
+    }
+
+    #[test]
     fn into_iter_yields_all_entries() {
         let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
         for i in 0..60 {
@@ -3278,5 +3635,104 @@ mod tests {
         map.insert(1, 10);
         let err = map.try_insert(1, 99).expect_err("occupied must error");
         assert_eq!(err.value, 99);
+    }
+
+    #[test]
+    fn drain_yields_all_entries_then_empties_map() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(256);
+        for i in 0..60 {
+            map.insert(i, i * 7);
+        }
+        let mut collected: Vec<(i32, i32)> = map.drain().collect();
+        collected.sort_unstable();
+        let expected: Vec<(i32, i32)> = (0..60).map(|i| (i, i * 7)).collect();
+        assert_eq!(collected, expected);
+        assert!(map.is_empty());
+        assert_eq!(map.iter().count(), 0);
+        // Reuse after drain.
+        map.insert(999, 999);
+        assert_eq!(map.get(&999), Some(&999));
+    }
+
+    #[test]
+    fn drain_partial_consume_then_drop_still_empties_map() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(256);
+        for i in 0..60 {
+            map.insert(i, i);
+        }
+        {
+            let mut drain = map.drain();
+            let _first = drain.next();
+            let _second = drain.next();
+            // Drop here without exhausting; remaining entries must still be
+            // freed and the map emptied (std semantics).
+        }
+        assert!(map.is_empty());
+        assert_eq!(map.iter().count(), 0);
+    }
+
+    #[test]
+    fn extract_if_yields_only_matching_and_leaves_rest() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(256);
+        for i in 0..80 {
+            map.insert(i, i);
+        }
+        let mut extracted: Vec<(i32, i32)> = map.extract_if(|k, _| k % 3 == 0).collect();
+        extracted.sort_unstable();
+        let expected: Vec<(i32, i32)> = (0..80).filter(|i| i % 3 == 0).map(|i| (i, i)).collect();
+        assert_eq!(extracted, expected);
+        assert_eq!(map.len(), 80 - expected.len());
+        for i in 0..80 {
+            if i % 3 == 0 {
+                assert!(map.get(&i).is_none());
+            } else {
+                assert_eq!(map.get(&i), Some(&i));
+            }
+        }
+    }
+
+    #[test]
+    fn extract_if_partial_consume_then_drop_keeps_remaining_in_map() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(256);
+        for i in 0..60 {
+            map.insert(i, i);
+        }
+        let original_len = map.len();
+        let extracted_count;
+        {
+            let mut it = map.extract_if(|_, _| true);
+            assert!(it.next().is_some());
+            assert!(it.next().is_some());
+            extracted_count = 2;
+        }
+        assert_eq!(map.len(), original_len - extracted_count);
+        let remaining: Vec<i32> = map.iter().map(|(&k, _)| k).collect();
+        assert_eq!(remaining.len(), original_len - extracted_count);
+    }
+
+    #[test]
+    fn retain_does_not_trigger_mid_iter_resize_with_clustered_tombstones() {
+        // Stress the resize-suppression guard: pack the map to a high load
+        // and retain half. A naive (unguarded) impl would invoke `resize`
+        // mid-walk, invalidating the iterator's slot cursor.
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(1024);
+        let max = i32::try_from(max_insertions(map.capacity(), DEFAULT_RESERVE_FRACTION))
+            .expect("test capacity fits i32");
+        for i in 0..max {
+            map.insert(i, i);
+        }
+        let initial_capacity = map.capacity();
+        map.retain(|k, _| k % 2 == 0);
+
+        let expected_count = (0..max).filter(|i| i % 2 == 0).count();
+        assert_eq!(map.len(), expected_count);
+        for i in 0..max {
+            if i % 2 == 0 {
+                assert_eq!(map.get(&i), Some(&i), "kept key {i} missing");
+            } else {
+                assert!(map.get(&i).is_none(), "dropped key {i} survived");
+            }
+        }
+        assert!(map.capacity() <= initial_capacity * 2);
     }
 }
