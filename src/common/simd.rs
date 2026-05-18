@@ -154,6 +154,7 @@ impl ControlOps {
 #[inline]
 fn match_fingerprint_group_u32(ptr: *const u8, target: u8) -> u32 {
     #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::cast_ptr_alignment)]
     unsafe {
         let data = _mm_loadu_si128(ptr.cast::<__m128i>());
         #[allow(clippy::cast_possible_wrap)]
@@ -330,7 +331,11 @@ unsafe fn free_mask_16_neon(ptr: *const u8) -> BitMask {
     }
 }
 
-#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_ptr_alignment
+)]
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn eq_mask_16_sse2(ptr: *const u8, target: u8) -> BitMask {
@@ -345,7 +350,11 @@ unsafe fn eq_mask_16_sse2(ptr: *const u8, target: u8) -> BitMask {
     }
 }
 
-#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_ptr_alignment
+)]
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn free_mask_16_sse2(ptr: *const u8) -> BitMask {
@@ -360,7 +369,7 @@ unsafe fn free_mask_16_sse2(ptr: *const u8) -> BitMask {
     }
 }
 
-#[allow(clippy::cast_possible_wrap)]
+#[allow(clippy::cast_possible_wrap, clippy::cast_ptr_alignment)]
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn eq_mask_32_avx2(ptr: *const u8, target: u8) -> u32 {
