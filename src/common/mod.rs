@@ -7,6 +7,26 @@ pub(crate) mod simd;
 
 pub type DefaultHashBuilder = foldhash::fast::RandomState;
 
+/// Error returned by `try_reserve` when the map can't grow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TryReserveError {
+    /// Capacity computation overflowed `usize`.
+    CapacityOverflow,
+    /// Allocator failed.
+    AllocError,
+}
+
+impl std::fmt::Display for TryReserveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CapacityOverflow => f.write_str("capacity overflow"),
+            Self::AllocError => f.write_str("memory allocation failed"),
+        }
+    }
+}
+
+impl std::error::Error for TryReserveError {}
+
 #[cfg(test)]
 mod tests {
     use super::layout::RawTable;

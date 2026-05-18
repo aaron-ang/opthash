@@ -30,6 +30,18 @@ pub(crate) fn max_insertions(capacity: usize, reserve_fraction: f64) -> usize {
     capacity.saturating_sub(floor_to_usize(reserve_fraction * usize_to_f64(capacity)))
 }
 
+/// Smallest capacity `>= start` (doubling each step) whose `max_insertions`
+/// accommodates `needed`. Returns `None` if doubling overflows before the
+/// threshold is reached.
+#[inline]
+pub(crate) fn capacity_for(start: usize, needed: usize, reserve_fraction: f64) -> Option<usize> {
+    let mut cap = start;
+    while max_insertions(cap, reserve_fraction) < needed {
+        cap = cap.checked_mul(2)?;
+    }
+    Some(cap)
+}
+
 pub(crate) fn sanitize_reserve_fraction(reserve_fraction: f64) -> f64 {
     if reserve_fraction.is_finite() {
         reserve_fraction.clamp(MIN_RESERVE_FRACTION, MAX_RESERVE_FRACTION)

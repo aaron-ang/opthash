@@ -61,13 +61,7 @@ impl<T> Drop for RawTable<T> {
 impl<T> RawTable<T> {
     pub fn new(capacity: usize) -> Self {
         if capacity == 0 {
-            return Self {
-                data_ptr: NonNull::dangling(),
-                capacity: 0,
-                group_count: 0,
-                ctrl_offset: 0,
-                _marker: PhantomData,
-            };
+            return Self::empty();
         }
 
         let padded_capacity = round_up_to_group(capacity);
@@ -86,15 +80,51 @@ impl<T> RawTable<T> {
         }
     }
 
+    /// Fallible counterpart to [`RawTable::new`]. Returns `Err(())` on layout
+    /// overflow or allocator failure; used by `try_reserve`.
+    pub fn try_new(capacity: usize) -> Result<Self, ()> {
+        if capacity == 0 {
+            return Ok(Self::empty());
+        }
+
+        let padded_capacity = round_up_to_group(capacity);
+        let group_count = padded_capacity / GROUP_SIZE;
+        let (layout, ctrl_offset) = Self::try_unified_layout(capacity, group_count).ok_or(())?;
+
+        let raw = unsafe { alloc::alloc_zeroed(layout) };
+        let data_ptr = NonNull::new(raw).ok_or(())?;
+
+        Ok(Self {
+            data_ptr,
+            capacity,
+            group_count,
+            ctrl_offset,
+            _marker: PhantomData,
+        })
+    }
+
+    #[inline]
+    fn empty() -> Self {
+        Self {
+            data_ptr: NonNull::dangling(),
+            capacity: 0,
+            group_count: 0,
+            ctrl_offset: 0,
+            _marker: PhantomData,
+        }
+    }
+
     /// Layout: `[slots (T-aligned)] [padding] [controls (64-aligned)]`.
     fn unified_layout(capacity: usize, group_count: usize) -> (Layout, usize) {
-        let slots_layout = Layout::array::<T>(capacity).expect("slots layout overflow");
-        let controls_layout = Layout::from_size_align(group_count * GROUP_SIZE, CONTROL_ALIGN)
-            .expect("controls layout overflow");
-        let (combined, ctrl_offset) = slots_layout
-            .extend(controls_layout)
-            .expect("layout extend overflow");
-        (combined.pad_to_align(), ctrl_offset)
+        Self::try_unified_layout(capacity, group_count).expect("layout overflow")
+    }
+
+    fn try_unified_layout(capacity: usize, group_count: usize) -> Option<(Layout, usize)> {
+        let slots_layout = Layout::array::<T>(capacity).ok()?;
+        let ctrl_bytes = group_count.checked_mul(GROUP_SIZE)?;
+        let controls_layout = Layout::from_size_align(ctrl_bytes, CONTROL_ALIGN).ok()?;
+        let (combined, ctrl_offset) = slots_layout.extend(controls_layout).ok()?;
+        Some((combined.pad_to_align(), ctrl_offset))
     }
 
     #[inline]
