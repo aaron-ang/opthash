@@ -1611,9 +1611,6 @@ where
         while self.max_populated_level > 0 && self.levels[self.max_populated_level].len == 0 {
             self.max_populated_level -= 1;
         }
-        if self.levels.is_empty() || self.levels[0].len == 0 {
-            self.max_populated_level = 0;
-        }
     }
 }
 
@@ -2781,6 +2778,18 @@ mod tests {
         assert_eq!(map.iter().count(), 0);
     }
 
+    // Regression: removing one of two keys that both routed into a deep level
+    // (level 0 unallocated) must not orphan the surviving sibling.
+    #[test]
+    fn remove_preserves_sibling_when_level_zero_empty() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::default();
+        map.insert(1, 10);
+        map.insert(2, 20);
+        map.remove(&1);
+        assert_eq!(map.get(&2), Some(&20));
+        assert_eq!(map.len(), 1);
+    }
+
     #[test]
     fn get_disjoint_mut_returns_all_refs_on_hits() {
         let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
@@ -3237,11 +3246,7 @@ mod tests {
 
     #[test]
     fn entry_occupied_remove_returns_value() {
-        // Use larger capacity so both keys land in level 0 — small-capacity
-        // funnel layouts route into deeper levels where existing
-        // shrink_max_populated_level semantics make sibling keys unreachable
-        // after a single remove (pre-existing behavior, see issue tracker).
-        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(256);
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
         map.insert(1, 10);
         map.insert(2, 20);
         if let Entry::Occupied(occ) = map.entry(1) {
