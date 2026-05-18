@@ -76,6 +76,10 @@ Charts are saved in `assets/`. Shared plotting helpers (`IMPLEMENTATIONS`, loade
 - `src/funnel.rs` — `FunnelHashMap` (tests inline)
 - `src/common/` — shared internals: control-byte SIMD ops, layout math, config
 
+## Worktree naming
+
+When spawning a worktree, name its branch after the work (e.g. `feat/std-parity-mut-iters`) and pass the same name to `git worktree add`.
+
 ## Refactoring guidelines
 
 - Low-level helpers used by both the library and benchmarks live in `src/common/` (bitmask, simd, layout, math). Benches pull fixtures from `benches/common.rs`. Don't duplicate primitives across `src/` and `benches/`.
