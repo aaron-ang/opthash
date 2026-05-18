@@ -7,7 +7,7 @@ use crate::common::simd::ProbeOps;
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
     control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps},
-    layout::{Entry, GROUP_SIZE, RawTable},
+    layout::{Entry as SlotEntry, GROUP_SIZE, RawTable},
     math::{
         ceil_three_quarters, floor_half_reserve_slots, level_salt, max_insertions,
         round_up_to_pow2_groups, sanitize_reserve_fraction, usize_to_f64,
@@ -72,7 +72,7 @@ impl ElasticOptions {
 /// open-addressed table roughly half the previous level's capacity.
 struct Level<K, V> {
     /// `SoA` control bytes + entries.
-    table: RawTable<Entry<K, V>>,
+    table: RawTable<SlotEntry<K, V>>,
     /// Live entry count.
     len: usize,
     /// Per-level salt mixed into key hashes. Hot — read every lookup.
@@ -332,7 +332,7 @@ where
         let prev_ctrl = level.table.control_at(slot_idx);
         level
             .table
-            .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
+            .write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
         level.len += 1;
         if prev_ctrl == CTRL_TOMBSTONE {
             level.tombstones -= 1;
@@ -564,6 +564,346 @@ where
             inner: self.into_iter(),
         }
     }
+
+    /// Returns an [`Entry`] for in-place manipulation of `key`'s slot.
+    ///
+    /// Mirrors [`std::collections::HashMap::entry`]: a single probe locates
+    /// the key (or its absence), and the returned enum lets the caller
+    /// insert-if-missing, modify in place, or remove without a second lookup.
+    ///
+    /// Note: [`VacantEntry::insert`] routes the slot choice through the same
+    /// `batch_plan`-driven logic [`ElasticHashMap::insert`] uses. The lookup
+    /// probe finds where the key *would* live; the batch plan dictates where
+    /// a *new* key must go, and those can differ — so the lookup-result slot
+    /// is intentionally discarded on the vacant insert path.
+    pub fn entry(&mut self, key: K) -> Entry<'_, K, V> {
+        let key_hash = self.hash_key(&key);
+        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        if let Some((level_idx, slot_idx)) =
+            self.find_slot_indices_with_hash(&key, key_hash, key_fingerprint)
+        {
+            Entry::Occupied(OccupiedEntry {
+                map: self,
+                level_idx,
+                slot_idx,
+            })
+        } else {
+            Entry::Vacant(VacantEntry { map: self, key })
+        }
+    }
+
+    /// Tries to insert `key`/`value`. Mirrors the unstable
+    /// [`std::collections::HashMap::try_insert`]: on success returns a mut
+    /// ref to the inserted value; on key collision returns an
+    /// [`OccupiedError`] carrying the existing entry and the rejected value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OccupiedError`] if `key` was already present. The original
+    /// value is left untouched.
+    pub fn try_insert(&mut self, key: K, value: V) -> Result<&mut V, OccupiedError<'_, K, V>> {
+        match self.entry(key) {
+            Entry::Occupied(entry) => Err(OccupiedError { entry, value }),
+            Entry::Vacant(entry) => Ok(entry.insert(value)),
+        }
+    }
+
+    /// Insert path for a key already known to be absent. Mirrors the
+    /// post-lookup half of [`ElasticHashMap::insert`] so the `batch_plan`
+    /// placement invariant is preserved, then returns the slot location so
+    /// the caller can hand back a mutable reference without re-probing.
+    fn insert_for_vacant_entry(&mut self, key: K, value: V) -> (usize, usize) {
+        let key_hash = self.hash_key(&key);
+        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+
+        if self.len >= self.max_insertions {
+            let new_capacity = if self.capacity == 0 {
+                INITIAL_CAPACITY
+            } else {
+                self.capacity.saturating_mul(2)
+            };
+            self.resize(new_capacity);
+        }
+
+        self.advance_batch_window();
+        let (level_idx, slot_idx) = self
+            .choose_slot_for_new_key(key_hash)
+            .expect("no free slot found after resize");
+
+        let level = &mut self.levels[level_idx];
+        let prev_ctrl = level.table.control_at(slot_idx);
+        level
+            .table
+            .write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+        level.len += 1;
+        if prev_ctrl == CTRL_TOMBSTONE {
+            level.tombstones -= 1;
+        }
+        if level_idx > self.max_populated_level {
+            self.max_populated_level = level_idx;
+        }
+        self.len += 1;
+        if self.batch_remaining > 0 {
+            self.batch_remaining -= 1;
+        }
+        (level_idx, slot_idx)
+    }
+}
+
+/// A view into a single entry in an [`ElasticHashMap`], which may be either
+/// vacant or occupied. Constructed via [`ElasticHashMap::entry`].
+pub enum Entry<'a, K: 'a, V: 'a> {
+    /// Slot is occupied; key already lives in the map.
+    Occupied(OccupiedEntry<'a, K, V>),
+    /// Slot is vacant; the supplied key does not exist in the map yet.
+    Vacant(VacantEntry<'a, K, V>),
+}
+
+/// View of an occupied entry — the key already exists in the map. Holds a
+/// back-pointer to the map plus the slot's `(level_idx, slot_idx)` location,
+/// so methods reach the entry without re-probing.
+pub struct OccupiedEntry<'a, K, V> {
+    map: &'a mut ElasticHashMap<K, V>,
+    level_idx: usize,
+    slot_idx: usize,
+}
+
+impl<'a, K, V> OccupiedEntry<'a, K, V>
+where
+    K: Eq + Hash,
+{
+    /// Returns a reference to the entry's key.
+    #[must_use]
+    pub fn key(&self) -> &K {
+        unsafe {
+            &self.map.levels[self.level_idx]
+                .table
+                .get_ref(self.slot_idx)
+                .key
+        }
+    }
+
+    /// Returns a reference to the entry's value.
+    #[must_use]
+    pub fn get(&self) -> &V {
+        unsafe {
+            &self.map.levels[self.level_idx]
+                .table
+                .get_ref(self.slot_idx)
+                .value
+        }
+    }
+
+    /// Returns a mutable reference to the entry's value. The borrow is tied
+    /// to `self`; use [`OccupiedEntry::into_mut`] to extend it to the
+    /// entry's lifetime.
+    pub fn get_mut(&mut self) -> &mut V {
+        unsafe {
+            &mut self.map.levels[self.level_idx]
+                .table
+                .get_mut(self.slot_idx)
+                .value
+        }
+    }
+
+    /// Converts the entry into a mutable reference whose lifetime is tied
+    /// to the map itself.
+    #[must_use]
+    pub fn into_mut(self) -> &'a mut V {
+        unsafe {
+            &mut self.map.levels[self.level_idx]
+                .table
+                .get_mut(self.slot_idx)
+                .value
+        }
+    }
+
+    /// Replaces the entry's value and returns the old one.
+    pub fn insert(&mut self, value: V) -> V {
+        let entry = unsafe { self.map.levels[self.level_idx].table.get_mut(self.slot_idx) };
+        std::mem::replace(&mut entry.value, value)
+    }
+
+    /// Removes the entry and returns its value.
+    #[must_use]
+    pub fn remove(self) -> V {
+        self.remove_entry().1
+    }
+
+    /// Removes the entry and returns the `(key, value)` pair. Mirrors the
+    /// bookkeeping done by [`ElasticHashMap::remove`].
+    #[must_use]
+    pub fn remove_entry(self) -> (K, V) {
+        let level_idx = self.level_idx;
+        let slot_idx = self.slot_idx;
+        let removed = {
+            let level = &mut self.map.levels[level_idx];
+            let removed = unsafe { level.table.take(slot_idx) };
+            level.table.mark_tombstone(slot_idx);
+            level.len -= 1;
+            level.tombstones += 1;
+            removed
+        };
+
+        self.map.len -= 1;
+        let needs_resize = self.map.levels[level_idx].needs_cleanup();
+        self.map.shrink_max_populated_level();
+        if needs_resize {
+            let capacity = self.map.capacity;
+            self.map.resize(capacity);
+        }
+        (removed.key, removed.value)
+    }
+}
+
+/// View of a vacant entry — the key is not yet in the map. Holds a
+/// back-pointer plus the absent key. [`VacantEntry::insert`] consumes both
+/// to route the insert through the canonical insert path.
+pub struct VacantEntry<'a, K, V> {
+    map: &'a mut ElasticHashMap<K, V>,
+    key: K,
+}
+
+impl<'a, K, V> VacantEntry<'a, K, V>
+where
+    K: Eq + Hash,
+{
+    /// Returns a reference to the key that would be inserted.
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    /// Consumes the entry and returns the key without inserting.
+    #[must_use]
+    pub fn into_key(self) -> K {
+        self.key
+    }
+
+    /// Inserts `value` for the entry's key, returning a mutable reference
+    /// to it. Routes the slot choice through the same `batch_plan` logic
+    /// [`ElasticHashMap::insert`] uses, so the elastic-hashing invariant
+    /// (a new key targets the batch-selected level pair, not where the
+    /// lookup probe landed) is preserved.
+    pub fn insert(self, value: V) -> &'a mut V {
+        let (level_idx, slot_idx) = self.map.insert_for_vacant_entry(self.key, value);
+        unsafe { &mut self.map.levels[level_idx].table.get_mut(slot_idx).value }
+    }
+}
+
+impl<'a, K, V> Entry<'a, K, V>
+where
+    K: Eq + Hash,
+{
+    /// Returns a mutable reference to the entry's value, inserting `default`
+    /// first if vacant.
+    pub fn or_insert(self, default: V) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(default),
+        }
+    }
+
+    /// Like [`Entry::or_insert`] but the default is computed lazily.
+    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(default()),
+        }
+    }
+
+    /// Like [`Entry::or_insert_with`] but the default closure receives a
+    /// reference to the key.
+    pub fn or_insert_with_key<F: FnOnce(&K) -> V>(self, default: F) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let value = default(entry.key());
+                entry.insert(value)
+            }
+        }
+    }
+
+    /// Returns a reference to this entry's key.
+    pub fn key(&self) -> &K {
+        match self {
+            Entry::Occupied(entry) => entry.key(),
+            Entry::Vacant(entry) => entry.key(),
+        }
+    }
+
+    /// Runs `f` against the value if the entry is occupied, then returns
+    /// the entry for further chaining.
+    #[must_use]
+    pub fn and_modify<F: FnOnce(&mut V)>(self, f: F) -> Self {
+        match self {
+            Entry::Occupied(mut entry) => {
+                f(entry.get_mut());
+                Entry::Occupied(entry)
+            }
+            Entry::Vacant(entry) => Entry::Vacant(entry),
+        }
+    }
+}
+
+impl<'a, K, V> Entry<'a, K, V>
+where
+    K: Eq + Hash,
+    V: Default,
+{
+    /// Returns a mutable reference to the value, inserting `V::default()`
+    /// first if vacant.
+    pub fn or_default(self) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(V::default()),
+        }
+    }
+}
+
+/// Returned by [`ElasticHashMap::try_insert`] when the key was already in
+/// the map. Carries the existing entry plus the rejected value so the
+/// caller can recover both.
+pub struct OccupiedError<'a, K, V> {
+    /// The conflicting entry already in the map.
+    pub entry: OccupiedEntry<'a, K, V>,
+    /// The value that was passed to `try_insert` and rejected.
+    pub value: V,
+}
+
+impl<K, V> std::fmt::Debug for OccupiedError<'_, K, V>
+where
+    K: Eq + Hash + std::fmt::Debug,
+    V: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OccupiedError")
+            .field("key", self.entry.key())
+            .field("value", &self.value)
+            .finish()
+    }
+}
+
+impl<K, V> std::fmt::Display for OccupiedError<'_, K, V>
+where
+    K: Eq + Hash + std::fmt::Debug,
+    V: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tried to insert {:?}, but key {:?} was already present with {:?}",
+            self.value,
+            self.entry.key(),
+            self.entry.get(),
+        )
+    }
+}
+
+impl<K, V> std::error::Error for OccupiedError<'_, K, V>
+where
+    K: Eq + Hash + std::fmt::Debug,
+    V: std::fmt::Debug,
+{
 }
 
 /// Borrowing iterator over occupied entries. Walks levels in order, scanning
@@ -1866,5 +2206,154 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), n - take);
         drop(taken);
         assert_eq!(counter.load(Ordering::SeqCst), n);
+    }
+
+    #[test]
+    fn entry_or_insert_creates_when_missing() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        let value = map.entry(1).or_insert(10);
+        assert_eq!(*value, 10);
+        assert_eq!(map.get(&1), Some(&10));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn entry_or_insert_returns_existing() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        map.insert(1, 10);
+        let value = map.entry(1).or_insert(99);
+        assert_eq!(*value, 10);
+        assert_eq!(map.get(&1), Some(&10));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn entry_or_insert_with_lazy_default_not_called_on_hit() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        map.insert(1, 10);
+        let mut called = false;
+        let value = map.entry(1).or_insert_with(|| {
+            called = true;
+            42
+        });
+        assert_eq!(*value, 10);
+        assert!(!called, "default closure must not run on occupied entry");
+    }
+
+    #[test]
+    fn entry_or_insert_with_key_uses_key_in_default() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        let value = map.entry(7).or_insert_with_key(|k| k * 100);
+        assert_eq!(*value, 700);
+        assert_eq!(map.get(&7), Some(&700));
+    }
+
+    #[test]
+    fn entry_and_modify_runs_on_occupied() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        map.insert(1, 10);
+        let value = map.entry(1).and_modify(|v| *v += 5).or_insert(0);
+        assert_eq!(*value, 15);
+        assert_eq!(map.get(&1), Some(&15));
+    }
+
+    #[test]
+    fn entry_and_modify_skips_on_vacant() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        let mut touched = false;
+        let value = map.entry(1).and_modify(|_| touched = true).or_insert(42);
+        assert_eq!(*value, 42);
+        assert!(!touched);
+        assert_eq!(map.get(&1), Some(&42));
+    }
+
+    #[test]
+    fn entry_occupied_get_mut_mutates() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        map.insert(1, 10);
+        if let Entry::Occupied(mut occ) = map.entry(1) {
+            *occ.get_mut() = 99;
+            assert_eq!(*occ.get(), 99);
+        } else {
+            panic!("expected occupied");
+        }
+        assert_eq!(map.get(&1), Some(&99));
+    }
+
+    #[test]
+    fn entry_occupied_into_mut_outlives_entry_borrow() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        map.insert(1, 10);
+        let value: &mut i32 = match map.entry(1) {
+            Entry::Occupied(occ) => occ.into_mut(),
+            Entry::Vacant(_) => panic!("expected occupied"),
+        };
+        *value = 123;
+        assert_eq!(map.get(&1), Some(&123));
+    }
+
+    #[test]
+    fn entry_occupied_insert_returns_old_and_replaces() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        map.insert(1, 10);
+        if let Entry::Occupied(mut occ) = map.entry(1) {
+            let old = occ.insert(99);
+            assert_eq!(old, 10);
+        } else {
+            panic!("expected occupied");
+        }
+        assert_eq!(map.get(&1), Some(&99));
+    }
+
+    #[test]
+    fn entry_occupied_remove_returns_value() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        map.insert(1, 10);
+        map.insert(2, 20);
+        if let Entry::Occupied(occ) = map.entry(1) {
+            assert_eq!(occ.remove(), 10);
+        } else {
+            panic!("expected occupied");
+        }
+        assert!(map.get(&1).is_none());
+        assert_eq!(map.get(&2), Some(&20));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn entry_vacant_insert_returns_mut_ref() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        let value: &mut i32 = match map.entry(5) {
+            Entry::Vacant(vac) => vac.insert(50),
+            Entry::Occupied(_) => panic!("expected vacant"),
+        };
+        *value += 1;
+        assert_eq!(map.get(&5), Some(&51));
+    }
+
+    #[test]
+    fn try_insert_succeeds_when_missing() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        let value = map.try_insert(1, 10).expect("vacant should succeed");
+        assert_eq!(*value, 10);
+        assert_eq!(map.get(&1), Some(&10));
+    }
+
+    #[test]
+    fn try_insert_fails_with_occupied_error_when_present() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        map.insert(1, 10);
+        let err = map.try_insert(1, 99).expect_err("occupied must error");
+        assert_eq!(err.entry.key(), &1);
+        assert_eq!(err.entry.get(), &10);
+        assert_eq!(map.get(&1), Some(&10));
+    }
+
+    #[test]
+    fn try_insert_occupied_error_carries_rejected_value() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        map.insert(1, 10);
+        let err = map.try_insert(1, 99).expect_err("occupied must error");
+        assert_eq!(err.value, 99);
     }
 }
