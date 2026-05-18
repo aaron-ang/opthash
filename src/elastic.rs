@@ -725,7 +725,7 @@ where
     }
 }
 
-/// `&mut V` iterator. Newtype wrapping `ElasticIterMut`.
+/// `&mut V` iterator returned by [`ElasticHashMap::values_mut`].
 pub struct ElasticValuesMut<'a, K, V> {
     inner: ElasticIterMut<'a, K, V>,
 }
@@ -747,9 +747,7 @@ impl<K, V> std::fmt::Debug for ElasticValuesMut<'_, K, V> {
     }
 }
 
-/// Consuming `(K, V)` iterator. `next()` calls `RawTable::take` then marks
-/// the slot tombstone so the map's `Drop` is a no-op over entries already
-/// yielded. `Drop` drains the remainder, matching std semantics.
+/// Consuming `(K, V)` iterator returned by `ElasticHashMap::into_iter`.
 pub struct ElasticIntoIter<K, V> {
     map: ElasticHashMap<K, V>,
     level_idx: usize,
@@ -814,7 +812,7 @@ where
     }
 }
 
-/// Consuming `K` iterator.
+/// Owned `K` iterator returned by [`ElasticHashMap::into_keys`].
 pub struct ElasticIntoKeys<K, V> {
     inner: ElasticIntoIter<K, V>,
 }
@@ -836,7 +834,7 @@ impl<K, V> std::fmt::Debug for ElasticIntoKeys<K, V> {
     }
 }
 
-/// Consuming `V` iterator.
+/// Owned `V` iterator returned by [`ElasticHashMap::into_values`].
 pub struct ElasticIntoValues<K, V> {
     inner: ElasticIntoIter<K, V>,
 }

@@ -1806,8 +1806,7 @@ where
     }
 }
 
-/// Mutable iterator over values only. Newtype wrapper mapping
-/// `FunnelIterMut`'s `(&K, &mut V)` to `&mut V`.
+/// `&mut V` iterator returned by [`FunnelHashMap::values_mut`].
 pub struct FunnelValuesMut<'a, K, V> {
     inner: FunnelIterMut<'a, K, V>,
 }
@@ -1829,13 +1828,10 @@ impl<K, V> std::fmt::Debug for FunnelValuesMut<'_, K, V> {
     }
 }
 
-/// Consuming iterator yielding owned `(K, V)` pairs.
+/// Owned `(K, V)` iterator returned by `FunnelHashMap::into_iter`.
 ///
-/// SAFETY: owns the map. Each occupied slot is read via `RawTable::take`
-/// and the slot is immediately marked tombstone, so neither a future
-/// `next()` call nor the map's own `Drop` will revisit the slot. On
-/// `Drop`, the iterator drains the remainder so values get their `Drop`,
-/// matching `std::collections::hash_map::IntoIter`'s semantics.
+/// SAFETY: each yielded slot is immediately tombstoned, so the map's
+/// `Drop` never revisits it. `Drop` drains the remainder per std semantics.
 pub struct FunnelIntoIter<K, V> {
     map: FunnelHashMap<K, V>,
     phase: FunnelIterPhase,
@@ -1943,7 +1939,7 @@ where
     }
 }
 
-/// Consuming iterator yielding owned keys.
+/// Owned `K` iterator returned by [`FunnelHashMap::into_keys`].
 pub struct FunnelIntoKeys<K, V> {
     inner: FunnelIntoIter<K, V>,
 }
@@ -1965,7 +1961,7 @@ impl<K, V> std::fmt::Debug for FunnelIntoKeys<K, V> {
     }
 }
 
-/// Consuming `V` iterator.
+/// Owned `V` iterator returned by [`FunnelHashMap::into_values`].
 pub struct FunnelIntoValues<K, V> {
     inner: FunnelIntoIter<K, V>,
 }
