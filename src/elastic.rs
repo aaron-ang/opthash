@@ -644,15 +644,11 @@ where
     where
         F: FnMut(&K, &mut V) -> bool,
     {
-        // `extract_if` removes entries where the predicate returns `true`;
-        // `retain` keeps entries where the user's predicate returns `true`.
-        // Inverting the predicate reuses the same walk.
         self.extract_if(|k, v| !f(k, v)).for_each(drop);
     }
 
-    /// Returns a draining iterator over every entry, emptying the map.
-    /// Mirrors [`std::collections::HashMap::drain`]: entries left in the
-    /// iterator at drop time are still dropped — the map is empty afterwards.
+    /// Returns a draining iterator that empties the map. Mirrors
+    /// [`std::collections::HashMap::drain`].
     pub fn drain(&mut self) -> Drain<'_, K, V> {
         Drain {
             map: self,
@@ -661,10 +657,8 @@ where
         }
     }
 
-    /// Like [`Self::drain`] but conditional on `f(&K, &mut V) -> bool`.
-    /// Yields only the `(K, V)` pairs for which `f` returned `true`; entries
-    /// the predicate kept (and any entries past the iterator's cursor when
-    /// it drops) remain in the map. Mirrors
+    /// Yields and removes `(K, V)` pairs where `f` returned `true`; kept
+    /// entries remain in the map. Mirrors
     /// [`std::collections::HashMap::extract_if`].
     pub fn extract_if<F>(&mut self, f: F) -> ExtractIf<'_, K, V, F>
     where
@@ -982,13 +976,9 @@ impl<K, V> std::iter::FusedIterator for Drain<'_, K, V> {}
 
 impl<K, V> Drop for Drain<'_, K, V> {
     fn drop(&mut self) {
-        // Drop any not-yet-yielded entries so consumers don't leak memory.
-        // Mirrors `std::collections::hash_map::Drain` semantics.
+        // Drain any unyielded entries so values run their `Drop`.
         for _ in &mut *self {}
-        // Walking left tombstones everywhere; cheaper to reset levels en bloc
-        // than to rely on the per-remove tombstone trail. All entries have
-        // already been moved out by `next()`, so `clear_all_controls` only
-        // wipes control bytes and `len`/`tombstones` counters.
+        // All entries moved out via `next()`; wipe ctrl bytes + counters en bloc.
         for level in &mut self.map.levels {
             level.table.clear_all_controls();
             level.len = 0;
@@ -1041,8 +1031,7 @@ where
                 if !level.table.control_at(idx).is_occupied() {
                     continue;
                 }
-                // Evaluate the predicate against in-place borrows so mutations
-                // stick on kept entries.
+                // In-place borrow so predicate mutations stick on kept entries.
                 let entry = unsafe { level.table.get_mut(idx) };
                 if (self.pred)(&entry.key, &mut entry.value) {
                     let removed = unsafe { level.table.take(idx) };
