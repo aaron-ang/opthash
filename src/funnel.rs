@@ -7,7 +7,7 @@ use crate::common::simd::{ProbeOps, prefetch_read};
 use crate::common::{
     config::{DEFAULT_RESERVE_FRACTION, INITIAL_CAPACITY},
     control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps},
-    layout::{Entry, GROUP_SIZE, RawTable},
+    layout::{Entry as SlotEntry, GROUP_SIZE, RawTable},
     math::{
         ceil_to_usize, fastmod_magic, fastmod_u32, floor_to_usize, level_salt, max_insertions,
         round_to_usize, round_up_to_group, round_up_to_pow2_groups, sanitize_reserve_fraction,
@@ -75,7 +75,7 @@ impl FunnelOptions {
 /// special array). Bucket-local probing keeps lookup cost bounded.
 struct BucketLevel<K, V> {
     /// Structure of Arrays control bytes + entries.
-    table: RawTable<Entry<K, V>>,
+    table: RawTable<SlotEntry<K, V>>,
     /// Live entry count.
     len: usize,
     /// Deleted-slot count.
@@ -149,7 +149,7 @@ impl<K, V> Drop for BucketLevel<K, V> {
 /// (step coprime to `group_count` ⇒ permutation over all groups).
 struct SpecialPrimary<K, V> {
     /// `SoA` control bytes + entries.
-    table: RawTable<Entry<K, V>>,
+    table: RawTable<SlotEntry<K, V>>,
     /// Live entry count.
     len: usize,
     /// Total tombstones; drives the global 50%-capacity resize trigger.
@@ -195,7 +195,7 @@ impl<K, V> Drop for SpecialPrimary<K, V> {
 /// certainly fits.
 struct SpecialFallback<K, V> {
     /// Structure of Arrays control bytes + entries.
-    table: RawTable<Entry<K, V>>,
+    table: RawTable<SlotEntry<K, V>>,
     /// Live entry count.
     len: usize,
     /// Deleted-slot count.
@@ -805,6 +805,67 @@ where
         }
     }
 
+    /// Returns an [`Entry`] for in-place manipulation of `key`'s slot.
+    /// Mirrors [`std::collections::HashMap::entry`].
+    pub fn entry(&mut self, key: K) -> Entry<'_, K, V> {
+        let key_hash = self.hash_key(&key);
+        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        if let Some(location) = self.find_slot_location_with_hash(&key, key_hash, key_fingerprint) {
+            Entry::Occupied(OccupiedEntry {
+                map: self,
+                location,
+            })
+        } else {
+            Entry::Vacant(VacantEntry {
+                map: self,
+                key,
+                key_hash,
+            })
+        }
+    }
+
+    /// Inserts `key`/`value` if absent. Mirrors the unstable
+    /// [`std::collections::HashMap::try_insert`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OccupiedError`] if `key` was already present.
+    pub fn try_insert(&mut self, key: K, value: V) -> Result<&mut V, OccupiedError<'_, K, V>> {
+        match self.entry(key) {
+            Entry::Occupied(entry) => Err(OccupiedError { entry, value }),
+            Entry::Vacant(entry) => Ok(entry.insert(value)),
+        }
+    }
+
+    /// Post-lookup insert for a key known to be absent. Returns the chosen
+    /// slot so the caller can borrow into it without re-probing.
+    fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> SlotLocation {
+        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+
+        let mut location = if self.len < self.max_insertions {
+            self.choose_slot_for_new_key(key_hash)
+        } else {
+            None
+        };
+
+        if location.is_none() {
+            let new_capacity = if self.capacity == 0 {
+                INITIAL_CAPACITY
+            } else {
+                self.capacity.saturating_mul(2)
+            };
+            self.resize(new_capacity);
+            location = Some(
+                self.choose_slot_for_new_key(key_hash)
+                    .expect("no free slot found after resize"),
+            );
+        }
+
+        let final_location = location.expect("location set above");
+        self.place_new_entry(final_location, key, value, key_fingerprint);
+        final_location
+    }
+
     pub fn clear(&mut self) {
         for level in &mut self.levels {
             for idx in 0..level.table.capacity() {
@@ -1070,7 +1131,7 @@ where
                 let level = &mut self.levels[level_idx];
                 level
                     .table
-                    .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
+                    .write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
                 level.len += 1;
                 if level_idx > self.max_populated_level {
                     self.max_populated_level = level_idx;
@@ -1082,9 +1143,11 @@ where
                 // Reusing a tombstone slot must decrement the counter;
                 // otherwise resize triggers on stale-since-resize counts.
                 let was_tombstone = primary.table.control_at(slot_idx) == CTRL_TOMBSTONE;
-                primary
-                    .table
-                    .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
+                primary.table.write_with_control(
+                    slot_idx,
+                    SlotEntry { key, value },
+                    key_fingerprint,
+                );
                 primary.len += 1;
                 primary.group_summaries[group_idx] |= ControlOps::fingerprint_bit(key_fingerprint);
                 if was_tombstone {
@@ -1093,9 +1156,11 @@ where
             }
             SlotLocation::SpecialFallback { slot_idx } => {
                 let fallback = &mut self.special.fallback;
-                fallback
-                    .table
-                    .write_with_control(slot_idx, Entry { key, value }, key_fingerprint);
+                fallback.table.write_with_control(
+                    slot_idx,
+                    SlotEntry { key, value },
+                    key_fingerprint,
+                );
                 fallback.len += 1;
             }
         }
@@ -1538,10 +1603,307 @@ where
         while self.max_populated_level > 0 && self.levels[self.max_populated_level].len == 0 {
             self.max_populated_level -= 1;
         }
-        if self.levels.is_empty() || self.levels[0].len == 0 {
-            self.max_populated_level = 0;
+    }
+}
+
+/// A view into a single entry in a [`FunnelHashMap`], which may be either
+/// vacant or occupied. Constructed via [`FunnelHashMap::entry`].
+pub enum Entry<'a, K: 'a, V: 'a> {
+    /// Slot is occupied; key already lives in the map.
+    Occupied(OccupiedEntry<'a, K, V>),
+    /// Slot is vacant; the supplied key does not exist in the map yet.
+    Vacant(VacantEntry<'a, K, V>),
+}
+
+/// View of an occupied entry in a [`FunnelHashMap`].
+pub struct OccupiedEntry<'a, K, V> {
+    map: &'a mut FunnelHashMap<K, V>,
+    location: SlotLocation,
+}
+
+impl<'a, K, V> OccupiedEntry<'a, K, V>
+where
+    K: Eq + Hash,
+{
+    /// Returns a reference to the entry's key.
+    #[must_use]
+    pub fn key(&self) -> &K {
+        match self.location {
+            SlotLocation::Level {
+                level_idx,
+                slot_idx,
+            } => unsafe { &self.map.levels[level_idx].table.get_ref(slot_idx).key },
+            SlotLocation::SpecialPrimary { slot_idx } => unsafe {
+                &self.map.special.primary.table.get_ref(slot_idx).key
+            },
+            SlotLocation::SpecialFallback { slot_idx } => unsafe {
+                &self.map.special.fallback.table.get_ref(slot_idx).key
+            },
         }
     }
+
+    /// Returns a reference to the entry's value.
+    #[must_use]
+    pub fn get(&self) -> &V {
+        match self.location {
+            SlotLocation::Level {
+                level_idx,
+                slot_idx,
+            } => unsafe { &self.map.levels[level_idx].table.get_ref(slot_idx).value },
+            SlotLocation::SpecialPrimary { slot_idx } => unsafe {
+                &self.map.special.primary.table.get_ref(slot_idx).value
+            },
+            SlotLocation::SpecialFallback { slot_idx } => unsafe {
+                &self.map.special.fallback.table.get_ref(slot_idx).value
+            },
+        }
+    }
+
+    /// Returns `&mut V`. Borrow is tied to `self`; for the map's lifetime
+    /// use [`OccupiedEntry::into_mut`].
+    pub fn get_mut(&mut self) -> &mut V {
+        match self.location {
+            SlotLocation::Level {
+                level_idx,
+                slot_idx,
+            } => unsafe { &mut self.map.levels[level_idx].table.get_mut(slot_idx).value },
+            SlotLocation::SpecialPrimary { slot_idx } => unsafe {
+                &mut self.map.special.primary.table.get_mut(slot_idx).value
+            },
+            SlotLocation::SpecialFallback { slot_idx } => unsafe {
+                &mut self.map.special.fallback.table.get_mut(slot_idx).value
+            },
+        }
+    }
+
+    /// Consumes the entry and returns `&mut V` borrowed from the map.
+    #[must_use]
+    pub fn into_mut(self) -> &'a mut V {
+        match self.location {
+            SlotLocation::Level {
+                level_idx,
+                slot_idx,
+            } => unsafe { &mut self.map.levels[level_idx].table.get_mut(slot_idx).value },
+            SlotLocation::SpecialPrimary { slot_idx } => unsafe {
+                &mut self.map.special.primary.table.get_mut(slot_idx).value
+            },
+            SlotLocation::SpecialFallback { slot_idx } => unsafe {
+                &mut self.map.special.fallback.table.get_mut(slot_idx).value
+            },
+        }
+    }
+
+    /// Replaces the entry's value and returns the old one.
+    pub fn insert(&mut self, value: V) -> V {
+        self.map.replace_existing_value(self.location, value)
+    }
+
+    /// Removes the entry and returns its value.
+    #[must_use]
+    pub fn remove(self) -> V {
+        self.remove_entry().1
+    }
+
+    /// Removes the entry and returns the `(key, value)` pair.
+    #[must_use]
+    pub fn remove_entry(self) -> (K, V) {
+        let (removed_entry, needs_resize) = match self.location {
+            SlotLocation::Level {
+                level_idx,
+                slot_idx,
+            } => {
+                let level = &mut self.map.levels[level_idx];
+                let removed = unsafe { level.table.take(slot_idx) };
+                level.table.mark_tombstone(slot_idx);
+                level.len -= 1;
+                level.tombstones += 1;
+                let needs_resize = level.tombstones > level.capacity() / 2;
+                (removed, needs_resize)
+            }
+            SlotLocation::SpecialPrimary { slot_idx } => {
+                let primary = &mut self.map.special.primary;
+                let removed = unsafe { primary.table.take(slot_idx) };
+                primary.table.mark_tombstone(slot_idx);
+                primary.len -= 1;
+                primary.tombstones += 1;
+                let needs_resize = primary.tombstones > primary.table.capacity() / 2;
+                (removed, needs_resize)
+            }
+            SlotLocation::SpecialFallback { slot_idx } => {
+                let fallback = &mut self.map.special.fallback;
+                let removed = unsafe { fallback.table.take(slot_idx) };
+                fallback.table.mark_tombstone(slot_idx);
+                fallback.len -= 1;
+                fallback.tombstones += 1;
+                let needs_resize = fallback.tombstones > fallback.capacity() / 2;
+                (removed, needs_resize)
+            }
+        };
+
+        self.map.len -= 1;
+        self.map.shrink_max_populated_level();
+        if needs_resize {
+            let capacity = self.map.capacity;
+            self.map.resize(capacity);
+        }
+        (removed_entry.key, removed_entry.value)
+    }
+}
+
+/// View of a vacant entry in a [`FunnelHashMap`].
+pub struct VacantEntry<'a, K, V> {
+    map: &'a mut FunnelHashMap<K, V>,
+    key: K,
+    key_hash: u64,
+}
+
+impl<'a, K, V> VacantEntry<'a, K, V>
+where
+    K: Eq + Hash,
+{
+    /// Returns a reference to the key that would be inserted.
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    /// Consumes the entry and returns the key without inserting.
+    #[must_use]
+    pub fn into_key(self) -> K {
+        self.key
+    }
+
+    /// Inserts `value` for the entry's key, returning `&mut V`.
+    pub fn insert(self, value: V) -> &'a mut V {
+        let location = self
+            .map
+            .insert_for_vacant_entry(self.key, value, self.key_hash);
+        match location {
+            SlotLocation::Level {
+                level_idx,
+                slot_idx,
+            } => unsafe { &mut self.map.levels[level_idx].table.get_mut(slot_idx).value },
+            SlotLocation::SpecialPrimary { slot_idx } => unsafe {
+                &mut self.map.special.primary.table.get_mut(slot_idx).value
+            },
+            SlotLocation::SpecialFallback { slot_idx } => unsafe {
+                &mut self.map.special.fallback.table.get_mut(slot_idx).value
+            },
+        }
+    }
+}
+
+impl<'a, K, V> Entry<'a, K, V>
+where
+    K: Eq + Hash,
+{
+    /// Returns a mutable reference to the entry's value, inserting `default`
+    /// first if vacant.
+    pub fn or_insert(self, default: V) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(default),
+        }
+    }
+
+    /// Like [`Entry::or_insert`] but the default is computed lazily.
+    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(default()),
+        }
+    }
+
+    /// Like [`Entry::or_insert_with`] but the default closure receives a
+    /// reference to the key.
+    pub fn or_insert_with_key<F: FnOnce(&K) -> V>(self, default: F) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let value = default(entry.key());
+                entry.insert(value)
+            }
+        }
+    }
+
+    /// Returns a reference to this entry's key.
+    pub fn key(&self) -> &K {
+        match self {
+            Entry::Occupied(entry) => entry.key(),
+            Entry::Vacant(entry) => entry.key(),
+        }
+    }
+
+    /// Runs `f` against the value if the entry is occupied, then returns
+    /// the entry for further chaining.
+    #[must_use]
+    pub fn and_modify<F: FnOnce(&mut V)>(self, f: F) -> Self {
+        match self {
+            Entry::Occupied(mut entry) => {
+                f(entry.get_mut());
+                Entry::Occupied(entry)
+            }
+            Entry::Vacant(entry) => Entry::Vacant(entry),
+        }
+    }
+}
+
+impl<'a, K, V> Entry<'a, K, V>
+where
+    K: Eq + Hash,
+    V: Default,
+{
+    /// Returns a mutable reference to the value, inserting `V::default()`
+    /// first if vacant.
+    pub fn or_default(self) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(V::default()),
+        }
+    }
+}
+
+/// Error returned by [`FunnelHashMap::try_insert`] on key collision.
+pub struct OccupiedError<'a, K, V> {
+    /// The existing entry.
+    pub entry: OccupiedEntry<'a, K, V>,
+    /// The value that was rejected.
+    pub value: V,
+}
+
+impl<K, V> std::fmt::Debug for OccupiedError<'_, K, V>
+where
+    K: Eq + Hash + std::fmt::Debug,
+    V: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OccupiedError")
+            .field("key", self.entry.key())
+            .field("value", &self.value)
+            .finish()
+    }
+}
+
+impl<K, V> std::fmt::Display for OccupiedError<'_, K, V>
+where
+    K: Eq + Hash + std::fmt::Debug,
+    V: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tried to insert {:?}, but key {:?} was already present with {:?}",
+            self.value,
+            self.entry.key(),
+            self.entry.get(),
+        )
+    }
+}
+
+impl<K, V> std::error::Error for OccupiedError<'_, K, V>
+where
+    K: Eq + Hash + std::fmt::Debug,
+    V: std::fmt::Debug,
+{
 }
 
 /// Three-phase iterator state: walk all bucket levels, then the special
@@ -2400,6 +2762,18 @@ mod tests {
         assert_eq!(map.iter().count(), 0);
     }
 
+    // Regression: removing one of two keys that both routed into a deep level
+    // (level 0 unallocated) must not orphan the surviving sibling.
+    #[test]
+    fn remove_preserves_sibling_when_level_zero_empty() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::default();
+        map.insert(1, 10);
+        map.insert(2, 20);
+        map.remove(&1);
+        assert_eq!(map.get(&2), Some(&20));
+        assert_eq!(map.len(), 1);
+    }
+
     #[test]
     fn get_disjoint_mut_returns_all_refs_on_hits() {
         let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
@@ -2755,5 +3129,154 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), n - take);
         drop(taken);
         assert_eq!(counter.load(Ordering::SeqCst), n);
+    }
+
+    #[test]
+    fn entry_or_insert_creates_when_missing() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        let value = map.entry(1).or_insert(10);
+        assert_eq!(*value, 10);
+        assert_eq!(map.get(&1), Some(&10));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn entry_or_insert_returns_existing() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        map.insert(1, 10);
+        let value = map.entry(1).or_insert(99);
+        assert_eq!(*value, 10);
+        assert_eq!(map.get(&1), Some(&10));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn entry_or_insert_with_lazy_default_not_called_on_hit() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        map.insert(1, 10);
+        let mut called = false;
+        let value = map.entry(1).or_insert_with(|| {
+            called = true;
+            42
+        });
+        assert_eq!(*value, 10);
+        assert!(!called, "default closure must not run on occupied entry");
+    }
+
+    #[test]
+    fn entry_or_insert_with_key_uses_key_in_default() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        let value = map.entry(7).or_insert_with_key(|k| k * 100);
+        assert_eq!(*value, 700);
+        assert_eq!(map.get(&7), Some(&700));
+    }
+
+    #[test]
+    fn entry_and_modify_runs_on_occupied() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        map.insert(1, 10);
+        let value = map.entry(1).and_modify(|v| *v += 5).or_insert(0);
+        assert_eq!(*value, 15);
+        assert_eq!(map.get(&1), Some(&15));
+    }
+
+    #[test]
+    fn entry_and_modify_skips_on_vacant() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        let mut touched = false;
+        let value = map.entry(1).and_modify(|_| touched = true).or_insert(42);
+        assert_eq!(*value, 42);
+        assert!(!touched);
+        assert_eq!(map.get(&1), Some(&42));
+    }
+
+    #[test]
+    fn entry_occupied_get_mut_mutates() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        map.insert(1, 10);
+        if let Entry::Occupied(mut occ) = map.entry(1) {
+            *occ.get_mut() = 99;
+            assert_eq!(*occ.get(), 99);
+        } else {
+            panic!("expected occupied");
+        }
+        assert_eq!(map.get(&1), Some(&99));
+    }
+
+    #[test]
+    fn entry_occupied_into_mut_outlives_entry_borrow() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        map.insert(1, 10);
+        let value: &mut i32 = match map.entry(1) {
+            Entry::Occupied(occ) => occ.into_mut(),
+            Entry::Vacant(_) => panic!("expected occupied"),
+        };
+        *value = 123;
+        assert_eq!(map.get(&1), Some(&123));
+    }
+
+    #[test]
+    fn entry_occupied_insert_returns_old_and_replaces() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        map.insert(1, 10);
+        if let Entry::Occupied(mut occ) = map.entry(1) {
+            let old = occ.insert(99);
+            assert_eq!(old, 10);
+        } else {
+            panic!("expected occupied");
+        }
+        assert_eq!(map.get(&1), Some(&99));
+    }
+
+    #[test]
+    fn entry_occupied_remove_returns_value() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        map.insert(1, 10);
+        map.insert(2, 20);
+        if let Entry::Occupied(occ) = map.entry(1) {
+            assert_eq!(occ.remove(), 10);
+        } else {
+            panic!("expected occupied");
+        }
+        assert!(map.get(&1).is_none());
+        assert_eq!(map.get(&2), Some(&20));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn entry_vacant_insert_returns_mut_ref() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        let value: &mut i32 = match map.entry(5) {
+            Entry::Vacant(vac) => vac.insert(50),
+            Entry::Occupied(_) => panic!("expected vacant"),
+        };
+        *value += 1;
+        assert_eq!(map.get(&5), Some(&51));
+    }
+
+    #[test]
+    fn try_insert_succeeds_when_missing() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        let value = map.try_insert(1, 10).expect("vacant should succeed");
+        assert_eq!(*value, 10);
+        assert_eq!(map.get(&1), Some(&10));
+    }
+
+    #[test]
+    fn try_insert_fails_with_occupied_error_when_present() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        map.insert(1, 10);
+        let err = map.try_insert(1, 99).expect_err("occupied must error");
+        assert_eq!(err.entry.key(), &1);
+        assert_eq!(err.entry.get(), &10);
+        assert_eq!(map.get(&1), Some(&10));
+    }
+
+    #[test]
+    fn try_insert_occupied_error_carries_rejected_value() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        map.insert(1, 10);
+        let err = map.try_insert(1, 99).expect_err("occupied must error");
+        assert_eq!(err.value, 99);
     }
 }
