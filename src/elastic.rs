@@ -10,7 +10,7 @@ use crate::common::{
     control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps},
     layout::{Entry, GROUP_SIZE, RawTable},
     math::{
-        ceil_three_quarters, floor_half_reserve_slots, level_salt, max_insertions,
+        capacity_for, ceil_three_quarters, floor_half_reserve_slots, level_salt, max_insertions,
         round_up_to_pow2_groups, sanitize_reserve_fraction, usize_to_f64,
     },
 };
@@ -310,12 +310,17 @@ where
 
     /// Grow capacity so at least `additional` more inserts fit without
     /// triggering an internal resize. No-op if already large enough.
+    ///
+    /// # Panics
+    ///
+    /// Panics on capacity overflow. Use [`Self::try_reserve`] for fallible
+    /// growth.
     pub fn reserve(&mut self, additional: usize) {
         let needed = self.len.saturating_add(additional);
         if needed <= self.max_insertions {
             return;
         }
-        let new_capacity = self.grow_capacity_for(needed);
+        let new_capacity = self.grow_capacity_for(needed).expect("capacity overflow");
         self.resize(new_capacity);
     }
 
@@ -335,7 +340,9 @@ where
         if needed <= self.max_insertions {
             return Ok(());
         }
-        let new_capacity = self.grow_capacity_for(needed);
+        let new_capacity = self
+            .grow_capacity_for(needed)
+            .ok_or(TryReserveError::CapacityOverflow)?;
         self.try_resize(new_capacity)
     }
 
@@ -348,6 +355,11 @@ where
     /// Shrinks the capacity with a lower bound. The table won't shrink below
     /// the larger of `min_capacity` and `self.len`. Mirrors
     /// [`std::collections::HashMap::shrink_to`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min_capacity` exceeds any representable capacity (i.e.,
+    /// no `usize` capacity satisfies `max_insertions(cap) >= min_capacity`).
     pub fn shrink_to(&mut self, min_capacity: usize) {
         if self.len == 0 && min_capacity == 0 {
             if self.capacity > 0 {
@@ -356,10 +368,8 @@ where
             return;
         }
         let lower = self.len.max(min_capacity).max(INITIAL_CAPACITY);
-        let mut new_capacity = INITIAL_CAPACITY;
-        while max_insertions(new_capacity, self.reserve_fraction) < lower {
-            new_capacity = new_capacity.saturating_mul(2);
-        }
+        let new_capacity = capacity_for(INITIAL_CAPACITY, lower, self.reserve_fraction)
+            .expect("capacity overflow");
         if new_capacity >= self.capacity {
             return;
         }
@@ -367,13 +377,14 @@ where
     }
 
     /// Round up to the smallest capacity whose `max_insertions` accommodates
-    /// `needed` live entries. Used by `reserve` / `try_reserve`.
-    fn grow_capacity_for(&self, needed: usize) -> usize {
-        let mut new_capacity = self.capacity.max(INITIAL_CAPACITY);
-        while max_insertions(new_capacity, self.reserve_fraction) < needed {
-            new_capacity = new_capacity.saturating_mul(2);
-        }
-        new_capacity
+    /// `needed` live entries. Returns `None` if no representable capacity
+    /// suffices. Used by `reserve` / `try_reserve`.
+    fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
+        capacity_for(
+            self.capacity.max(INITIAL_CAPACITY),
+            needed,
+            self.reserve_fraction,
+        )
     }
 
     /// # Panics
