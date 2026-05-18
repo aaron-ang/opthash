@@ -806,14 +806,7 @@ where
     }
 
     /// Returns an [`Entry`] for in-place manipulation of `key`'s slot.
-    ///
-    /// Mirrors [`std::collections::HashMap::entry`]: a single probe locates
-    /// the key (or its absence), and the returned enum lets the caller
-    /// insert-if-missing, modify in place, or remove without a second lookup.
-    ///
-    /// Note: [`VacantEntry::insert`] routes the slot choice through the same
-    /// funnel-descent logic [`FunnelHashMap::insert`] uses, so the funnel
-    /// placement invariants are preserved.
+    /// Mirrors [`std::collections::HashMap::entry`].
     pub fn entry(&mut self, key: K) -> Entry<'_, K, V> {
         let key_hash = self.hash_key(&key);
         let key_fingerprint = ControlOps::control_fingerprint(key_hash);
@@ -831,15 +824,12 @@ where
         }
     }
 
-    /// Tries to insert `key`/`value`. Mirrors the unstable
-    /// [`std::collections::HashMap::try_insert`]: on success returns a mut
-    /// ref to the inserted value; on key collision returns an
-    /// [`OccupiedError`] carrying the existing entry and the rejected value.
+    /// Inserts `key`/`value` if absent. Mirrors the unstable
+    /// [`std::collections::HashMap::try_insert`].
     ///
     /// # Errors
     ///
-    /// Returns [`OccupiedError`] if `key` was already present. The original
-    /// value is left untouched.
+    /// Returns [`OccupiedError`] if `key` was already present.
     pub fn try_insert(&mut self, key: K, value: V) -> Result<&mut V, OccupiedError<'_, K, V>> {
         match self.entry(key) {
             Entry::Occupied(entry) => Err(OccupiedError { entry, value }),
@@ -847,9 +837,8 @@ where
         }
     }
 
-    /// Insert path for a key already known to be absent. Routes the slot
-    /// choice through `choose_slot_for_new_key` so funnel-descent placement
-    /// is preserved, then returns the chosen slot location.
+    /// Post-lookup insert for a key known to be absent. Returns the chosen
+    /// slot so the caller can borrow into it without re-probing.
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> SlotLocation {
         let key_fingerprint = ControlOps::control_fingerprint(key_hash);
 
@@ -1626,9 +1615,7 @@ pub enum Entry<'a, K: 'a, V: 'a> {
     Vacant(VacantEntry<'a, K, V>),
 }
 
-/// View of an occupied entry — the key already exists in the map. Holds a
-/// back-pointer plus the slot's `SlotLocation`, so methods reach the entry
-/// without re-probing.
+/// View of an occupied entry in a [`FunnelHashMap`].
 pub struct OccupiedEntry<'a, K, V> {
     map: &'a mut FunnelHashMap<K, V>,
     location: SlotLocation,
@@ -1672,9 +1659,8 @@ where
         }
     }
 
-    /// Returns a mutable reference to the entry's value. The borrow is tied
-    /// to `self`; use [`OccupiedEntry::into_mut`] to extend it to the
-    /// entry's lifetime.
+    /// Returns `&mut V`. Borrow is tied to `self`; for the map's lifetime
+    /// use [`OccupiedEntry::into_mut`].
     pub fn get_mut(&mut self) -> &mut V {
         match self.location {
             SlotLocation::Level {
@@ -1690,8 +1676,7 @@ where
         }
     }
 
-    /// Converts the entry into a mutable reference whose lifetime is tied
-    /// to the map itself.
+    /// Consumes the entry and returns `&mut V` borrowed from the map.
     #[must_use]
     pub fn into_mut(self) -> &'a mut V {
         match self.location {
@@ -1719,8 +1704,7 @@ where
         self.remove_entry().1
     }
 
-    /// Removes the entry and returns the `(key, value)` pair. Mirrors the
-    /// bookkeeping done by [`FunnelHashMap::remove`].
+    /// Removes the entry and returns the `(key, value)` pair.
     #[must_use]
     pub fn remove_entry(self) -> (K, V) {
         let (removed_entry, needs_resize) = match self.location {
@@ -1766,9 +1750,7 @@ where
     }
 }
 
-/// View of a vacant entry — the key is not yet in the map. Holds a
-/// back-pointer plus the absent key. [`VacantEntry::insert`] consumes both
-/// to route the insert through the canonical insert path.
+/// View of a vacant entry in a [`FunnelHashMap`].
 pub struct VacantEntry<'a, K, V> {
     map: &'a mut FunnelHashMap<K, V>,
     key: K,
@@ -1790,9 +1772,7 @@ where
         self.key
     }
 
-    /// Inserts `value` for the entry's key, returning a mutable reference
-    /// to it. Routes the slot choice through the same funnel-descent logic
-    /// [`FunnelHashMap::insert`] uses, so placement invariants are preserved.
+    /// Inserts `value` for the entry's key, returning `&mut V`.
     pub fn insert(self, value: V) -> &'a mut V {
         let location = self
             .map
@@ -1882,13 +1862,11 @@ where
     }
 }
 
-/// Returned by [`FunnelHashMap::try_insert`] when the key was already in
-/// the map. Carries the existing entry plus the rejected value so the
-/// caller can recover both.
+/// Error returned by [`FunnelHashMap::try_insert`] on key collision.
 pub struct OccupiedError<'a, K, V> {
-    /// The conflicting entry already in the map.
+    /// The existing entry.
     pub entry: OccupiedEntry<'a, K, V>,
-    /// The value that was passed to `try_insert` and rejected.
+    /// The value that was rejected.
     pub value: V,
 }
 
