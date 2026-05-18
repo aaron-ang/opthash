@@ -2,6 +2,7 @@ use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash};
 
 use crate::common::DefaultHashBuilder;
+use crate::common::TryReserveError;
 use crate::common::simd::ProbeOps;
 
 use crate::common::{
@@ -113,6 +114,28 @@ impl<K, V> Level<K, V> {
             half_reserve_slot_threshold: floor_half_reserve_slots(reserve_fraction, capacity),
             limited_probe_budgets,
         }
+    }
+
+    /// Fallible counterpart to [`Level::with_capacity`].
+    fn try_with_capacity(
+        capacity: usize,
+        reserve_fraction: f64,
+        probe_scale: f64,
+        level_idx: usize,
+    ) -> Result<Self, TryReserveError> {
+        let table = RawTable::try_new(capacity).map_err(|()| TryReserveError::AllocError)?;
+        let group_count = table.group_count();
+        let limited_probe_budgets =
+            try_build_probe_budgets(capacity, group_count, reserve_fraction, probe_scale)?;
+        Ok(Self {
+            table,
+            len: 0,
+            salt: level_salt(level_idx),
+            group_count_mask: group_count.wrapping_sub(1),
+            tombstones: 0,
+            half_reserve_slot_threshold: floor_half_reserve_slots(reserve_fraction, capacity),
+            limited_probe_budgets,
+        })
     }
 
     #[inline]
@@ -292,11 +315,65 @@ where
         if needed <= self.max_insertions {
             return;
         }
+        let new_capacity = self.grow_capacity_for(needed);
+        self.resize(new_capacity);
+    }
+
+    /// Fallible counterpart to [`Self::reserve`]. Returns
+    /// `Err(TryReserveError::CapacityOverflow)` if `self.len + additional`
+    /// overflows `usize`, or `Err(TryReserveError::AllocError)` if the
+    /// allocator can't grow the table.
+    ///
+    /// # Errors
+    ///
+    /// See above.
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
+        let needed = self
+            .len
+            .checked_add(additional)
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        if needed <= self.max_insertions {
+            return Ok(());
+        }
+        let new_capacity = self.grow_capacity_for(needed);
+        self.try_resize(new_capacity)
+    }
+
+    /// Shrinks the capacity as much as possible while preserving all live
+    /// entries. Mirrors [`std::collections::HashMap::shrink_to_fit`].
+    pub fn shrink_to_fit(&mut self) {
+        self.shrink_to(0);
+    }
+
+    /// Shrinks the capacity with a lower bound. The table won't shrink below
+    /// the larger of `min_capacity` and `self.len`. Mirrors
+    /// [`std::collections::HashMap::shrink_to`].
+    pub fn shrink_to(&mut self, min_capacity: usize) {
+        if self.len == 0 && min_capacity == 0 {
+            if self.capacity > 0 {
+                self.resize(0);
+            }
+            return;
+        }
+        let lower = self.len.max(min_capacity).max(INITIAL_CAPACITY);
+        let mut new_capacity = INITIAL_CAPACITY;
+        while max_insertions(new_capacity, self.reserve_fraction) < lower {
+            new_capacity = new_capacity.saturating_mul(2);
+        }
+        if new_capacity >= self.capacity {
+            return;
+        }
+        self.resize(new_capacity);
+    }
+
+    /// Round up to the smallest capacity whose `max_insertions` accommodates
+    /// `needed` live entries. Used by `reserve` / `try_reserve`.
+    fn grow_capacity_for(&self, needed: usize) -> usize {
         let mut new_capacity = self.capacity.max(INITIAL_CAPACITY);
         while max_insertions(new_capacity, self.reserve_fraction) < needed {
             new_capacity = new_capacity.saturating_mul(2);
         }
-        self.resize(new_capacity);
+        new_capacity
     }
 
     /// # Panics
@@ -663,6 +740,82 @@ where
         *self = new_map;
     }
 
+    /// Fallible counterpart to [`Self::resize`] used by `try_reserve`.
+    ///
+    /// Builds the new (empty) backing storage with fallible allocation
+    /// *before* touching `self`, so an `Err` return leaves the map intact.
+    fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError> {
+        let hash_builder = self.hash_builder.clone();
+        let mut new_map = Self::try_with_options_and_hasher(
+            ElasticOptions {
+                capacity: new_capacity,
+                reserve_fraction: self.reserve_fraction,
+                probe_scale: self.probe_scale,
+            },
+            hash_builder,
+        )?;
+
+        for level in &mut self.levels {
+            for idx in 0..level.table.capacity() {
+                if level.table.control_at(idx).is_occupied() {
+                    let entry = unsafe { level.table.take(idx) };
+                    new_map.insert(entry.key, entry.value);
+                }
+            }
+            level.table.clear_all_controls();
+            level.len = 0;
+            level.tombstones = 0;
+        }
+
+        self.len = 0;
+        self.max_populated_level = 0;
+        *self = new_map;
+        Ok(())
+    }
+
+    /// Fallible counterpart to [`Self::with_options_and_hasher`]. Returns
+    /// `Err(TryReserveError::AllocError)` if any backing allocation fails.
+    fn try_with_options_and_hasher(
+        options: ElasticOptions,
+        hash_builder: DefaultHashBuilder,
+    ) -> Result<Self, TryReserveError> {
+        let reserve_fraction = sanitize_reserve_fraction(options.reserve_fraction);
+        let probe_scale = sanitize_probe_scale(options.probe_scale);
+        let capacity = options.capacity;
+        let max_insertions = max_insertions(capacity, reserve_fraction);
+
+        let level_capacities = partition_levels(capacity);
+        let mut levels: Vec<Level<K, V>> = Vec::new();
+        levels
+            .try_reserve_exact(level_capacities.len())
+            .map_err(|_| TryReserveError::AllocError)?;
+        for (level_idx, &cap) in level_capacities.iter().enumerate() {
+            levels.push(Level::try_with_capacity(
+                cap,
+                reserve_fraction,
+                probe_scale,
+                level_idx,
+            )?);
+        }
+
+        let batch_plan = build_batch_plan(&level_capacities, reserve_fraction, max_insertions);
+        let batch_remaining = batch_plan.first().copied().unwrap_or(0);
+
+        Ok(Self {
+            levels,
+            len: 0,
+            capacity,
+            max_insertions,
+            reserve_fraction,
+            probe_scale,
+            batch_plan,
+            current_batch_index: 0,
+            batch_remaining,
+            max_populated_level: 0,
+            hash_builder,
+        })
+    }
+
     #[inline]
     fn hash_key<Q>(&self, key: &Q) -> u64
     where
@@ -915,11 +1068,32 @@ fn sanitize_probe_scale(probe_scale: f64) -> f64 {
     }
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
+/// Fallible counterpart to [`build_probe_budgets`]. Returns
+/// `Err(TryReserveError::AllocError)` on allocation failure.
+fn try_build_probe_budgets(
+    capacity: usize,
+    group_count: usize,
+    reserve_fraction: f64,
+    probe_scale: f64,
+) -> Result<Box<[usize]>, TryReserveError> {
+    let mut budgets: Vec<usize> = Vec::new();
+    budgets
+        .try_reserve_exact(capacity.saturating_add(1))
+        .map_err(|_| TryReserveError::AllocError)?;
+    budgets.resize(capacity.saturating_add(1), 1);
+    if capacity == 0 {
+        return Ok(budgets.into_boxed_slice());
+    }
+    fill_probe_budgets(
+        &mut budgets,
+        capacity,
+        group_count,
+        reserve_fraction,
+        probe_scale,
+    );
+    Ok(budgets.into_boxed_slice())
+}
+
 fn build_probe_budgets(
     capacity: usize,
     group_count: usize,
@@ -930,7 +1104,28 @@ fn build_probe_budgets(
     if capacity == 0 {
         return budgets.into_boxed_slice();
     }
+    fill_probe_budgets(
+        &mut budgets,
+        capacity,
+        group_count,
+        reserve_fraction,
+        probe_scale,
+    );
+    budgets.into_boxed_slice()
+}
 
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn fill_probe_budgets(
+    budgets: &mut [usize],
+    capacity: usize,
+    group_count: usize,
+    reserve_fraction: f64,
+    probe_scale: f64,
+) {
     let max_budget = group_count.max(1);
     let cap_f = usize_to_f64(capacity);
     let log_cap = (1.0 / reserve_fraction).log2();
@@ -962,8 +1157,6 @@ fn build_probe_budgets(
             prev_end = threshold;
         }
     }
-
-    budgets.into_boxed_slice()
 }
 
 /// Split `total_capacity` into geometrically halving level sizes, then round
@@ -1389,5 +1582,106 @@ mod tests {
         assert!(map.get("alpha").is_none());
 
         assert!(map.remove_entry("alpha").is_none());
+    }
+
+    #[test]
+    fn try_reserve_grows_when_needed() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        assert_eq!(map.capacity(), 0);
+        map.try_reserve(1024).expect("alloc should succeed");
+        let cap = map.capacity();
+        assert!(cap >= 1024, "reserve under-allocated: cap={cap}");
+        for i in 0..1024 {
+            map.insert(i, i * 2);
+        }
+        for i in 0..1024 {
+            assert_eq!(map.get(&i), Some(&(i * 2)));
+        }
+        assert_eq!(map.len(), 1024);
+    }
+
+    #[test]
+    fn try_reserve_zero_additional_is_noop() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        let cap_before = map.capacity();
+        map.try_reserve(0).expect("noop");
+        assert_eq!(map.capacity(), cap_before);
+    }
+
+    #[test]
+    fn try_reserve_overflow_returns_error() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        map.insert(1, 1);
+        assert_eq!(
+            map.try_reserve(usize::MAX),
+            Err(TryReserveError::CapacityOverflow)
+        );
+    }
+
+    #[test]
+    fn shrink_to_below_len_clamps_to_len() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(2048);
+        for i in 0..100 {
+            map.insert(i, i);
+        }
+        let cap_before = map.capacity();
+        map.shrink_to(0);
+        let cap_after = map.capacity();
+        // Capacity dropped but all entries still queryable.
+        assert!(cap_after < cap_before);
+        assert!(cap_after >= map.len());
+        for i in 0..100 {
+            assert_eq!(map.get(&i), Some(&i));
+        }
+    }
+
+    #[test]
+    fn shrink_to_above_capacity_is_noop() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..10 {
+            map.insert(i, i);
+        }
+        let cap = map.capacity();
+        map.shrink_to(cap * 4);
+        assert_eq!(map.capacity(), cap);
+    }
+
+    #[test]
+    fn shrink_to_fit_reduces_capacity_when_sparse() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(2048);
+        for i in 0..1000 {
+            map.insert(i, i);
+        }
+        for i in 0..900 {
+            map.remove(&i);
+        }
+        let cap_before = map.capacity();
+        map.shrink_to_fit();
+        assert!(map.capacity() < cap_before);
+        for i in 900..1000 {
+            assert_eq!(map.get(&i), Some(&i));
+        }
+    }
+
+    #[test]
+    fn shrink_then_insert_works() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(1024);
+        for i in 0..200 {
+            map.insert(i, i * 3);
+        }
+        for i in 0..150 {
+            map.remove(&i);
+        }
+        map.shrink_to_fit();
+        // Reinserting into a freshly-shrunk map should land cleanly.
+        for i in 0..50 {
+            assert_eq!(map.insert(i, i * 5), None);
+        }
+        for i in 0..50 {
+            assert_eq!(map.get(&i), Some(&(i * 5)));
+        }
+        for i in 150..200 {
+            assert_eq!(map.get(&i), Some(&(i * 3)));
+        }
     }
 }

@@ -61,13 +61,7 @@ impl<T> Drop for RawTable<T> {
 impl<T> RawTable<T> {
     pub fn new(capacity: usize) -> Self {
         if capacity == 0 {
-            return Self {
-                data_ptr: NonNull::dangling(),
-                capacity: 0,
-                group_count: 0,
-                ctrl_offset: 0,
-                _marker: PhantomData,
-            };
+            return Self::empty();
         }
 
         let padded_capacity = round_up_to_group(capacity);
@@ -82,6 +76,40 @@ impl<T> RawTable<T> {
             capacity,
             group_count,
             ctrl_offset,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Fallible counterpart to [`RawTable::new`]. Returns `Err(())` instead
+    /// of aborting if the allocator fails; used by `try_reserve`.
+    pub fn try_new(capacity: usize) -> Result<Self, ()> {
+        if capacity == 0 {
+            return Ok(Self::empty());
+        }
+
+        let padded_capacity = round_up_to_group(capacity);
+        let group_count = padded_capacity / GROUP_SIZE;
+        let (layout, ctrl_offset) = Self::unified_layout(capacity, group_count);
+
+        let raw = unsafe { alloc::alloc_zeroed(layout) };
+        let data_ptr = NonNull::new(raw).ok_or(())?;
+
+        Ok(Self {
+            data_ptr,
+            capacity,
+            group_count,
+            ctrl_offset,
+            _marker: PhantomData,
+        })
+    }
+
+    #[inline]
+    fn empty() -> Self {
+        Self {
+            data_ptr: NonNull::dangling(),
+            capacity: 0,
+            group_count: 0,
+            ctrl_offset: 0,
             _marker: PhantomData,
         }
     }
