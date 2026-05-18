@@ -179,11 +179,6 @@ pub struct ElasticHashMap<K, V> {
     batch_remaining: usize,
     /// Highest level index ever written; bounds the lookup probe loop.
     max_populated_level: usize,
-    /// While true, `remove` skips the tombstone-cleanup resize so a bulk-op
-    /// iterator (`drain`, `extract_if`, `retain`) can safely hold a
-    /// `(level_idx, slot_idx)` cursor across many removals. Cleared (and a
-    /// deferred resize applied) when the iterator drops.
-    resize_suppressed: bool,
     /// Hash builder. Cloned across resizes to preserve probe sequences.
     hash_builder: DefaultHashBuilder,
 }
@@ -271,7 +266,6 @@ where
             current_batch_index: 0,
             batch_remaining,
             max_populated_level: 0,
-            resize_suppressed: false,
             hash_builder,
         }
     }
@@ -483,7 +477,7 @@ where
         };
 
         self.len -= 1;
-        let needs_resize = !self.resize_suppressed && self.levels[level_idx].needs_cleanup();
+        let needs_resize = self.levels[level_idx].needs_cleanup();
         self.shrink_max_populated_level();
         if needs_resize {
             self.resize(self.capacity);
@@ -660,7 +654,6 @@ where
     /// Mirrors [`std::collections::HashMap::drain`]: entries left in the
     /// iterator at drop time are still dropped — the map is empty afterwards.
     pub fn drain(&mut self) -> Drain<'_, K, V> {
-        self.resize_suppressed = true;
         Drain {
             map: self,
             level_idx: 0,
@@ -677,7 +670,6 @@ where
     where
         F: FnMut(&K, &mut V) -> bool,
     {
-        self.resize_suppressed = true;
         ExtractIf {
             map: self,
             pred: f,
@@ -981,9 +973,12 @@ impl<K, V> Iterator for Drain<'_, K, V> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.map.len))
+        (self.map.len, Some(self.map.len))
     }
 }
+
+impl<K, V> ExactSizeIterator for Drain<'_, K, V> {}
+impl<K, V> std::iter::FusedIterator for Drain<'_, K, V> {}
 
 impl<K, V> Drop for Drain<'_, K, V> {
     fn drop(&mut self) {
@@ -1003,7 +998,6 @@ impl<K, V> Drop for Drain<'_, K, V> {
         self.map.max_populated_level = 0;
         self.map.current_batch_index = 0;
         self.map.batch_remaining = self.map.batch_plan.first().copied().unwrap_or(0);
-        self.map.resize_suppressed = false;
     }
 }
 
@@ -1076,10 +1070,8 @@ where
     F: FnMut(&K, &mut V) -> bool,
 {
     fn drop(&mut self) {
-        // Per std, dropping `extract_if` without exhausting leaves the
-        // remaining (unvisited) entries in the map. Only consolidate any
-        // tombstone backlog from already-removed entries.
-        self.map.resize_suppressed = false;
+        // Dropping `extract_if` early leaves unvisited entries in the map.
+        // Only consolidate any tombstone backlog from already-removed entries.
         self.map.resize_if_needed();
     }
 }
@@ -2659,9 +2651,9 @@ mod tests {
 
     #[test]
     fn retain_does_not_trigger_mid_iter_resize_with_clustered_tombstones() {
-        // Stress the resize-suppression guard: build a small map past the
-        // cleanup threshold and retain half. A naive (unguarded) impl would
-        // invoke `resize` mid-walk, invalidating the iterator cursor.
+        // Build a small map past the cleanup threshold and retain half. The
+        // bulk-op iterators bypass `remove`, so the per-remove resize check
+        // can't fire mid-walk; this test guards that invariant.
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(256);
         let cap = i32::try_from(map.capacity()).expect("test capacity fits i32");
         let n = cap * 2 / 3;

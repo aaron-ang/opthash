@@ -318,11 +318,6 @@ pub struct FunnelHashMap<K, V> {
     primary_probe_limit: usize,
     /// Highest level index ever written; bounds the lookup probe loop.
     max_populated_level: usize,
-    /// While true, `remove` skips the tombstone-cleanup resize so a bulk-op
-    /// iterator (`drain`, `extract_if`, `retain`) can safely hold a slot
-    /// cursor across many removals. Cleared (and a deferred resize applied)
-    /// when the iterator drops.
-    resize_suppressed: bool,
     /// Hash builder. Cloned across resizes to preserve probe sequences.
     hash_builder: DefaultHashBuilder,
 }
@@ -424,7 +419,6 @@ where
             reserve_fraction,
             primary_probe_limit,
             max_populated_level: 0,
-            resize_suppressed: false,
             hash_builder,
         }
     }
@@ -734,7 +728,7 @@ where
 
         self.len -= 1;
         self.shrink_max_populated_level();
-        if needs_resize && !self.resize_suppressed {
+        if needs_resize {
             self.resize(self.capacity);
         }
         Some((removed_entry.key, removed_entry.value))
@@ -888,7 +882,6 @@ where
     /// Mirrors [`std::collections::HashMap::drain`]: entries left in the
     /// iterator at drop time are still dropped — the map is empty afterwards.
     pub fn drain(&mut self) -> Drain<'_, K, V> {
-        self.resize_suppressed = true;
         Drain {
             map: self,
             phase: DrainPhase::Levels,
@@ -906,7 +899,6 @@ where
     where
         F: FnMut(&K, &mut V) -> bool,
     {
-        self.resize_suppressed = true;
         ExtractIf {
             map: self,
             pred: f,
@@ -917,8 +909,7 @@ where
     }
 
     /// Triggers a no-grow rehash if any region crossed its cleanup threshold
-    /// while resize was suppressed. Called once from each bulk-op iterator's
-    /// `Drop`.
+    /// during a bulk op. Called once from each bulk-op iterator's `Drop`.
     fn resize_if_needed(&mut self) {
         let level_dirty = self
             .levels
@@ -2164,9 +2155,12 @@ impl<K, V> Iterator for Drain<'_, K, V> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.map.len))
+        (self.map.len, Some(self.map.len))
     }
 }
+
+impl<K, V> ExactSizeIterator for Drain<'_, K, V> {}
+impl<K, V> std::iter::FusedIterator for Drain<'_, K, V> {}
 
 impl<K, V> Drop for Drain<'_, K, V> {
     fn drop(&mut self) {
@@ -2189,7 +2183,6 @@ impl<K, V> Drop for Drain<'_, K, V> {
         self.map.special.fallback.tombstones = 0;
         self.map.len = 0;
         self.map.max_populated_level = 0;
-        self.map.resize_suppressed = false;
     }
 }
 
@@ -2312,7 +2305,6 @@ where
     fn drop(&mut self) {
         // Dropping `extract_if` early leaves unvisited entries in the map.
         // Only consolidate any tombstone backlog from already-removed entries.
-        self.map.resize_suppressed = false;
         self.map.resize_if_needed();
     }
 }
@@ -3712,9 +3704,9 @@ mod tests {
 
     #[test]
     fn retain_does_not_trigger_mid_iter_resize_with_clustered_tombstones() {
-        // Stress the resize-suppression guard: pack the map to a high load
-        // and retain half. A naive (unguarded) impl would invoke `resize`
-        // mid-walk, invalidating the iterator's slot cursor.
+        // Pack the map to a high load and retain half. The bulk-op iterators
+        // bypass `remove`, so the per-remove resize check can't fire mid-walk;
+        // this test guards that invariant.
         let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(1024);
         let max = i32::try_from(max_insertions(map.capacity(), DEFAULT_RESERVE_FRACTION))
             .expect("test capacity fits i32");
