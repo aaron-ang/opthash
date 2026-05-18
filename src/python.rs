@@ -1,4 +1,6 @@
 #![cfg(feature = "python")]
+// Raw-pointer casts in pyo3 macro expansions. Per-fn `#[allow]` doesn't reach
+// the generated wrapper, so suppression must be file-level.
 #![allow(clippy::ptr_as_ptr, clippy::borrow_as_ptr, clippy::ref_as_ptr)]
 
 use std::hash::{Hash, Hasher};

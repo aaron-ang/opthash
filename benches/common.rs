@@ -1,4 +1,6 @@
-#![allow(dead_code, clippy::must_use_candidate)]
+// `mod common;` is included by each bench binary; items unused in one binary
+// may be used in another, so `dead_code` has to be suppressed module-wide.
+#![allow(dead_code)]
 
 use std::collections::HashMap as StdHashMap;
 
@@ -15,10 +17,12 @@ pub const VALUE_XOR_MIX: u64 = 0xA5A5_A5A5_A5A5_A5A5;
 /// replacement values as distinct from the initial value mix.
 pub const VALUE_XOR_MIX_ALT: u64 = 0x5A5A_5A5A_5A5A_5A5A;
 
+#[must_use]
 pub fn key_at(index: usize) -> u64 {
     (index as u64).wrapping_mul(GOLDEN_RATIO_U64)
 }
 
+#[must_use]
 pub fn make_pairs(count: usize) -> Vec<(u64, u64)> {
     (0..count)
         .map(|idx| {
@@ -28,6 +32,7 @@ pub fn make_pairs(count: usize) -> Vec<(u64, u64)> {
         .collect()
 }
 
+#[must_use]
 pub fn build_std_map(pairs: &[(u64, u64)]) -> StdHashMap<u64, u64> {
     let mut map = StdHashMap::with_capacity(pairs.len() * 2);
     for &(key, value) in pairs {
@@ -36,6 +41,7 @@ pub fn build_std_map(pairs: &[(u64, u64)]) -> StdHashMap<u64, u64> {
     map
 }
 
+#[must_use]
 pub fn build_elastic_map(pairs: &[(u64, u64)]) -> ElasticHashMap<u64, u64> {
     let mut map = ElasticHashMap::with_capacity(pairs.len() * 2);
     for &(key, value) in pairs {
@@ -44,6 +50,7 @@ pub fn build_elastic_map(pairs: &[(u64, u64)]) -> ElasticHashMap<u64, u64> {
     map
 }
 
+#[must_use]
 pub fn build_funnel_map(pairs: &[(u64, u64)]) -> FunnelHashMap<u64, u64> {
     let mut map = FunnelHashMap::with_capacity(pairs.len() * 2);
     for &(key, value) in pairs {
@@ -52,6 +59,7 @@ pub fn build_funnel_map(pairs: &[(u64, u64)]) -> FunnelHashMap<u64, u64> {
     map
 }
 
+#[must_use]
 pub fn build_hashbrown_map(pairs: &[(u64, u64)]) -> HashbrownMap<u64, u64> {
     let mut map = HashbrownMap::with_capacity(pairs.len() * 2);
     for &(key, value) in pairs {
@@ -60,6 +68,7 @@ pub fn build_hashbrown_map(pairs: &[(u64, u64)]) -> HashbrownMap<u64, u64> {
     map
 }
 
+#[must_use]
 pub fn size_label(size: usize) -> String {
     if size >= 1_000_000 {
         format!("{}M", size / 1_000_000)

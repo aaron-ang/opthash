@@ -1,5 +1,3 @@
-#![allow(clippy::cast_ptr_alignment)]
-
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{
     uint8x16_t, vandq_u8, vceqq_u8, vdupq_n_u8, vget_lane_u64, vld1q_u8, vreinterpret_u64_u8,
@@ -332,11 +330,7 @@ unsafe fn free_mask_16_neon(ptr: *const u8) -> BitMask {
     }
 }
 
-#[allow(
-    clippy::cast_possible_wrap,
-    clippy::cast_ptr_alignment,
-    clippy::cast_sign_loss
-)]
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn eq_mask_16_sse2(ptr: *const u8, target: u8) -> BitMask {
@@ -351,11 +345,7 @@ unsafe fn eq_mask_16_sse2(ptr: *const u8, target: u8) -> BitMask {
     }
 }
 
-#[allow(
-    clippy::cast_possible_wrap,
-    clippy::cast_ptr_alignment,
-    clippy::cast_sign_loss
-)]
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn free_mask_16_sse2(ptr: *const u8) -> BitMask {
@@ -370,7 +360,7 @@ unsafe fn free_mask_16_sse2(ptr: *const u8) -> BitMask {
     }
 }
 
-#[allow(clippy::cast_possible_wrap, clippy::cast_ptr_alignment)]
+#[allow(clippy::cast_possible_wrap)]
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn eq_mask_32_avx2(ptr: *const u8, target: u8) -> u32 {
