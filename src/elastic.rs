@@ -660,15 +660,15 @@ impl<K, V> std::fmt::Debug for Values<'_, K, V> {
 /// `(&K, &mut V)` iterator. Walks levels in storage order, skipping FREE
 /// and TOMBSTONE slots.
 ///
-/// SAFETY: raw pointer + `PhantomData<&'a mut Level<K, V>>` ties the
-/// iterator to the exclusive borrow of the map. Each `next()` returns a
-/// borrow of a strictly newer slot, so produced references are disjoint.
+/// SAFETY: raw pointer + `PhantomData<&'a mut ElasticHashMap<K, V>>` ties
+/// the iterator to the exclusive borrow of the map. Each `next()` returns
+/// a borrow of a strictly newer slot, so produced references are disjoint.
 pub struct ElasticIterMut<'a, K, V> {
     levels: *mut Level<K, V>,
     levels_len: usize,
     level_idx: usize,
     slot_idx: usize,
-    _marker: std::marker::PhantomData<&'a mut Level<K, V>>,
+    _marker: std::marker::PhantomData<&'a mut ElasticHashMap<K, V>>,
 }
 
 // SAFETY: behaves as `&mut [Level<K, V>]` for its lifetime.
