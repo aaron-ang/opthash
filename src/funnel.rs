@@ -823,7 +823,11 @@ where
                 location,
             })
         } else {
-            Entry::Vacant(VacantEntry { map: self, key })
+            Entry::Vacant(VacantEntry {
+                map: self,
+                key,
+                key_hash,
+            })
         }
     }
 
@@ -846,8 +850,7 @@ where
     /// Insert path for a key already known to be absent. Routes the slot
     /// choice through `choose_slot_for_new_key` so funnel-descent placement
     /// is preserved, then returns the chosen slot location.
-    fn insert_for_vacant_entry(&mut self, key: K, value: V) -> SlotLocation {
-        let key_hash = self.hash_key(&key);
+    fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> SlotLocation {
         let key_fingerprint = ControlOps::control_fingerprint(key_hash);
 
         let mut location = if self.len < self.max_insertions {
@@ -1769,6 +1772,7 @@ where
 pub struct VacantEntry<'a, K, V> {
     map: &'a mut FunnelHashMap<K, V>,
     key: K,
+    key_hash: u64,
 }
 
 impl<'a, K, V> VacantEntry<'a, K, V>
@@ -1790,7 +1794,9 @@ where
     /// to it. Routes the slot choice through the same funnel-descent logic
     /// [`FunnelHashMap::insert`] uses, so placement invariants are preserved.
     pub fn insert(self, value: V) -> &'a mut V {
-        let location = self.map.insert_for_vacant_entry(self.key, value);
+        let location = self
+            .map
+            .insert_for_vacant_entry(self.key, value, self.key_hash);
         match location {
             SlotLocation::Level {
                 level_idx,

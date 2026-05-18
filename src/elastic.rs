@@ -588,7 +588,11 @@ where
                 slot_idx,
             })
         } else {
-            Entry::Vacant(VacantEntry { map: self, key })
+            Entry::Vacant(VacantEntry {
+                map: self,
+                key,
+                key_hash,
+            })
         }
     }
 
@@ -612,8 +616,7 @@ where
     /// post-lookup half of [`ElasticHashMap::insert`] so the `batch_plan`
     /// placement invariant is preserved, then returns the slot location so
     /// the caller can hand back a mutable reference without re-probing.
-    fn insert_for_vacant_entry(&mut self, key: K, value: V) -> (usize, usize) {
-        let key_hash = self.hash_key(&key);
+    fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
         let key_fingerprint = ControlOps::control_fingerprint(key_hash);
 
         if self.len >= self.max_insertions {
@@ -762,6 +765,7 @@ where
 pub struct VacantEntry<'a, K, V> {
     map: &'a mut ElasticHashMap<K, V>,
     key: K,
+    key_hash: u64,
 }
 
 impl<'a, K, V> VacantEntry<'a, K, V>
@@ -785,7 +789,9 @@ where
     /// (a new key targets the batch-selected level pair, not where the
     /// lookup probe landed) is preserved.
     pub fn insert(self, value: V) -> &'a mut V {
-        let (level_idx, slot_idx) = self.map.insert_for_vacant_entry(self.key, value);
+        let (level_idx, slot_idx) =
+            self.map
+                .insert_for_vacant_entry(self.key, value, self.key_hash);
         unsafe { &mut self.map.levels[level_idx].table.get_mut(slot_idx).value }
     }
 }
