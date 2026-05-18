@@ -8,15 +8,11 @@ pub(crate) mod simd;
 pub type DefaultHashBuilder = foldhash::fast::RandomState;
 
 /// Error returned by `try_reserve` when the map can't grow.
-///
-/// Mirrors the role of [`std::collections::TryReserveError`]. We use a local
-/// type because std's error has private fields and no stable constructor,
-/// so library code can't build one from a raw allocation failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TryReserveError {
-    /// Computing the new capacity overflowed `usize`.
+    /// Capacity computation overflowed `usize`.
     CapacityOverflow,
-    /// The allocator failed to satisfy the request.
+    /// Allocator failed.
     AllocError,
 }
 

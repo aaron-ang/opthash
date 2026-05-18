@@ -324,14 +324,12 @@ where
         self.resize(new_capacity);
     }
 
-    /// Fallible counterpart to [`Self::reserve`]. Returns
-    /// `Err(TryReserveError::CapacityOverflow)` if `self.len + additional`
-    /// overflows `usize`, or `Err(TryReserveError::AllocError)` if the
-    /// allocator can't grow the table.
+    /// Fallible counterpart to [`Self::reserve`].
     ///
     /// # Errors
     ///
-    /// See above.
+    /// [`TryReserveError::CapacityOverflow`] if `self.len + additional`
+    /// overflows; [`TryReserveError::AllocError`] on allocator failure.
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
         let needed = self
             .len
@@ -358,8 +356,8 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if `min_capacity` exceeds any representable capacity (i.e.,
-    /// no `usize` capacity satisfies `max_insertions(cap) >= min_capacity`).
+    /// Panics if no representable capacity satisfies
+    /// `max_insertions(cap) >= min_capacity`.
     pub fn shrink_to(&mut self, min_capacity: usize) {
         if self.len == 0 && min_capacity == 0 {
             if self.capacity > 0 {
@@ -751,10 +749,8 @@ where
         *self = new_map;
     }
 
-    /// Fallible counterpart to [`Self::resize`] used by `try_reserve`.
-    ///
-    /// Builds the new (empty) backing storage with fallible allocation
-    /// *before* touching `self`, so an `Err` return leaves the map intact.
+    /// Fallible counterpart to [`Self::resize`]. Allocates the new backing
+    /// storage before touching `self`, so `Err` leaves the map intact.
     fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError> {
         let hash_builder = self.hash_builder.clone();
         let mut new_map = Self::try_with_options_and_hasher(
