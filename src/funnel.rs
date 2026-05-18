@@ -152,15 +152,12 @@ struct SpecialPrimary<K, V> {
     table: RawTable<Entry<K, V>>,
     /// Live entry count.
     len: usize,
-    /// Total tombstone count across all groups; drives the global
-    /// 50%-capacity resize trigger.
+    /// Total tombstones; drives the global 50%-capacity resize trigger.
     tombstones: usize,
     /// `group_count - 1`. Pow2 by construction.
     group_count_mask: usize,
     /// Per-group packed fingerprint metadata for fast scans.
     group_summaries: Box<[u128]>,
-    /// Per-group tombstone count, gates `StopSearch` during probing.
-    group_tombstones: Box<[usize]>,
 }
 
 impl<K, V> SpecialPrimary<K, V> {
@@ -178,7 +175,6 @@ impl<K, V> SpecialPrimary<K, V> {
             tombstones: 0,
             group_count_mask: group_count.saturating_sub(1),
             group_summaries: vec![0; group_count].into_boxed_slice(),
-            group_tombstones: vec![0; group_count].into_boxed_slice(),
         }
     }
 }
@@ -711,12 +707,10 @@ where
                 (removed, needs_resize)
             }
             SlotLocation::SpecialPrimary { slot_idx } => {
-                let group_idx = slot_idx / GROUP_SIZE;
                 let primary = &mut self.special.primary;
                 let removed = unsafe { primary.table.take(slot_idx) };
                 primary.table.mark_tombstone(slot_idx);
                 primary.len -= 1;
-                primary.group_tombstones[group_idx] += 1;
                 primary.tombstones += 1;
                 let needs_resize = primary.tombstones > primary.table.capacity() / 2;
                 (removed, needs_resize)
@@ -791,7 +785,6 @@ where
         self.special.primary.len = 0;
         self.special.primary.tombstones = 0;
         self.special.primary.group_summaries.fill(0);
-        self.special.primary.group_tombstones.fill(0);
 
         for idx in 0..self.special.fallback.table.capacity() {
             if self.special.fallback.table.control_at(idx).is_occupied() {
@@ -834,7 +827,6 @@ where
         self.special.primary.len = 0;
         self.special.primary.tombstones = 0;
         self.special.primary.group_summaries.fill(0);
-        self.special.primary.group_tombstones.fill(0);
 
         for idx in 0..self.special.fallback.table.capacity() {
             if self.special.fallback.table.control_at(idx).is_occupied() {
@@ -885,13 +877,9 @@ where
         ProbeOps::hash_to_usize(key_hash.rotate_left(11)) & mask
     }
 
-    /// Per-key odd step over the pow2 `group_count`. Forcing the low bit
-    /// makes the step coprime to any power of two, so iterating
-    /// `group_idx = (group_idx + step) & mask` visits every group within
-    /// `group_count` iterations. Restores probe-path diversity that the
-    /// fixed-step triangular probe (g, g+1, g+3, g+6, …) lost when it
-    /// replaced double hashing — all keys sharing a start group then walked
-    /// the same path, concentrating tombstones under delete-heavy workloads.
+    /// Per-key odd step over the pow2 `group_count`. The `| 1` forces odd ⇒
+    /// coprime to pow2 ⇒ `(group_idx + step) & mask` visits every group
+    /// within `group_count` iterations.
     #[inline]
     fn special_primary_step(&self, key_hash: u64) -> usize {
         let mask = self.special.primary.group_count_mask;
@@ -1050,10 +1038,8 @@ where
             SlotLocation::SpecialPrimary { slot_idx } => {
                 let group_idx = slot_idx / GROUP_SIZE;
                 let primary = &mut self.special.primary;
-                // Reusing a tombstone slot must decrement the tombstone
-                // counters (global + per-group); otherwise resize triggers
-                // prematurely and the per-group `StopSearch` early-exit at
-                // find_in_special_primary never re-enables.
+                // Reusing a tombstone slot must decrement the counter;
+                // otherwise resize triggers on stale-since-resize counts.
                 let was_tombstone = primary.table.control_at(slot_idx) == CTRL_TOMBSTONE;
                 primary
                     .table
@@ -1062,7 +1048,6 @@ where
                 primary.group_summaries[group_idx] |= ControlOps::fingerprint_bit(key_fingerprint);
                 if was_tombstone {
                     primary.tombstones -= 1;
-                    primary.group_tombstones[group_idx] -= 1;
                 }
             }
             SlotLocation::SpecialFallback { slot_idx } => {
@@ -1288,8 +1273,11 @@ where
                     }
                 }
             }
-            if primary.group_tombstones[group_idx] == 0
-                && primary.table.first_free_in_group(group_idx).is_some()
+            if !primary
+                .table
+                .group_match_mask(group_idx, CTRL_TOMBSTONE)
+                .any()
+                && primary.table.group_match_mask(group_idx, CTRL_EMPTY).any()
             {
                 return LookupStep::StopSearch;
             }
@@ -1331,9 +1319,17 @@ where
         let mut group_idx = self.special_primary_group_start(key_hash);
         let step = self.special_primary_step(key_hash);
         for _ in 0..group_limit {
-            if candidate.is_none() {
-                candidate = primary.table.first_free_in_group(group_idx);
-            }
+            // Cache the free-in-group result so candidate-population and
+            // StopSearch share one SIMD scan per group.
+            let free_in_group = if candidate.is_none() {
+                let slot = primary.table.first_free_in_group(group_idx);
+                if let Some(slot) = slot {
+                    candidate = Some(slot);
+                }
+                slot.is_some()
+            } else {
+                primary.table.group_match_mask(group_idx, CTRL_EMPTY).any()
+            };
             if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
                 for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
                     let slot_idx = group_idx * GROUP_SIZE + relative_idx;
@@ -1343,8 +1339,11 @@ where
                     }
                 }
             }
-            if primary.group_tombstones[group_idx] == 0
-                && primary.table.first_free_in_group(group_idx).is_some()
+            if free_in_group
+                && !primary
+                    .table
+                    .group_match_mask(group_idx, CTRL_TOMBSTONE)
+                    .any()
             {
                 return (LookupStep::StopSearch, candidate);
             }
