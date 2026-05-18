@@ -764,6 +764,47 @@ where
         }
     }
 
+    /// Mutable iterator yielding `(&K, &mut V)`. Mirrors `HashMap::iter_mut`.
+    pub fn iter_mut(&mut self) -> FunnelIterMut<'_, K, V> {
+        let levels_len = self.levels.len();
+        let levels = self.levels.as_mut_ptr();
+        let primary = std::ptr::from_mut(&mut self.special.primary);
+        let fallback = std::ptr::from_mut(&mut self.special.fallback);
+        FunnelIterMut {
+            levels,
+            levels_len,
+            primary,
+            fallback,
+            phase: FunnelIterPhase::Levels,
+            level_idx: 0,
+            slot_idx: 0,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Mutable iterator yielding `&mut V`. Mirrors `HashMap::values_mut`.
+    pub fn values_mut(&mut self) -> FunnelValuesMut<'_, K, V> {
+        FunnelValuesMut {
+            inner: self.iter_mut(),
+        }
+    }
+
+    /// Consuming iterator yielding owned keys. Mirrors `HashMap::into_keys`.
+    #[must_use]
+    pub fn into_keys(self) -> FunnelIntoKeys<K, V> {
+        FunnelIntoKeys {
+            inner: self.into_iter(),
+        }
+    }
+
+    /// Consuming iterator yielding owned values. Mirrors `HashMap::into_values`.
+    #[must_use]
+    pub fn into_values(self) -> FunnelIntoValues<K, V> {
+        FunnelIntoValues {
+            inner: self.into_iter(),
+        }
+    }
+
     pub fn clear(&mut self) {
         for level in &mut self.levels {
             for idx in 0..level.table.capacity() {
@@ -1602,7 +1643,7 @@ where
     }
 }
 
-/// Borrowing iterator over `&K`, returned by [`FunnelHashMap::keys`].
+/// `&K` iterator returned by [`FunnelHashMap::keys`].
 #[derive(Clone)]
 pub struct Keys<'a, K, V> {
     inner: FunnelIter<'a, K, V>,
@@ -1622,7 +1663,7 @@ impl<K, V> std::fmt::Debug for Keys<'_, K, V> {
     }
 }
 
-/// Borrowing iterator over `&V`, returned by [`FunnelHashMap::values`].
+/// `&V` iterator returned by [`FunnelHashMap::values`].
 #[derive(Clone)]
 pub struct Values<'a, K, V> {
     inner: FunnelIter<'a, K, V>,
@@ -1639,6 +1680,306 @@ impl<'a, K, V> Iterator for Values<'a, K, V> {
 impl<K, V> std::fmt::Debug for Values<'_, K, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Values").finish_non_exhaustive()
+    }
+}
+
+/// `(&K, &mut V)` iterator. Visits bucket levels → special primary →
+/// special fallback. Skips FREE / TOMBSTONE.
+///
+/// SAFETY: raw pointers to each region + `PhantomData<&'a mut FunnelHashMap>`
+/// tie the iterator to the map's exclusive borrow. Each `next()` returns a
+/// borrow of a strictly newer slot ⇒ disjoint.
+pub struct FunnelIterMut<'a, K, V> {
+    levels: *mut BucketLevel<K, V>,
+    levels_len: usize,
+    primary: *mut SpecialPrimary<K, V>,
+    fallback: *mut SpecialFallback<K, V>,
+    phase: FunnelIterPhase,
+    level_idx: usize,
+    slot_idx: usize,
+    _marker: std::marker::PhantomData<&'a mut FunnelHashMap<K, V>>,
+}
+
+// SAFETY: `FunnelIterMut` acts as an exclusive borrow of the underlying
+// map regions for its lifetime, matching `&mut FunnelHashMap<K, V>`.
+unsafe impl<K: Send, V: Send> Send for FunnelIterMut<'_, K, V> {}
+unsafe impl<K: Sync, V: Sync> Sync for FunnelIterMut<'_, K, V> {}
+
+impl<'a, K, V> Iterator for FunnelIterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.phase {
+                FunnelIterPhase::Levels => {
+                    while self.level_idx < self.levels_len {
+                        // SAFETY: `level_idx < levels_len`, and `self.levels`
+                        // points at a slice of `levels_len` initialized
+                        // `BucketLevel`s owned by the borrowed map. We hold
+                        // an exclusive borrow for `'a` (via PhantomData).
+                        let level = unsafe { &mut *self.levels.add(self.level_idx) };
+                        let cap = level.table.capacity();
+                        while self.slot_idx < cap {
+                            let idx = self.slot_idx;
+                            self.slot_idx += 1;
+                            if level.table.control_at(idx).is_occupied() {
+                                // SAFETY: occupied control byte ⇒ valid
+                                // `Entry<K, V>`. We never revisit this slot,
+                                // so the returned borrows stay disjoint.
+                                let entry = unsafe { level.table.get_mut(idx) };
+                                let key: &'a K = unsafe { &*std::ptr::from_ref(&entry.key) };
+                                let val: &'a mut V =
+                                    unsafe { &mut *std::ptr::from_mut(&mut entry.value) };
+                                return Some((key, val));
+                            }
+                        }
+                        self.level_idx += 1;
+                        self.slot_idx = 0;
+                    }
+                    self.phase = FunnelIterPhase::Primary;
+                    self.slot_idx = 0;
+                }
+                FunnelIterPhase::Primary => {
+                    // SAFETY: `self.primary` points at the borrowed map's
+                    // `SpecialPrimary` for `'a`. We mutably alias only via
+                    // this iterator, and only one outstanding `&mut` exists.
+                    let primary = unsafe { &mut *self.primary };
+                    let cap = primary.table.capacity();
+                    while self.slot_idx < cap {
+                        let idx = self.slot_idx;
+                        self.slot_idx += 1;
+                        if primary.table.control_at(idx).is_occupied() {
+                            // SAFETY: see above; occupied ⇒ valid entry,
+                            // distinct slot each call.
+                            let entry = unsafe { primary.table.get_mut(idx) };
+                            let key: &'a K = unsafe { &*std::ptr::from_ref(&entry.key) };
+                            let val: &'a mut V =
+                                unsafe { &mut *std::ptr::from_mut(&mut entry.value) };
+                            return Some((key, val));
+                        }
+                    }
+                    self.phase = FunnelIterPhase::Fallback;
+                    self.slot_idx = 0;
+                }
+                FunnelIterPhase::Fallback => {
+                    // SAFETY: same as the Primary arm, for `self.fallback`.
+                    let fallback = unsafe { &mut *self.fallback };
+                    let cap = fallback.table.capacity();
+                    while self.slot_idx < cap {
+                        let idx = self.slot_idx;
+                        self.slot_idx += 1;
+                        if fallback.table.control_at(idx).is_occupied() {
+                            // SAFETY: occupied ⇒ valid entry, distinct slot.
+                            let entry = unsafe { fallback.table.get_mut(idx) };
+                            let key: &'a K = unsafe { &*std::ptr::from_ref(&entry.key) };
+                            let val: &'a mut V =
+                                unsafe { &mut *std::ptr::from_mut(&mut entry.value) };
+                            return Some((key, val));
+                        }
+                    }
+                    self.phase = FunnelIterPhase::Done;
+                }
+                FunnelIterPhase::Done => return None,
+            }
+        }
+    }
+}
+
+impl<K, V> std::fmt::Debug for FunnelIterMut<'_, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FunnelIterMut")
+            .field("level_idx", &self.level_idx)
+            .field("slot_idx", &self.slot_idx)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a mut FunnelHashMap<K, V>
+where
+    K: Eq + Hash,
+{
+    type Item = (&'a K, &'a mut V);
+    type IntoIter = FunnelIterMut<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+/// `&mut V` iterator returned by [`FunnelHashMap::values_mut`].
+pub struct FunnelValuesMut<'a, K, V> {
+    inner: FunnelIterMut<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for FunnelValuesMut<'a, K, V> {
+    type Item = &'a mut V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(_, v)| v)
+    }
+}
+
+impl<K, V> std::fmt::Debug for FunnelValuesMut<'_, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FunnelValuesMut")
+            .field("level_idx", &self.inner.level_idx)
+            .field("slot_idx", &self.inner.slot_idx)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Owned `(K, V)` iterator returned by `FunnelHashMap::into_iter`.
+///
+/// SAFETY: each yielded slot is immediately tombstoned, so the map's
+/// `Drop` never revisits it. `Drop` drains the remainder per std semantics.
+pub struct FunnelIntoIter<K, V> {
+    map: FunnelHashMap<K, V>,
+    phase: FunnelIterPhase,
+    level_idx: usize,
+    slot_idx: usize,
+}
+
+impl<K, V> Iterator for FunnelIntoIter<K, V> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.phase {
+                FunnelIterPhase::Levels => {
+                    while self.level_idx < self.map.levels.len() {
+                        let level = &mut self.map.levels[self.level_idx];
+                        let cap = level.table.capacity();
+                        while self.slot_idx < cap {
+                            let idx = self.slot_idx;
+                            self.slot_idx += 1;
+                            if level.table.control_at(idx).is_occupied() {
+                                // SAFETY: occupied ⇒ valid entry. Move it
+                                // out and tombstone the slot so the map's
+                                // `Drop` skips it.
+                                let entry = unsafe { level.table.take(idx) };
+                                level.table.mark_tombstone(idx);
+                                return Some((entry.key, entry.value));
+                            }
+                        }
+                        self.level_idx += 1;
+                        self.slot_idx = 0;
+                    }
+                    self.phase = FunnelIterPhase::Primary;
+                    self.slot_idx = 0;
+                }
+                FunnelIterPhase::Primary => {
+                    let table = &mut self.map.special.primary.table;
+                    let cap = table.capacity();
+                    while self.slot_idx < cap {
+                        let idx = self.slot_idx;
+                        self.slot_idx += 1;
+                        if table.control_at(idx).is_occupied() {
+                            // SAFETY: same as Levels arm.
+                            let entry = unsafe { table.take(idx) };
+                            table.mark_tombstone(idx);
+                            return Some((entry.key, entry.value));
+                        }
+                    }
+                    self.phase = FunnelIterPhase::Fallback;
+                    self.slot_idx = 0;
+                }
+                FunnelIterPhase::Fallback => {
+                    let table = &mut self.map.special.fallback.table;
+                    let cap = table.capacity();
+                    while self.slot_idx < cap {
+                        let idx = self.slot_idx;
+                        self.slot_idx += 1;
+                        if table.control_at(idx).is_occupied() {
+                            // SAFETY: same as Levels arm.
+                            let entry = unsafe { table.take(idx) };
+                            table.mark_tombstone(idx);
+                            return Some((entry.key, entry.value));
+                        }
+                    }
+                    self.phase = FunnelIterPhase::Done;
+                }
+                FunnelIterPhase::Done => return None,
+            }
+        }
+    }
+}
+
+impl<K, V> Drop for FunnelIntoIter<K, V> {
+    fn drop(&mut self) {
+        // Drain the remainder so each owned `(K, V)` runs its `Drop`. After
+        // this, the map's own `Drop` finds only tombstones and is a no-op
+        // over the entries.
+        for _ in self.by_ref() {}
+    }
+}
+
+impl<K, V> std::fmt::Debug for FunnelIntoIter<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FunnelIntoIter")
+            .field("level_idx", &self.level_idx)
+            .field("slot_idx", &self.slot_idx)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<K, V> IntoIterator for FunnelHashMap<K, V>
+where
+    K: Eq + Hash,
+{
+    type Item = (K, V);
+    type IntoIter = FunnelIntoIter<K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        FunnelIntoIter {
+            map: self,
+            phase: FunnelIterPhase::Levels,
+            level_idx: 0,
+            slot_idx: 0,
+        }
+    }
+}
+
+/// Owned `K` iterator returned by [`FunnelHashMap::into_keys`].
+pub struct FunnelIntoKeys<K, V> {
+    inner: FunnelIntoIter<K, V>,
+}
+
+impl<K, V> Iterator for FunnelIntoKeys<K, V> {
+    type Item = K;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, _)| k)
+    }
+}
+
+impl<K, V> std::fmt::Debug for FunnelIntoKeys<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FunnelIntoKeys")
+            .field("level_idx", &self.inner.level_idx)
+            .field("slot_idx", &self.inner.slot_idx)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Owned `V` iterator returned by [`FunnelHashMap::into_values`].
+pub struct FunnelIntoValues<K, V> {
+    inner: FunnelIntoIter<K, V>,
+}
+
+impl<K, V> Iterator for FunnelIntoValues<K, V> {
+    type Item = V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(_, v)| v)
+    }
+}
+
+impl<K, V> std::fmt::Debug for FunnelIntoValues<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FunnelIntoValues")
+            .field("level_idx", &self.inner.level_idx)
+            .field("slot_idx", &self.inner.slot_idx)
+            .finish_non_exhaustive()
     }
 }
 
@@ -2175,5 +2516,244 @@ mod tests {
         assert!(map.get("alpha").is_none());
 
         assert!(map.remove_entry("alpha").is_none());
+    }
+
+    #[test]
+    fn iter_mut_yields_mutable_values_in_some_order() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
+        for i in 0..50 {
+            map.insert(i, i);
+        }
+        for (_, v) in &mut map {
+            *v *= 2;
+        }
+        for i in 0..50 {
+            assert_eq!(map.get(&i), Some(&(i * 2)), "key {i} not doubled");
+        }
+    }
+
+    #[test]
+    fn iter_mut_yields_each_entry_exactly_once() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
+        for i in 0..80 {
+            map.insert(i, i * 3);
+        }
+        let mut collected: Vec<(i32, i32)> = map.iter_mut().map(|(&k, v)| (k, *v)).collect();
+        collected.sort_unstable();
+        let expected: Vec<(i32, i32)> = (0..80).map(|i| (i, i * 3)).collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn iter_mut_skips_tombstones() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
+        for i in 0..40 {
+            map.insert(i, i);
+        }
+        for i in (0..40).step_by(2) {
+            map.remove(&i);
+        }
+        let count = map.iter_mut().count();
+        assert_eq!(count, map.len());
+    }
+
+    #[test]
+    fn iter_mut_empty_map_is_empty() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::new();
+        assert_eq!(map.iter_mut().count(), 0);
+    }
+
+    #[test]
+    fn values_mut_mutates_in_place() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
+        for i in 0..30 {
+            map.insert(i, i);
+        }
+        for v in map.values_mut() {
+            *v += 100;
+        }
+        for i in 0..30 {
+            assert_eq!(map.get(&i), Some(&(i + 100)));
+        }
+    }
+
+    #[test]
+    fn into_iter_yields_all_entries() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
+        for i in 0..60 {
+            map.insert(i, i * 11);
+        }
+        let mut collected: Vec<(i32, i32)> = map.into_iter().collect();
+        collected.sort_unstable();
+        let expected: Vec<(i32, i32)> = (0..60).map(|i| (i, i * 11)).collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn into_iter_skips_tombstones() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
+        for i in 0..60 {
+            map.insert(i, i);
+        }
+        for i in (0..60).step_by(3) {
+            map.remove(&i);
+        }
+        let expected_len = map.len();
+        let collected: Vec<(i32, i32)> = map.into_iter().collect();
+        assert_eq!(collected.len(), expected_len);
+    }
+
+    #[test]
+    fn into_keys_yields_all_keys() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
+        for i in 0..30 {
+            map.insert(i, i);
+        }
+        let mut keys: Vec<i32> = map.into_keys().collect();
+        keys.sort_unstable();
+        assert_eq!(keys, (0..30).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn into_values_yields_all_values() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(64);
+        for i in 0..30 {
+            map.insert(i, i * 5);
+        }
+        let mut vals: Vec<i32> = map.into_values().collect();
+        vals.sort_unstable();
+        let expected: Vec<i32> = (0..30).map(|i| i * 5).collect();
+        assert_eq!(vals, expected);
+    }
+
+    #[test]
+    fn into_keys_drops_values() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DropCounter {
+            counter: Arc<AtomicUsize>,
+        }
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let n: usize = 32;
+        let mut map: FunnelHashMap<usize, DropCounter> = FunnelHashMap::with_capacity(64);
+        for i in 0..n {
+            map.insert(
+                i,
+                DropCounter {
+                    counter: Arc::clone(&counter),
+                },
+            );
+        }
+        let keys: Vec<usize> = map.into_keys().collect();
+        assert_eq!(keys.len(), n);
+        assert_eq!(counter.load(Ordering::SeqCst), n);
+    }
+
+    #[test]
+    fn into_values_drops_keys() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DropKey {
+            id: usize,
+            counter: Arc<AtomicUsize>,
+        }
+        impl std::hash::Hash for DropKey {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                self.id.hash(state);
+            }
+        }
+        impl PartialEq for DropKey {
+            fn eq(&self, other: &Self) -> bool {
+                self.id == other.id
+            }
+        }
+        impl Eq for DropKey {}
+        impl Drop for DropKey {
+            fn drop(&mut self) {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let n: usize = 32;
+        let mut map: FunnelHashMap<DropKey, usize> = FunnelHashMap::with_capacity(64);
+        for i in 0..n {
+            map.insert(
+                DropKey {
+                    id: i,
+                    counter: Arc::clone(&counter),
+                },
+                i,
+            );
+        }
+        let vals: Vec<usize> = map.into_values().collect();
+        assert_eq!(vals.len(), n);
+        assert_eq!(counter.load(Ordering::SeqCst), n);
+    }
+
+    #[test]
+    fn iter_mut_partial_consume_then_drop() {
+        let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(128);
+        for i in 0..40 {
+            map.insert(i, i);
+        }
+        {
+            let mut it = map.iter_mut();
+            for _ in 0..7 {
+                if let Some((_, v)) = it.next() {
+                    *v += 1000;
+                }
+            }
+            // it drops here; map is still consistent.
+        }
+        assert_eq!(map.len(), 40);
+        for i in 0..40 {
+            assert!(map.get(&i).is_some(), "key {i} disappeared");
+        }
+    }
+
+    #[test]
+    fn into_iter_partial_drop_drops_remaining() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DropCounter {
+            counter: Arc<AtomicUsize>,
+        }
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let n: usize = 50;
+        let mut map: FunnelHashMap<usize, DropCounter> = FunnelHashMap::with_capacity(128);
+        for i in 0..n {
+            map.insert(
+                i,
+                DropCounter {
+                    counter: Arc::clone(&counter),
+                },
+            );
+        }
+        let take = 12;
+        let mut it = map.into_iter();
+        let mut taken: Vec<(usize, DropCounter)> = Vec::with_capacity(take);
+        for _ in 0..take {
+            taken.push(it.next().expect("element"));
+        }
+        drop(it);
+        assert_eq!(counter.load(Ordering::SeqCst), n - take);
+        drop(taken);
+        assert_eq!(counter.load(Ordering::SeqCst), n);
     }
 }

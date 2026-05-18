@@ -511,13 +511,13 @@ where
         }
     }
 
-    /// Borrowing iterator over `&K`. Order matches [`Self::iter`].
+    /// `&K` iterator. Order matches [`Self::iter`].
     #[must_use]
     pub fn keys(&self) -> Keys<'_, K, V> {
         Keys { inner: self.iter() }
     }
 
-    /// Borrowing iterator over `&V`. Order matches [`Self::iter`].
+    /// `&V` iterator. Order matches [`Self::iter`].
     #[must_use]
     pub fn values(&self) -> Values<'_, K, V> {
         Values { inner: self.iter() }
@@ -527,6 +527,42 @@ where
     #[must_use]
     pub fn hasher(&self) -> &DefaultHashBuilder {
         &self.hash_builder
+    }
+
+    /// `(&K, &mut V)` iterator. Mirrors `HashMap::iter_mut`.
+    pub fn iter_mut(&mut self) -> ElasticIterMut<'_, K, V> {
+        let levels_len = self.levels.len();
+        let levels = self.levels.as_mut_ptr();
+        ElasticIterMut {
+            levels,
+            levels_len,
+            level_idx: 0,
+            slot_idx: 0,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// `&mut V` iterator. Mirrors `HashMap::values_mut`.
+    pub fn values_mut(&mut self) -> ElasticValuesMut<'_, K, V> {
+        ElasticValuesMut {
+            inner: self.iter_mut(),
+        }
+    }
+
+    /// Consuming iterator over owned keys. Mirrors `HashMap::into_keys`.
+    #[must_use]
+    pub fn into_keys(self) -> ElasticIntoKeys<K, V> {
+        ElasticIntoKeys {
+            inner: self.into_iter(),
+        }
+    }
+
+    /// Consuming iterator over owned values. Mirrors `HashMap::into_values`.
+    #[must_use]
+    pub fn into_values(self) -> ElasticIntoValues<K, V> {
+        ElasticIntoValues {
+            inner: self.into_iter(),
+        }
     }
 }
 
@@ -581,7 +617,7 @@ where
     }
 }
 
-/// Borrowing iterator over `&K`, returned by [`ElasticHashMap::keys`].
+/// `&K` iterator returned by [`ElasticHashMap::keys`].
 #[derive(Clone)]
 pub struct Keys<'a, K, V> {
     inner: ElasticIter<'a, K, V>,
@@ -601,7 +637,7 @@ impl<K, V> std::fmt::Debug for Keys<'_, K, V> {
     }
 }
 
-/// Borrowing iterator over `&V`, returned by [`ElasticHashMap::values`].
+/// `&V` iterator returned by [`ElasticHashMap::values`].
 #[derive(Clone)]
 pub struct Values<'a, K, V> {
     inner: ElasticIter<'a, K, V>,
@@ -618,6 +654,205 @@ impl<'a, K, V> Iterator for Values<'a, K, V> {
 impl<K, V> std::fmt::Debug for Values<'_, K, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Values").finish_non_exhaustive()
+    }
+}
+
+/// `(&K, &mut V)` iterator. Walks levels in storage order, skipping FREE
+/// and TOMBSTONE slots.
+///
+/// SAFETY: raw pointer + `PhantomData<&'a mut ElasticHashMap<K, V>>` ties
+/// the iterator to the exclusive borrow of the map. Each `next()` returns
+/// a borrow of a strictly newer slot, so produced references are disjoint.
+pub struct ElasticIterMut<'a, K, V> {
+    levels: *mut Level<K, V>,
+    levels_len: usize,
+    level_idx: usize,
+    slot_idx: usize,
+    _marker: std::marker::PhantomData<&'a mut ElasticHashMap<K, V>>,
+}
+
+// SAFETY: behaves as `&mut [Level<K, V>]` for its lifetime.
+unsafe impl<K: Send, V: Send> Send for ElasticIterMut<'_, K, V> {}
+unsafe impl<K: Sync, V: Sync> Sync for ElasticIterMut<'_, K, V> {}
+
+impl<'a, K, V> Iterator for ElasticIterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.level_idx < self.levels_len {
+            // SAFETY: `level_idx < levels_len`; `self.levels` points at an
+            // owned slice of initialized `Level`s. Fresh `&mut` each iter.
+            let level = unsafe { &mut *self.levels.add(self.level_idx) };
+            let cap = level.table.capacity();
+            while self.slot_idx < cap {
+                let idx = self.slot_idx;
+                self.slot_idx += 1;
+                if level.table.control_at(idx).is_occupied() {
+                    // SAFETY: occupied control byte ⇒ valid Entry. Reborrow
+                    // through raw ptr so returned refs outlive the per-iter
+                    // `level` reborrow; never revisit the slot ⇒ disjoint.
+                    let entry = unsafe { level.table.get_mut(idx) };
+                    let key: &'a K = unsafe { &*std::ptr::from_ref(&entry.key) };
+                    let val: &'a mut V = unsafe { &mut *std::ptr::from_mut(&mut entry.value) };
+                    return Some((key, val));
+                }
+            }
+            self.level_idx += 1;
+            self.slot_idx = 0;
+        }
+        None
+    }
+}
+
+impl<K, V> std::fmt::Debug for ElasticIterMut<'_, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ElasticIterMut")
+            .field("level_idx", &self.level_idx)
+            .field("slot_idx", &self.slot_idx)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a mut ElasticHashMap<K, V>
+where
+    K: Eq + Hash,
+{
+    type Item = (&'a K, &'a mut V);
+    type IntoIter = ElasticIterMut<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+/// `&mut V` iterator returned by [`ElasticHashMap::values_mut`].
+pub struct ElasticValuesMut<'a, K, V> {
+    inner: ElasticIterMut<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for ElasticValuesMut<'a, K, V> {
+    type Item = &'a mut V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(_, v)| v)
+    }
+}
+
+impl<K, V> std::fmt::Debug for ElasticValuesMut<'_, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ElasticValuesMut")
+            .field("level_idx", &self.inner.level_idx)
+            .field("slot_idx", &self.inner.slot_idx)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Consuming `(K, V)` iterator returned by `ElasticHashMap::into_iter`.
+pub struct ElasticIntoIter<K, V> {
+    map: ElasticHashMap<K, V>,
+    level_idx: usize,
+    slot_idx: usize,
+}
+
+impl<K, V> Iterator for ElasticIntoIter<K, V> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.level_idx < self.map.levels.len() {
+            let level = &mut self.map.levels[self.level_idx];
+            let cap = level.table.capacity();
+            while self.slot_idx < cap {
+                let idx = self.slot_idx;
+                self.slot_idx += 1;
+                if level.table.control_at(idx).is_occupied() {
+                    // SAFETY: occupied ⇒ valid. Tombstone-mark prevents
+                    // map's Drop and future next() from revisiting.
+                    let entry = unsafe { level.table.take(idx) };
+                    level.table.mark_tombstone(idx);
+                    return Some((entry.key, entry.value));
+                }
+            }
+            self.level_idx += 1;
+            self.slot_idx = 0;
+        }
+        None
+    }
+}
+
+impl<K, V> Drop for ElasticIntoIter<K, V> {
+    fn drop(&mut self) {
+        // Drain remaining entries so each runs its Drop; map's Drop then
+        // sees only tombstones.
+        for _ in self.by_ref() {}
+    }
+}
+
+impl<K, V> std::fmt::Debug for ElasticIntoIter<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ElasticIntoIter")
+            .field("level_idx", &self.level_idx)
+            .field("slot_idx", &self.slot_idx)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<K, V> IntoIterator for ElasticHashMap<K, V>
+where
+    K: Eq + Hash,
+{
+    type Item = (K, V);
+    type IntoIter = ElasticIntoIter<K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        ElasticIntoIter {
+            map: self,
+            level_idx: 0,
+            slot_idx: 0,
+        }
+    }
+}
+
+/// Owned `K` iterator returned by [`ElasticHashMap::into_keys`].
+pub struct ElasticIntoKeys<K, V> {
+    inner: ElasticIntoIter<K, V>,
+}
+
+impl<K, V> Iterator for ElasticIntoKeys<K, V> {
+    type Item = K;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, _)| k)
+    }
+}
+
+impl<K, V> std::fmt::Debug for ElasticIntoKeys<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ElasticIntoKeys")
+            .field("level_idx", &self.inner.level_idx)
+            .field("slot_idx", &self.inner.slot_idx)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Owned `V` iterator returned by [`ElasticHashMap::into_values`].
+pub struct ElasticIntoValues<K, V> {
+    inner: ElasticIntoIter<K, V>,
+}
+
+impl<K, V> Iterator for ElasticIntoValues<K, V> {
+    type Item = V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(_, v)| v)
+    }
+}
+
+impl<K, V> std::fmt::Debug for ElasticIntoValues<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ElasticIntoValues")
+            .field("level_idx", &self.inner.level_idx)
+            .field("slot_idx", &self.inner.slot_idx)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1389,5 +1624,247 @@ mod tests {
         assert!(map.get("alpha").is_none());
 
         assert!(map.remove_entry("alpha").is_none());
+    }
+
+    #[test]
+    fn iter_mut_yields_mutable_values_in_some_order() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..32 {
+            map.insert(i, i);
+        }
+        for (_, v) in &mut map {
+            *v *= 2;
+        }
+        for i in 0..32 {
+            assert_eq!(map.get(&i), Some(&(i * 2)), "key {i} not doubled");
+        }
+    }
+
+    #[test]
+    fn iter_mut_yields_each_entry_exactly_once() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..50 {
+            map.insert(i, i * 3);
+        }
+        let mut collected: Vec<(i32, i32)> = map.iter_mut().map(|(&k, v)| (k, *v)).collect();
+        collected.sort_unstable();
+        let expected: Vec<(i32, i32)> = (0..50).map(|i| (i, i * 3)).collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn iter_mut_skips_tombstones() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(32);
+        for i in 0..20 {
+            map.insert(i, i);
+        }
+        for i in (0..20).step_by(2) {
+            map.remove(&i);
+        }
+        let count = map.iter_mut().count();
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn iter_mut_empty_map_is_empty() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        assert_eq!(map.iter_mut().count(), 0);
+    }
+
+    #[test]
+    fn values_mut_mutates_in_place() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(32);
+        for i in 0..16 {
+            map.insert(i, i);
+        }
+        for v in map.values_mut() {
+            *v += 100;
+        }
+        for i in 0..16 {
+            assert_eq!(map.get(&i), Some(&(i + 100)));
+        }
+    }
+
+    #[test]
+    fn into_iter_yields_all_entries() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..30 {
+            map.insert(i, i * 11);
+        }
+        let mut collected: Vec<(i32, i32)> = map.into_iter().collect();
+        collected.sort_unstable();
+        let expected: Vec<(i32, i32)> = (0..30).map(|i| (i, i * 11)).collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn into_iter_skips_tombstones() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..40 {
+            map.insert(i, i);
+        }
+        for i in (0..40).step_by(3) {
+            map.remove(&i);
+        }
+        let expected_len = map.len();
+        let collected: Vec<(i32, i32)> = map.into_iter().collect();
+        assert_eq!(collected.len(), expected_len);
+    }
+
+    #[test]
+    fn into_keys_yields_all_keys() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..20 {
+            map.insert(i, i);
+        }
+        let mut keys: Vec<i32> = map.into_keys().collect();
+        keys.sort_unstable();
+        assert_eq!(keys, (0..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn into_values_yields_all_values() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..20 {
+            map.insert(i, i * 5);
+        }
+        let mut vals: Vec<i32> = map.into_values().collect();
+        vals.sort_unstable();
+        let expected: Vec<i32> = (0..20).map(|i| i * 5).collect();
+        assert_eq!(vals, expected);
+    }
+
+    #[test]
+    fn into_keys_drops_values() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DropCounter {
+            counter: Arc<AtomicUsize>,
+        }
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let n: usize = 25;
+        let mut map: ElasticHashMap<usize, DropCounter> = ElasticHashMap::with_capacity(64);
+        for i in 0..n {
+            map.insert(
+                i,
+                DropCounter {
+                    counter: Arc::clone(&counter),
+                },
+            );
+        }
+        let keys: Vec<usize> = map.into_keys().collect();
+        assert_eq!(keys.len(), n);
+        assert_eq!(counter.load(Ordering::SeqCst), n);
+    }
+
+    #[test]
+    fn into_values_drops_keys() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DropKey {
+            id: usize,
+            counter: Arc<AtomicUsize>,
+        }
+        impl std::hash::Hash for DropKey {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                self.id.hash(state);
+            }
+        }
+        impl PartialEq for DropKey {
+            fn eq(&self, other: &Self) -> bool {
+                self.id == other.id
+            }
+        }
+        impl Eq for DropKey {}
+        impl Drop for DropKey {
+            fn drop(&mut self) {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let n: usize = 25;
+        let mut map: ElasticHashMap<DropKey, usize> = ElasticHashMap::with_capacity(64);
+        for i in 0..n {
+            map.insert(
+                DropKey {
+                    id: i,
+                    counter: Arc::clone(&counter),
+                },
+                i,
+            );
+        }
+        let vals: Vec<usize> = map.into_values().collect();
+        assert_eq!(vals.len(), n);
+        assert_eq!(counter.load(Ordering::SeqCst), n);
+    }
+
+    #[test]
+    fn iter_mut_partial_consume_then_drop() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..30 {
+            map.insert(i, i);
+        }
+        {
+            let mut it = map.iter_mut();
+            for _ in 0..5 {
+                if let Some((_, v)) = it.next() {
+                    *v += 1000;
+                }
+            }
+            // it drops here; map is still consistent.
+        }
+        assert_eq!(map.len(), 30);
+        // Every original key is still present.
+        for i in 0..30 {
+            assert!(map.get(&i).is_some(), "key {i} disappeared");
+        }
+    }
+
+    #[test]
+    fn into_iter_partial_drop_drops_remaining() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DropCounter {
+            counter: Arc<AtomicUsize>,
+        }
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let n: usize = 40;
+        let mut map: ElasticHashMap<usize, DropCounter> = ElasticHashMap::with_capacity(64);
+        for i in 0..n {
+            map.insert(
+                i,
+                DropCounter {
+                    counter: Arc::clone(&counter),
+                },
+            );
+        }
+        let take = 10;
+        let mut it = map.into_iter();
+        let mut taken: Vec<(usize, DropCounter)> = Vec::with_capacity(take);
+        for _ in 0..take {
+            taken.push(it.next().expect("element"));
+        }
+        // `taken` is alive; only the remaining `n - take` entries are dropped
+        // when the iterator's Drop runs.
+        drop(it);
+        assert_eq!(counter.load(Ordering::SeqCst), n - take);
+        drop(taken);
+        assert_eq!(counter.load(Ordering::SeqCst), n);
     }
 }

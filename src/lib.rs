@@ -7,8 +7,10 @@ mod python;
 
 pub use common::DefaultHashBuilder;
 pub use elastic::{
-    ElasticHashMap, ElasticIter, ElasticOptions, Keys as ElasticKeys, Values as ElasticValues,
+    ElasticHashMap, ElasticIntoIter, ElasticIntoKeys, ElasticIntoValues, ElasticIter,
+    ElasticIterMut, ElasticOptions, ElasticValuesMut, Keys as ElasticKeys, Values as ElasticValues,
 };
 pub use funnel::{
-    FunnelHashMap, FunnelIter, FunnelOptions, Keys as FunnelKeys, Values as FunnelValues,
+    FunnelHashMap, FunnelIntoIter, FunnelIntoKeys, FunnelIntoValues, FunnelIter, FunnelIterMut,
+    FunnelOptions, FunnelValuesMut, Keys as FunnelKeys, Values as FunnelValues,
 };
