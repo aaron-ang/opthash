@@ -637,6 +637,48 @@ where
         }
         (level_idx, slot_idx)
     }
+
+    /// Drops every entry for which `f(&K, &mut V)` returns `false`.
+    /// Mirrors [`std::collections::HashMap::retain`].
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        self.extract_if(|k, v| !f(k, v)).for_each(drop);
+    }
+
+    /// Returns a draining iterator that empties the map. Mirrors
+    /// [`std::collections::HashMap::drain`].
+    pub fn drain(&mut self) -> Drain<'_, K, V> {
+        Drain {
+            map: self,
+            level_idx: 0,
+            slot_idx: 0,
+        }
+    }
+
+    /// Yields and removes `(K, V)` pairs where `f` returned `true`; kept
+    /// entries remain in the map. Mirrors
+    /// [`std::collections::HashMap::extract_if`].
+    pub fn extract_if<F>(&mut self, f: F) -> ExtractIf<'_, K, V, F>
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        ExtractIf {
+            map: self,
+            pred: f,
+            level_idx: 0,
+            slot_idx: 0,
+        }
+    }
+
+    /// Walk every level and rehash if any crossed the cleanup threshold while
+    /// resize was suppressed. Called once from each bulk-op iterator's `Drop`.
+    fn resize_if_needed(&mut self) {
+        if self.levels.iter().any(Level::needs_cleanup) {
+            self.resize(self.capacity);
+        }
+    }
 }
 
 /// A view into a single entry in an [`ElasticHashMap`], which may be either
@@ -883,6 +925,144 @@ where
     K: Eq + Hash + std::fmt::Debug,
     V: std::fmt::Debug,
 {
+}
+
+/// Draining iterator. Yields and removes every `(K, V)` entry; the map is
+/// empty once the iterator is consumed or dropped. Returned by
+/// [`ElasticHashMap::drain`].
+pub struct Drain<'a, K, V> {
+    map: &'a mut ElasticHashMap<K, V>,
+    level_idx: usize,
+    slot_idx: usize,
+}
+
+impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for Drain<'_, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Drain").finish_non_exhaustive()
+    }
+}
+
+impl<K, V> Iterator for Drain<'_, K, V> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.level_idx < self.map.levels.len() {
+            let level = &mut self.map.levels[self.level_idx];
+            while self.slot_idx < level.table.capacity() {
+                let idx = self.slot_idx;
+                self.slot_idx += 1;
+                if level.table.control_at(idx).is_occupied() {
+                    let entry = unsafe { level.table.take(idx) };
+                    level.table.mark_tombstone(idx);
+                    level.len -= 1;
+                    level.tombstones += 1;
+                    self.map.len -= 1;
+                    return Some((entry.key, entry.value));
+                }
+            }
+            self.level_idx += 1;
+            self.slot_idx = 0;
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.map.len, Some(self.map.len))
+    }
+}
+
+impl<K, V> ExactSizeIterator for Drain<'_, K, V> {}
+impl<K, V> std::iter::FusedIterator for Drain<'_, K, V> {}
+
+impl<K, V> Drop for Drain<'_, K, V> {
+    fn drop(&mut self) {
+        // Drain any unyielded entries so values run their `Drop`.
+        for _ in &mut *self {}
+        // All entries moved out via `next()`; wipe ctrl bytes + counters en bloc.
+        for level in &mut self.map.levels {
+            level.table.clear_all_controls();
+            level.len = 0;
+            level.tombstones = 0;
+        }
+        self.map.len = 0;
+        self.map.max_populated_level = 0;
+        self.map.current_batch_index = 0;
+        self.map.batch_remaining = self.map.batch_plan.first().copied().unwrap_or(0);
+    }
+}
+
+/// Filtering drain. Yields and removes entries for which the predicate
+/// returns `true`; the rest stay in the map. Returned by
+/// [`ElasticHashMap::extract_if`].
+pub struct ExtractIf<'a, K, V, F>
+where
+    K: Eq + Hash,
+    F: FnMut(&K, &mut V) -> bool,
+{
+    map: &'a mut ElasticHashMap<K, V>,
+    pred: F,
+    level_idx: usize,
+    slot_idx: usize,
+}
+
+impl<K, V, F> std::fmt::Debug for ExtractIf<'_, K, V, F>
+where
+    K: Eq + Hash,
+    F: FnMut(&K, &mut V) -> bool,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtractIf").finish_non_exhaustive()
+    }
+}
+
+impl<K, V, F> Iterator for ExtractIf<'_, K, V, F>
+where
+    K: Eq + Hash,
+    F: FnMut(&K, &mut V) -> bool,
+{
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.level_idx < self.map.levels.len() {
+            let level = &mut self.map.levels[self.level_idx];
+            while self.slot_idx < level.table.capacity() {
+                let idx = self.slot_idx;
+                self.slot_idx += 1;
+                if !level.table.control_at(idx).is_occupied() {
+                    continue;
+                }
+                // In-place borrow so predicate mutations stick on kept entries.
+                let entry = unsafe { level.table.get_mut(idx) };
+                if (self.pred)(&entry.key, &mut entry.value) {
+                    let removed = unsafe { level.table.take(idx) };
+                    level.table.mark_tombstone(idx);
+                    level.len -= 1;
+                    level.tombstones += 1;
+                    self.map.len -= 1;
+                    return Some((removed.key, removed.value));
+                }
+            }
+            self.level_idx += 1;
+            self.slot_idx = 0;
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.map.len))
+    }
+}
+
+impl<K, V, F> Drop for ExtractIf<'_, K, V, F>
+where
+    K: Eq + Hash,
+    F: FnMut(&K, &mut V) -> bool,
+{
+    fn drop(&mut self) {
+        // Dropping `extract_if` early leaves unvisited entries in the map.
+        // Only consolidate any tombstone backlog from already-removed entries.
+        self.map.resize_if_needed();
+    }
 }
 
 /// Borrowing iterator over occupied entries. Walks levels in order, scanning
@@ -1960,6 +2140,23 @@ mod tests {
     }
 
     #[test]
+    fn retain_keeps_matching_drops_rest() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..40 {
+            map.insert(i, i * 10);
+        }
+        map.retain(|k, _| k % 2 == 0);
+        assert_eq!(map.len(), 20);
+        for i in 0..40 {
+            if i % 2 == 0 {
+                assert_eq!(map.get(&i), Some(&(i * 10)));
+            } else {
+                assert!(map.get(&i).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn iter_mut_yields_each_entry_exactly_once() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
         for i in 0..50 {
@@ -2000,6 +2197,36 @@ mod tests {
             *v += 100;
         }
         for i in 0..16 {
+            assert_eq!(map.get(&i), Some(&(i + 100)));
+        }
+    }
+
+    #[test]
+    fn retain_with_empty_map_is_noop() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::new();
+        let mut called = false;
+        map.retain(|_, _| {
+            called = true;
+            true
+        });
+        assert!(!called);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn retain_can_mutate_values_in_place() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..20 {
+            map.insert(i, i);
+        }
+        map.retain(|k, v| {
+            *v += 100;
+            k % 2 == 0
+        });
+        assert_eq!(map.len(), 10);
+        for i in (0..20).step_by(2) {
+            // Mutations only stick on surviving entries — the extracted ones
+            // never make it back into the map.
             assert_eq!(map.get(&i), Some(&(i + 100)));
         }
     }
@@ -2146,6 +2373,40 @@ mod tests {
         for i in 0..30 {
             assert!(map.get(&i).is_some(), "key {i} disappeared");
         }
+    }
+
+    #[test]
+    fn drain_yields_all_entries_then_empties_map() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..30 {
+            map.insert(i, i * 7);
+        }
+        let mut collected: Vec<(i32, i32)> = map.drain().collect();
+        collected.sort_unstable();
+        let expected: Vec<(i32, i32)> = (0..30).map(|i| (i, i * 7)).collect();
+        assert_eq!(collected, expected);
+        assert!(map.is_empty());
+        assert_eq!(map.iter().count(), 0);
+        // Reuse after drain.
+        map.insert(999, 999);
+        assert_eq!(map.get(&999), Some(&999));
+    }
+
+    #[test]
+    fn drain_partial_consume_then_drop_still_empties_map() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..30 {
+            map.insert(i, i);
+        }
+        {
+            let mut drain = map.drain();
+            let _first = drain.next();
+            let _second = drain.next();
+            // Drop here without exhausting; remaining entries must still be
+            // freed and the map emptied (std semantics).
+        }
+        assert!(map.is_empty());
+        assert_eq!(map.iter().count(), 0);
     }
 
     #[test]
@@ -2334,5 +2595,74 @@ mod tests {
         map.insert(1, 10);
         let err = map.try_insert(1, 99).expect_err("occupied must error");
         assert_eq!(err.value, 99);
+    }
+
+    #[test]
+    fn extract_if_yields_only_matching_and_leaves_rest() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..40 {
+            map.insert(i, i);
+        }
+        let mut extracted: Vec<(i32, i32)> = map.extract_if(|k, _| k % 3 == 0).collect();
+        extracted.sort_unstable();
+        let expected: Vec<(i32, i32)> = (0..40).filter(|i| i % 3 == 0).map(|i| (i, i)).collect();
+        assert_eq!(extracted, expected);
+        assert_eq!(map.len(), 40 - expected.len());
+        for i in 0..40 {
+            if i % 3 == 0 {
+                assert!(map.get(&i).is_none());
+            } else {
+                assert_eq!(map.get(&i), Some(&i));
+            }
+        }
+    }
+
+    #[test]
+    fn extract_if_partial_consume_then_drop_keeps_remaining_in_map() {
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(64);
+        for i in 0..30 {
+            map.insert(i, i);
+        }
+        let original_len = map.len();
+        let extracted_count;
+        {
+            let mut it = map.extract_if(|_, _| true);
+            // Pull two; abandon the rest.
+            assert!(it.next().is_some());
+            assert!(it.next().is_some());
+            extracted_count = 2;
+        }
+        assert_eq!(map.len(), original_len - extracted_count);
+        // Remaining keys are still all findable via iter().
+        let remaining: Vec<i32> = map.iter().map(|(&k, _)| k).collect();
+        assert_eq!(remaining.len(), original_len - extracted_count);
+    }
+
+    #[test]
+    fn retain_does_not_trigger_mid_iter_resize_with_clustered_tombstones() {
+        // Build a small map past the cleanup threshold and retain half. The
+        // bulk-op iterators bypass `remove`, so the per-remove resize check
+        // can't fire mid-walk; this test guards that invariant.
+        let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(256);
+        let cap = i32::try_from(map.capacity()).expect("test capacity fits i32");
+        let n = cap * 2 / 3;
+        for i in 0..n {
+            map.insert(i, i);
+        }
+        let initial_capacity = map.capacity();
+        map.retain(|k, _| k % 2 == 0);
+
+        // Every surviving key must still resolve.
+        let expected_count = (0..n).filter(|i| i % 2 == 0).count();
+        assert_eq!(map.len(), expected_count);
+        for i in 0..n {
+            if i % 2 == 0 {
+                assert_eq!(map.get(&i), Some(&i), "kept key {i} missing");
+            } else {
+                assert!(map.get(&i).is_none(), "dropped key {i} survived");
+            }
+        }
+        // No regress in capacity (we may have rehashed but never grew).
+        assert!(map.capacity() <= initial_capacity * 2);
     }
 }
